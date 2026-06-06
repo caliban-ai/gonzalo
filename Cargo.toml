@@ -4,6 +4,7 @@ members = [
     "crates/gonzalo-core",
     "crates/gonzalo-store-fs",
     "crates/gonzalo-store-git",
+    "crates/gonzalo-store-s3",
     "crates/gonzalo-domain",
     "crates/gonzalo",
 ]
@@ -21,6 +22,9 @@ gonzalo-core   = { path = "crates/gonzalo-core" }
 gonzalo-store-fs = { path = "crates/gonzalo-store-fs" }
 gonzalo-store-git = { path = "crates/gonzalo-store-git" }
 git2         = { version = "0.20", default-features = false }
+gonzalo-store-s3 = { path = "crates/gonzalo-store-s3" }
+aws-config   = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3   = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 gonzalo-domain = { path = "crates/gonzalo-domain" }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"

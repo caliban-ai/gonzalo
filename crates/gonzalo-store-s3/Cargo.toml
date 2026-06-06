@@ -1,0 +1,24 @@
+[package]
+name = "gonzalo-store-s3"
+description = "S3-compatible object-store substrate for gonzalo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core = { workspace = true }
+async-trait  = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "macros"] }
+aws-config   = { workspace = true }
+aws-sdk-s3   = { workspace = true }
+
+[dev-dependencies]
+gonzalo-core = { workspace = true, features = ["conformance"] }
+tokio        = { workspace = true }
+
+[lints]
+workspace = true
