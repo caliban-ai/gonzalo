@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/gonzalo-core",
     "crates/gonzalo-store-fs",
+    "crates/gonzalo-store-git",
     "crates/gonzalo-domain",
     "crates/gonzalo",
 ]
@@ -18,6 +19,8 @@ repository = "https://github.com/caliban-ai/gonzalo"
 [workspace.dependencies]
 gonzalo-core   = { path = "crates/gonzalo-core" }
 gonzalo-store-fs = { path = "crates/gonzalo-store-fs" }
+gonzalo-store-git = { path = "crates/gonzalo-store-git" }
+git2         = { version = "0.20", default-features = false }
 gonzalo-domain = { path = "crates/gonzalo-domain" }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
