@@ -14,3 +14,6 @@ pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
 pub mod error;
 pub use error::{CoreError, Result};
+
+pub mod store;
+pub use store::{Conflict, PutResult, Store};
