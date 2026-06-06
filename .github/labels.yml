@@ -1,0 +1,95 @@
+# kind/*
+- name: kind/bug
+  color: 'd73a4a'
+  description: "Categorizes issue or PR as related to a bug."
+  aliases: ['bug']
+- name: kind/feature
+  color: 'a2eeef'
+  description: "Categorizes issue or PR as related to a new feature."
+  aliases: ['enhancement']
+- name: kind/documentation
+  color: '0075ca'
+  description: "Categorizes issue or PR as related to documentation."
+  aliases: ['documentation']
+- name: kind/cleanup
+  color: 'c2e0c6'
+  description: "Categorizes issue or PR as related to cleanup or tech debt."
+  aliases: ['tech-debt']
+- name: kind/flake
+  color: 'f9d0c4'
+  description: "Categorizes issue or PR as related to a flaky test."
+- name: kind/support
+  color: 'd876e3'
+  description: "Categorizes issue or PR as a support question."
+  aliases: ['question']
+- name: kind/design
+  color: 'fbca04'
+  description: "Categorizes issue or PR as related to design."
+- name: kind/epic
+  color: '0052cc'
+  description: "Categorizes a large multi-part body of work."
+# priority/*
+- name: priority/critical-urgent
+  color: 'e11d21'
+  description: "Highest priority. Someone's top priority right now."
+- name: priority/important-soon
+  color: 'eb6420'
+  description: "Must be staffed and worked on soon."
+- name: priority/important-longterm
+  color: 'fbca04'
+  description: "Important over the long term, but may not be staffed soon."
+- name: priority/backlog
+  color: 'fef2c0'
+  description: "Higher priority than awaiting-more-evidence."
+- name: priority/awaiting-more-evidence
+  color: 'fef2c0'
+  description: "Lowest priority. Not yet enough support to act."
+# triage/*
+- name: triage/needs-triage
+  color: 'e99695'
+  description: "Indicates an issue or PR needs triage."
+- name: triage/accepted
+  color: '0e8a16'
+  description: "Indicates an issue or PR is ready to be actively worked on."
+- name: triage/needs-information
+  color: 'd876e3'
+  description: "Indicates more information is needed to proceed."
+- name: triage/duplicate
+  color: 'cfd3d7'
+  description: "Indicates an issue is a duplicate of another."
+  aliases: ['duplicate']
+- name: triage/not-reproducible
+  color: 'cfd3d7'
+  description: "Indicates an issue can not be reproduced."
+  aliases: ['invalid']
+# lifecycle/*
+- name: lifecycle/active
+  color: 'a2eeef'
+  description: "Indicates an issue or PR is actively being worked on."
+- name: lifecycle/stale
+  color: 'ededed'
+  description: "Denotes an issue or PR has gone stale."
+- name: lifecycle/frozen
+  color: 'ffffff'
+  description: "Indicates an issue or PR should not be auto-closed for staleness."
+  aliases: ['wontfix']
+# contributor
+- name: good first issue
+  color: '7057ff'
+  description: "Good for newcomers."
+- name: help wanted
+  color: '008672'
+  description: "Extra attention is needed."
+# area/* (gonzalo)
+- name: area/integration
+  color: '0e8a16'
+  description: "Area: cross-repo / caliban adoption"
+  aliases: ['integration']
+- name: area/security
+  color: 'd93f0b'
+  description: "Area: security / auth hardening"
+  aliases: ['security']
+- name: area/performance
+  color: 'fbca04'
+  description: "Area: performance"
+  aliases: ['performance']
