@@ -5,6 +5,7 @@ use crate::record::{Body, MergeClass};
 
 /// The result of attempting an automatic merge of two divergent bodies.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a MergeOutcome may need caller resolution and must not be ignored"]
 pub enum MergeOutcome {
     /// A merged body was produced automatically.
     Merged(Body),

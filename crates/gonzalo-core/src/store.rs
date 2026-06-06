@@ -16,6 +16,7 @@ pub struct Conflict {
 /// The outcome of a conditional write. `Conflict` is a normal, recoverable
 /// result — not an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a PutResult may be a Conflict that must be handled, never silently dropped"]
 pub enum PutResult {
     Committed(Revision),
     Conflict(Box<Conflict>),
