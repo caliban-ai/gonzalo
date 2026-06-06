@@ -90,6 +90,9 @@ async fn copy(dst: &dyn Store, rec: &Record) -> Result<()> {
 }
 
 async fn overwrite(dst: &dyn Store, rec: &Record, expected: &Revision) -> Result<()> {
+    // Conflict means a concurrent mutation raced the merge window. M2 assumes
+    // quiescent stores; the report won't reflect this case. Tightening to a
+    // re-loop is deferred.
     let _ = dst.put(rec.clone(), Some(expected.clone())).await?;
     Ok(())
 }
@@ -98,6 +101,12 @@ fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
     let counter = a.revision.counter.max(b.revision.counter) + 1;
     let mut labels = a.meta.labels.clone();
     labels.extend(b.meta.labels.clone());
+    let mut links = a.links.clone();
+    for l in &b.links {
+        if !links.contains(l) {
+            links.push(l.clone());
+        }
+    }
     Record {
         key: key.clone(),
         kind: a.kind,
@@ -115,7 +124,7 @@ fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
             updated: a.meta.updated.max(b.meta.updated),
             labels,
         },
-        links: a.links.clone(),
+        links,
     }
 }
 
@@ -226,5 +235,29 @@ mod tests {
         assert_eq!(report.conflicts.len(), 1);
         assert_eq!(report.conflicts[0].key, RecordKey::new("ns", "col", "c"));
         assert!(report.merged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_tier_divergence_surfaces_conflict() {
+        let a = MemStore::default();
+        let b = MemStore::default();
+        let _ = a.put(rec("m", RecordKind::MemoryTier, "a"), None).await.unwrap();
+        let _ = b.put(rec("m", RecordKind::MemoryTier, "b"), None).await.unwrap();
+
+        let report = sync(&a, &b).await.unwrap();
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(report.merged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_divergence_auto_merges() {
+        let a = MemStore::default();
+        let b = MemStore::default();
+        let _ = a.put(rec("s", RecordKind::Session, "base\nfrom_a\n"), None).await.unwrap();
+        let _ = b.put(rec("s", RecordKind::Session, "base\nfrom_b\n"), None).await.unwrap();
+
+        let report = sync(&a, &b).await.unwrap();
+        assert_eq!(report.merged, vec![RecordKey::new("ns", "col", "s")]);
+        assert!(report.conflicts.is_empty());
     }
 }
