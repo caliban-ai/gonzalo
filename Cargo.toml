@@ -10,6 +10,7 @@ members = [
     "crates/gonzalo-store-server",
     "crates/gonzalo-domain",
     "crates/gonzalo",
+    "crates/gonzalo-vector",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ reqwest     = { version = "0.12", default-features = false, features = ["json", 
 gonzalo-server = { path = "crates/gonzalo-server" }
 gonzalo-store-server = { path = "crates/gonzalo-store-server" }
 gonzalo-domain = { path = "crates/gonzalo-domain" }
+gonzalo-vector = { path = "crates/gonzalo-vector" }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde       = { version = "1", features = ["derive"] }

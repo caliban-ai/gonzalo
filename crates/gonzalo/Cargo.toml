@@ -15,6 +15,7 @@ gonzalo-store-fs = { workspace = true, optional = true }
 gonzalo-store-git = { workspace = true, optional = true }
 gonzalo-store-s3 = { workspace = true, optional = true }
 gonzalo-store-server = { workspace = true, optional = true }
+gonzalo-vector = { workspace = true, optional = true }
 
 [features]
 default = ["fs"]
@@ -22,6 +23,7 @@ fs = ["dep:gonzalo-store-fs"]
 git = ["dep:gonzalo-store-git"]
 s3 = ["dep:gonzalo-store-s3"]
 remote = ["dep:gonzalo-store-server"]
+vector = ["dep:gonzalo-vector"]
 
 [dev-dependencies]
 tokio    = { workspace = true }

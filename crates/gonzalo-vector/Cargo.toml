@@ -1,0 +1,19 @@
+[package]
+name = "gonzalo-vector"
+description = "Vector-search capability layer for gonzalo (embeddings keyed by RecordKey)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core = { workspace = true }
+async-trait  = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

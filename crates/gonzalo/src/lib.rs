@@ -23,6 +23,9 @@ pub use gonzalo_store_s3::S3Store;
 #[cfg(feature = "remote")]
 pub use gonzalo_store_server::ServerStore;
 
+#[cfg(feature = "vector")]
+pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
