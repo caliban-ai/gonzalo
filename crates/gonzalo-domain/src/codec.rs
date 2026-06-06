@@ -29,7 +29,10 @@ mod tests {
 
     #[test]
     fn roundtrips_through_body() {
-        let d = Demo { n: 7, s: "x".into() };
+        let d = Demo {
+            n: 7,
+            s: "x".into(),
+        };
         let body = d.to_body().unwrap();
         assert_eq!(Demo::from_body(&body).unwrap(), d);
     }

@@ -1,6 +1,6 @@
 //! The generic storage substrate trait and write-outcome types.
 
-use crate::{Record, RecordKey, Revision, Result};
+use crate::{Record, RecordKey, Result, Revision};
 use async_trait::async_trait;
 
 /// A detected concurrent-edit conflict: the caller's write expected

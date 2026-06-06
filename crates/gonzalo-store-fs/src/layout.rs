@@ -30,7 +30,10 @@ mod tests {
     fn record_path_is_nested_json() {
         let root = Path::new("/tmp/g");
         let key = RecordKey::new("caliban", "topics", "rust");
-        assert_eq!(record_path(root, &key), Path::new("/tmp/g/caliban/topics/rust.json"));
+        assert_eq!(
+            record_path(root, &key),
+            Path::new("/tmp/g/caliban/topics/rust.json")
+        );
     }
 
     #[test]

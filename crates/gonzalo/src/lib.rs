@@ -23,7 +23,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::new(dir.path());
 
-        let topic = Topic { slug: "rust".into(), bullets: vec!["use clippy".into()] };
+        let topic = Topic {
+            slug: "rust".into(),
+            bullets: vec!["use clippy".into()],
+        };
         let body = topic.to_body().unwrap();
         let key = RecordKey::new("caliban", "topics", "rust");
         let rec = Record {
@@ -42,7 +45,10 @@ mod tests {
             key: key.clone(),
         };
 
-        assert!(matches!(store.put(rec, None).await.unwrap(), PutResult::Committed(_)));
+        assert!(matches!(
+            store.put(rec, None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
         let got = store.get(&key).await.unwrap().unwrap();
         assert_eq!(Topic::from_body(&got.body).unwrap(), topic);
     }

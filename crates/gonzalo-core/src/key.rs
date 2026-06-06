@@ -17,7 +17,11 @@ impl RecordKey {
         collection: impl Into<String>,
         id: impl Into<String>,
     ) -> Self {
-        Self { namespace: namespace.into(), collection: collection.into(), id: id.into() }
+        Self {
+            namespace: namespace.into(),
+            collection: collection.into(),
+            id: id.into(),
+        }
     }
 }
 
@@ -37,7 +41,10 @@ pub struct KeyPrefix {
 impl KeyPrefix {
     pub fn matches(&self, key: &RecordKey) -> bool {
         self.namespace.as_ref().is_none_or(|n| n == &key.namespace)
-            && self.collection.as_ref().is_none_or(|c| c == &key.collection)
+            && self
+                .collection
+                .as_ref()
+                .is_none_or(|c| c == &key.collection)
     }
 }
 
@@ -54,8 +61,20 @@ mod tests {
     #[test]
     fn prefix_matches_on_set_fields_only() {
         let k = RecordKey::new("caliban", "topics", "x");
-        assert!(KeyPrefix { namespace: Some("caliban".into()), collection: None }.matches(&k));
-        assert!(!KeyPrefix { namespace: Some("other".into()), collection: None }.matches(&k));
+        assert!(
+            KeyPrefix {
+                namespace: Some("caliban".into()),
+                collection: None
+            }
+            .matches(&k)
+        );
+        assert!(
+            !KeyPrefix {
+                namespace: Some("other".into()),
+                collection: None
+            }
+            .matches(&k)
+        );
         assert!(KeyPrefix::default().matches(&k));
     }
 }

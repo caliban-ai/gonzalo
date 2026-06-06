@@ -38,7 +38,11 @@ impl Store for FsStore {
         self.read_record(key).await
     }
 
-    async fn put(&self, record: Record, expected: Option<gonzalo_core::Revision>) -> Result<PutResult> {
+    async fn put(
+        &self,
+        record: Record,
+        expected: Option<gonzalo_core::Revision>,
+    ) -> Result<PutResult> {
         // Optimistic concurrency: the stored revision must equal `expected`.
         // NOTE(TOCTOU): this read-then-write is racy without advisory locking — a
         // concurrent writer can commit between our read and rename, causing a silent
@@ -67,8 +71,12 @@ impl Store for FsStore {
             serde_json::to_vec_pretty(&record).map_err(|e| CoreError::Serde(e.to_string()))?;
         // Atomic write: temp file + rename.
         let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &bytes).await.map_err(|e| CoreError::Backend(e.to_string()))?;
-        tokio::fs::rename(&tmp, &path).await.map_err(|e| CoreError::Backend(e.to_string()))?;
+        tokio::fs::write(&tmp, &bytes)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
         Ok(PutResult::Committed(record.revision))
     }
 
@@ -80,25 +88,45 @@ impl Store for FsStore {
 }
 
 /// Walk `<root>/<ns>/<col>/<id>.json` and collect keys matching `prefix`.
-async fn collect_keys(root: &std::path::Path, prefix: &KeyPrefix, out: &mut Vec<RecordKey>) -> Result<()> {
+async fn collect_keys(
+    root: &std::path::Path,
+    prefix: &KeyPrefix,
+    out: &mut Vec<RecordKey>,
+) -> Result<()> {
     let mut namespaces = match tokio::fs::read_dir(root).await {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(CoreError::Backend(e.to_string())),
     };
-    while let Some(ns) = namespaces.next_entry().await.map_err(|e| CoreError::Backend(e.to_string()))? {
+    while let Some(ns) = namespaces
+        .next_entry()
+        .await
+        .map_err(|e| CoreError::Backend(e.to_string()))?
+    {
         if ns.file_type().await.map(|ft| !ft.is_dir()).unwrap_or(true) {
             continue;
         }
         let ns_name = ns.file_name().to_string_lossy().to_string();
-        let mut cols = tokio::fs::read_dir(ns.path()).await.map_err(|e| CoreError::Backend(e.to_string()))?;
-        while let Some(col) = cols.next_entry().await.map_err(|e| CoreError::Backend(e.to_string()))? {
+        let mut cols = tokio::fs::read_dir(ns.path())
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        while let Some(col) = cols
+            .next_entry()
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?
+        {
             if col.file_type().await.map(|ft| !ft.is_dir()).unwrap_or(true) {
                 continue;
             }
             let col_name = col.file_name().to_string_lossy().to_string();
-            let mut files = tokio::fs::read_dir(col.path()).await.map_err(|e| CoreError::Backend(e.to_string()))?;
-            while let Some(f) = files.next_entry().await.map_err(|e| CoreError::Backend(e.to_string()))? {
+            let mut files = tokio::fs::read_dir(col.path())
+                .await
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+            while let Some(f) = files
+                .next_entry()
+                .await
+                .map_err(|e| CoreError::Backend(e.to_string()))?
+            {
                 let fname = f.file_name().to_string_lossy().to_string();
                 if let Some(id) = fname.strip_suffix(".json") {
                     let key = RecordKey::new(ns_name.clone(), col_name.clone(), id.to_string());

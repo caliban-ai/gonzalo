@@ -49,7 +49,10 @@ fn append_only_merge(base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
 }
 
 fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
-    bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect()
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Lines present in `bytes` but not in `base_lines`, preserving order and
@@ -101,12 +104,18 @@ mod tests {
     #[test]
     fn opaque_needs_resolution() {
         let b = body("x\n");
-        assert_eq!(merge(MergeClass::Opaque, &b, &b, &b), MergeOutcome::NeedsResolution);
+        assert_eq!(
+            merge(MergeClass::Opaque, &b, &b, &b),
+            MergeOutcome::NeedsResolution
+        );
     }
 
     #[test]
     fn structured_needs_resolution_in_m1() {
         let b = body("x\n");
-        assert_eq!(merge(MergeClass::Structured, &b, &b, &b), MergeOutcome::NeedsResolution);
+        assert_eq!(
+            merge(MergeClass::Structured, &b, &b, &b),
+            MergeOutcome::NeedsResolution
+        );
     }
 }

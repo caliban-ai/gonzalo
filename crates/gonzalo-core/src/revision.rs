@@ -23,12 +23,18 @@ pub struct Revision {
 impl Revision {
     /// The first revision for a freshly created record body.
     pub fn initial(body: &[u8]) -> Self {
-        Self { counter: 0, hash: ContentHash::of(body) }
+        Self {
+            counter: 0,
+            hash: ContentHash::of(body),
+        }
     }
 
     /// The next revision after `self` for an updated body.
     pub fn next(&self, body: &[u8]) -> Self {
-        Self { counter: self.counter + 1, hash: ContentHash::of(body) }
+        Self {
+            counter: self.counter + 1,
+            hash: ContentHash::of(body),
+        }
     }
 }
 

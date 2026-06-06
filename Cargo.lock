@@ -142,6 +142,8 @@ dependencies = [
  "gonzalo-core",
  "gonzalo-domain",
  "gonzalo-store-fs",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

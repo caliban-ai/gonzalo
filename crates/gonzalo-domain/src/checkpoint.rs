@@ -22,7 +22,10 @@ mod tests {
 
     #[test]
     fn checkpoint_roundtrips() {
-        let c = Checkpoint { label: "before-refactor".into(), payload: "blob".into() };
+        let c = Checkpoint {
+            label: "before-refactor".into(),
+            payload: "blob".into(),
+        };
         assert_eq!(Checkpoint::from_body(&c.to_body().unwrap()).unwrap(), c);
         assert_eq!(Checkpoint::KIND, RecordKind::Checkpoint);
     }

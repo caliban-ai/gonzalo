@@ -12,7 +12,10 @@ pub struct Identity {
 
 impl Identity {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), display: None }
+        Self {
+            id: id.into(),
+            display: None,
+        }
     }
 }
 

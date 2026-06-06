@@ -32,7 +32,10 @@ mod tests {
     fn session_roundtrips() {
         let s = Session {
             name: "research".into(),
-            turns: vec![Turn { role: "user".into(), text: "hi".into() }],
+            turns: vec![Turn {
+                role: "user".into(),
+                text: "hi".into(),
+            }],
         };
         assert_eq!(Session::from_body(&s.to_body().unwrap()).unwrap(), s);
         assert_eq!(Session::KIND, RecordKind::Session);

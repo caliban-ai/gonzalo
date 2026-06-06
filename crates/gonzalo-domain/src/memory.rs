@@ -33,14 +33,20 @@ mod tests {
 
     #[test]
     fn tier_roundtrips() {
-        let t = MemoryTier { name: "global".into(), content: "be concise".into() };
+        let t = MemoryTier {
+            name: "global".into(),
+            content: "be concise".into(),
+        };
         assert_eq!(MemoryTier::from_body(&t.to_body().unwrap()).unwrap(), t);
         assert_eq!(MemoryTier::KIND, RecordKind::MemoryTier);
     }
 
     #[test]
     fn topic_roundtrips() {
-        let t = Topic { slug: "rust".into(), bullets: vec!["use clippy".into()] };
+        let t = Topic {
+            slug: "rust".into(),
+            bullets: vec!["use clippy".into()],
+        };
         assert_eq!(Topic::from_body(&t.to_body().unwrap()).unwrap(), t);
         assert_eq!(Topic::KIND, RecordKind::Topic);
     }
