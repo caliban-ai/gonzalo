@@ -8,3 +8,6 @@ pub use key::{KeyPrefix, RecordKey};
 
 pub mod revision;
 pub use revision::{ContentHash, Revision};
+
+pub mod record;
+pub use record::{Body, MergeClass, Meta, Record, RecordKind};
