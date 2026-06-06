@@ -17,5 +17,9 @@ gonzalo-store-fs = { workspace = true, optional = true }
 default = ["fs"]
 fs = ["dep:gonzalo-store-fs"]
 
+[dev-dependencies]
+tokio    = { workspace = true }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
