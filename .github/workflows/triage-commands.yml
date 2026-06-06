@@ -1,0 +1,35 @@
+name: Triage commands
+on:
+  issue_comment:
+    types: [created]
+permissions:
+  issues: write
+jobs:
+  triage:
+    if: ${{ contains(github.event.comment.body, '/triage') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const assoc = context.payload.comment.author_association;
+            if (!['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc)) {
+              core.info(`Ignoring /triage from ${assoc}`);
+              return;
+            }
+            const m = context.payload.comment.body.match(
+              /\/triage\s+(accepted|needs-information|duplicate|not-reproducible)/
+            );
+            if (!m) { core.info('No recognized /triage subcommand'); return; }
+            const target = `triage/${m[1]}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const current = await github.rest.issues.listLabelsOnIssue({ owner, repo, issue_number });
+            for (const l of current.data) {
+              if (l.name.startsWith('triage/') && l.name !== target) {
+                await github.rest.issues
+                  .removeLabel({ owner, repo, issue_number, name: l.name })
+                  .catch(() => {});
+              }
+            }
+            await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [target] });
