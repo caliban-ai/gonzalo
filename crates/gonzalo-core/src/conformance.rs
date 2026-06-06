@@ -74,14 +74,16 @@ async fn stale_expected_returns_conflict<S: Store>(store: &S) {
 }
 
 async fn list_filters_by_prefix<S: Store>(store: &S) {
-    store
+    let r1 = store
         .put(sample(RecordKey::new("x", "c1", "1"), b"1"), None)
         .await
         .unwrap();
-    store
+    assert!(matches!(r1, PutResult::Committed(_)));
+    let r2 = store
         .put(sample(RecordKey::new("x", "c2", "2"), b"2"), None)
         .await
         .unwrap();
+    assert!(matches!(r2, PutResult::Committed(_)));
     let prefix = KeyPrefix {
         namespace: Some("x".into()),
         collection: Some("c1".into()),

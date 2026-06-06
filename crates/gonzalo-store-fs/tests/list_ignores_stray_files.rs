@@ -29,7 +29,7 @@ async fn list_skips_stray_non_directory_files() {
     let store = FsStore::new(dir.path());
 
     let key = RecordKey::new("ns", "col", "real");
-    store.put(sample(key.clone()), None).await.unwrap();
+    let _ = store.put(sample(key.clone()), None).await.unwrap();
 
     // Stray files at the root level and inside the namespace dir.
     tokio::fs::write(dir.path().join(".DS_Store"), b"junk")
