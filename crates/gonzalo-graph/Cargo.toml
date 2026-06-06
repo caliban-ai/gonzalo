@@ -1,0 +1,20 @@
+[package]
+name = "gonzalo-graph"
+description = "Code-graph capability layer for gonzalo (tree-sitter symbol/reference index)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

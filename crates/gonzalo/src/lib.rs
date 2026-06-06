@@ -26,6 +26,11 @@ pub use gonzalo_store_server::ServerStore;
 #[cfg(feature = "vector")]
 pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
 
+#[cfg(feature = "graph")]
+pub use gonzalo_graph::{
+    CodeGraph, GraphStore, InMemoryGraphStore, Reference, Symbol, SymbolKind, build_rust,
+};
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
