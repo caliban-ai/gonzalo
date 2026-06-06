@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use gonzalo_cli::{get, list, migrate, parse_kind, status, sync_stores};
+use gonzalo_cli::{get, list, migrate, status, sync_stores};
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
 
@@ -146,8 +146,6 @@ async fn main() -> Result<()> {
         }
 
         Commands::Sync { a, b } => {
-            // Use parse_kind indirectly; it lives in lib for tests.
-            let _ = parse_kind("topic"); // ensure symbol is reachable
             let summary = sync_stores(&a, &b).await?;
             println!("copied_to_a: {}", summary.copied_to_a);
             println!("copied_to_b: {}", summary.copied_to_b);

@@ -164,19 +164,6 @@ pub async fn sync_stores(a: &Path, b: &Path) -> Result<SyncSummary> {
     })
 }
 
-// ─── RecordKind parsing ───────────────────────────────────────────────────────
-
-/// Parse a `RecordKind` from a CLI string. Accepts `topic`, `memory-tier`,
-/// `session`, `checkpoint`. Defaults to `Topic` on unknown input.
-pub fn parse_kind(s: &str) -> RecordKind {
-    match s {
-        "memory-tier" => RecordKind::MemoryTier,
-        "session" => RecordKind::Session,
-        "checkpoint" => RecordKind::Checkpoint,
-        _ => RecordKind::Topic,
-    }
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
