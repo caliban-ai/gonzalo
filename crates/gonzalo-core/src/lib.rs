@@ -24,5 +24,8 @@ pub use merge::{MergeOutcome, merge};
 pub mod paths;
 pub use paths::{object_key, record_components, segment};
 
+pub mod sync;
+pub use sync::{SyncConflict, SyncReport, sync};
+
 #[cfg(feature = "conformance")]
 pub mod conformance;
