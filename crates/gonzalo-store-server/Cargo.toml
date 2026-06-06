@@ -1,0 +1,28 @@
+[package]
+name = "gonzalo-store-server"
+description = "Client Store substrate that talks to a remote gonzalo daemon (HTTP or gRPC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core  = { workspace = true }
+gonzalo-proto = { workspace = true }
+async-trait   = { workspace = true }
+serde_json    = { workspace = true }
+tokio         = { workspace = true, features = ["rt", "macros"] }
+tonic         = { workspace = true }
+reqwest       = { workspace = true }
+
+[dev-dependencies]
+gonzalo-server   = { workspace = true }
+gonzalo-store-fs = { workspace = true }
+gonzalo-core     = { workspace = true, features = ["conformance"] }
+tokio            = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tempfile         = { workspace = true }
+
+[lints]
+workspace = true

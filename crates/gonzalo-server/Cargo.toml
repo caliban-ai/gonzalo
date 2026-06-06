@@ -1,0 +1,28 @@
+[package]
+name = "gonzalo-server"
+description = "The gonzalo daemon: serves a Store over gRPC and HTTP/JSON"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core  = { workspace = true }
+gonzalo-proto = { workspace = true }
+gonzalo-store-fs = { workspace = true }
+tonic         = { workspace = true }
+prost         = { workspace = true }
+axum          = { workspace = true }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio-stream  = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gonzalod"
+path = "src/bin/gonzalod.rs"

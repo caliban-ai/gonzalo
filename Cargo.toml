@@ -5,6 +5,9 @@ members = [
     "crates/gonzalo-store-fs",
     "crates/gonzalo-store-git",
     "crates/gonzalo-store-s3",
+    "crates/gonzalo-proto",
+    "crates/gonzalo-server",
+    "crates/gonzalo-store-server",
     "crates/gonzalo-domain",
     "crates/gonzalo",
 ]
@@ -25,6 +28,16 @@ git2         = { version = "0.20", default-features = false }
 gonzalo-store-s3 = { path = "crates/gonzalo-store-s3" }
 aws-config   = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3   = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+gonzalo-proto = { path = "crates/gonzalo-proto" }
+tonic       = "0.12"
+prost       = "0.13"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+axum        = "0.8"
+tokio-stream = { version = "0.1", features = ["net"] }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+gonzalo-server = { path = "crates/gonzalo-server" }
+gonzalo-store-server = { path = "crates/gonzalo-store-server" }
 gonzalo-domain = { path = "crates/gonzalo-domain" }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"

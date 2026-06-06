@@ -2,11 +2,12 @@
 
 use crate::{Record, RecordKey, Result, Revision};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// A detected concurrent-edit conflict: the caller's write expected
 /// `expected` to be the current revision, but the store holds `current`.
 /// Surfaced, never silently resolved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
     pub key: RecordKey,
     pub expected: Option<Revision>,

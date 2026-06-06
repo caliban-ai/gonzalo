@@ -1,0 +1,28 @@
+[package]
+name = "gonzalo-proto"
+description = "Shared gRPC schema and wire types for the gonzalo daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
+# This crate's build script must set the PROTOC env var (unsafe in edition
+# 2024), so it uses a local `deny` instead of the workspace-wide `forbid`,
+# which cannot be locally overridden. Library code remains unsafe-free.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

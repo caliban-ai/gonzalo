@@ -20,6 +20,9 @@ pub use gonzalo_store_git::GitStore;
 #[cfg(feature = "s3")]
 pub use gonzalo_store_s3::S3Store;
 
+#[cfg(feature = "remote")]
+pub use gonzalo_store_server::ServerStore;
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
