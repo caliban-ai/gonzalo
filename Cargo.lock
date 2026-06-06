@@ -173,7 +173,6 @@ dependencies = [
  "gonzalo-core",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
 ]
 
