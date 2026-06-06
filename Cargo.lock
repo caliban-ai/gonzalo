@@ -162,7 +162,6 @@ dependencies = [
  "gonzalo-core",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]
