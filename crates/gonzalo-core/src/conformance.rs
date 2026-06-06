@@ -47,8 +47,10 @@ async fn get_absent_returns_none<S: Store>(store: &S) {
 async fn put_then_get_roundtrips<S: Store>(store: &S) {
     let key = RecordKey::new("ns", "col", "a");
     let rec = sample(key.clone(), b"hello");
-    let out = store.put(rec.clone(), None).await.unwrap();
-    assert!(matches!(out, PutResult::Committed(_)));
+    let PutResult::Committed(committed_rev) = store.put(rec.clone(), None).await.unwrap() else {
+        panic!("expected Committed");
+    };
+    assert_eq!(committed_rev, rec.revision);
     assert_eq!(store.get(&key).await.unwrap(), Some(rec));
 }
 

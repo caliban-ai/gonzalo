@@ -4,8 +4,8 @@ use crate::{Record, RecordKey, Revision, Result};
 use async_trait::async_trait;
 
 /// A detected concurrent-edit conflict: the caller's write expected
-/// `expected` but the store holds `current`. `base` is the common ancestor
-/// revision if known. Surfaced, never silently resolved.
+/// `expected` to be the current revision, but the store holds `current`.
+/// Surfaced, never silently resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conflict {
     pub key: RecordKey,
@@ -18,7 +18,7 @@ pub struct Conflict {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PutResult {
     Committed(Revision),
-    Conflict(Conflict),
+    Conflict(Box<Conflict>),
 }
 
 /// A pluggable storage substrate over generic records.
