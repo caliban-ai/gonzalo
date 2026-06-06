@@ -1,0 +1,25 @@
+[package]
+name = "gonzalo-core"
+description = "Generic versioned Record/Store core for gonzalo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+blake3      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+conformance = []
+
+[lints]
+workspace = true
