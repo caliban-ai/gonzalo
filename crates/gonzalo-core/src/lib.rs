@@ -20,3 +20,6 @@ pub use store::{Conflict, PutResult, Store};
 
 pub mod merge;
 pub use merge::{MergeOutcome, merge};
+
+#[cfg(feature = "conformance")]
+pub mod conformance;
