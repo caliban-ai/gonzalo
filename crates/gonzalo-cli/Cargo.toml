@@ -1,0 +1,28 @@
+[package]
+name = "gonzalo-cli"
+description = "Admin/ops CLI for the gonzalo persistence layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core     = { workspace = true }
+gonzalo-store-fs = { workspace = true }
+clap   = { version = "4", features = ["derive"] }
+anyhow = "1"
+tokio  = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "gonzalo"
+path = "src/main.rs"
+
+[lints]
+workspace = true
