@@ -45,16 +45,30 @@ impl GitStore {
     }
 
     fn commit_file(&self, rel: &Path, message: &str) -> Result<()> {
-        let repo = git2::Repository::open(&self.root)
+        let repo =
+            git2::Repository::open(&self.root).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let mut index = repo
+            .index()
             .map_err(|e| CoreError::Backend(e.to_string()))?;
-        let mut index = repo.index().map_err(|e| CoreError::Backend(e.to_string()))?;
-        index.add_path(rel).map_err(|e| CoreError::Backend(e.to_string()))?;
-        index.write().map_err(|e| CoreError::Backend(e.to_string()))?;
-        let tree_oid = index.write_tree().map_err(|e| CoreError::Backend(e.to_string()))?;
-        let tree = repo.find_tree(tree_oid).map_err(|e| CoreError::Backend(e.to_string()))?;
+        index
+            .add_path(rel)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        index
+            .write()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
         let sig = git2::Signature::now("gonzalo", "gonzalo@localhost")
             .map_err(|e| CoreError::Backend(e.to_string()))?;
-        let parent = repo.head().ok().and_then(|h| h.target()).and_then(|oid| repo.find_commit(oid).ok());
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
         let parents: Vec<&git2::Commit> = parent.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
             .map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -81,15 +95,20 @@ impl GitStore {
 
 fn git_pull(root: &Path, remote: &str, branch: &str) -> Result<()> {
     let repo = git2::Repository::open(root).map_err(|e| CoreError::Backend(e.to_string()))?;
-    let mut rem = repo.find_remote(remote).map_err(|e| CoreError::Backend(e.to_string()))?;
-    rem.fetch(&[branch], None, None).map_err(|e| CoreError::Backend(e.to_string()))?;
+    let mut rem = repo
+        .find_remote(remote)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    rem.fetch(&[branch], None, None)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
     let fetch_head = repo
         .find_reference("FETCH_HEAD")
         .map_err(|e| CoreError::Backend(e.to_string()))?;
     let fetch_commit = repo
         .reference_to_annotated_commit(&fetch_head)
         .map_err(|e| CoreError::Backend(e.to_string()))?;
-    let (analysis, _) = repo.merge_analysis(&[&fetch_commit]).map_err(|e| CoreError::Backend(e.to_string()))?;
+    let (analysis, _) = repo
+        .merge_analysis(&[&fetch_commit])
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
     if analysis.is_up_to_date() {
         Ok(())
     } else if analysis.is_fast_forward() {
@@ -100,20 +119,26 @@ fn git_pull(root: &Path, remote: &str, branch: &str) -> Result<()> {
         reference
             .set_target(fetch_commit.id(), "fast-forward")
             .map_err(|e| CoreError::Backend(e.to_string()))?;
-        repo.set_head(&refname).map_err(|e| CoreError::Backend(e.to_string()))?;
+        repo.set_head(&refname)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
         repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
             .map_err(|e| CoreError::Backend(e.to_string()))?;
         Ok(())
     } else {
-        Err(CoreError::Backend("non-fast-forward pull requires manual merge".into()))
+        Err(CoreError::Backend(
+            "non-fast-forward pull requires manual merge".into(),
+        ))
     }
 }
 
 fn git_push(root: &Path, remote: &str, branch: &str) -> Result<()> {
     let repo = git2::Repository::open(root).map_err(|e| CoreError::Backend(e.to_string()))?;
-    let mut rem = repo.find_remote(remote).map_err(|e| CoreError::Backend(e.to_string()))?;
+    let mut rem = repo
+        .find_remote(remote)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    rem.push(&[refspec.as_str()], None).map_err(|e| CoreError::Backend(e.to_string()))?;
+    rem.push(&[refspec.as_str()], None)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
     Ok(())
 }
 
@@ -133,7 +158,9 @@ impl gonzalo_core::Store for GitStore {
         let this = Arc::new(self.root.clone());
         let key = key.clone();
         run_blocking(move || {
-            let store = GitStore { root: (*this).clone() };
+            let store = GitStore {
+                root: (*this).clone(),
+            };
             store.read(&key)
         })
         .await

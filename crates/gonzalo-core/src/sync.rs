@@ -110,7 +110,10 @@ fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
     Record {
         key: key.clone(),
         kind: a.kind,
-        revision: Revision { counter, hash: crate::ContentHash::of(body.bytes()) },
+        revision: Revision {
+            counter,
+            hash: crate::ContentHash::of(body.bytes()),
+        },
         parent: Some(if a.revision.counter >= b.revision.counter {
             a.revision.clone()
         } else {
@@ -196,31 +199,67 @@ mod tests {
     async fn copies_one_sided_records_both_directions() {
         let a = MemStore::default();
         let b = MemStore::default();
-        let _ = a.put(rec("only_a", RecordKind::Topic, "x"), None).await.unwrap();
-        let _ = b.put(rec("only_b", RecordKind::Topic, "y"), None).await.unwrap();
+        let _ = a
+            .put(rec("only_a", RecordKind::Topic, "x"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("only_b", RecordKind::Topic, "y"), None)
+            .await
+            .unwrap();
 
         let report = sync(&a, &b).await.unwrap();
-        assert_eq!(report.copied_to_b, vec![RecordKey::new("ns", "col", "only_a")]);
-        assert_eq!(report.copied_to_a, vec![RecordKey::new("ns", "col", "only_b")]);
-        assert!(a.get(&RecordKey::new("ns", "col", "only_b")).await.unwrap().is_some());
-        assert!(b.get(&RecordKey::new("ns", "col", "only_a")).await.unwrap().is_some());
+        assert_eq!(
+            report.copied_to_b,
+            vec![RecordKey::new("ns", "col", "only_a")]
+        );
+        assert_eq!(
+            report.copied_to_a,
+            vec![RecordKey::new("ns", "col", "only_b")]
+        );
+        assert!(
+            a.get(&RecordKey::new("ns", "col", "only_b"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            b.get(&RecordKey::new("ns", "col", "only_a"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn append_only_divergence_auto_merges() {
         let a = MemStore::default();
         let b = MemStore::default();
-        let _ = a.put(rec("t", RecordKind::Topic, "base\nfrom_a\n"), None).await.unwrap();
-        let _ = b.put(rec("t", RecordKind::Topic, "base\nfrom_b\n"), None).await.unwrap();
+        let _ = a
+            .put(rec("t", RecordKind::Topic, "base\nfrom_a\n"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("t", RecordKind::Topic, "base\nfrom_b\n"), None)
+            .await
+            .unwrap();
 
         let report = sync(&a, &b).await.unwrap();
         assert_eq!(report.merged, vec![RecordKey::new("ns", "col", "t")]);
         assert!(report.conflicts.is_empty());
-        let merged = a.get(&RecordKey::new("ns", "col", "t")).await.unwrap().unwrap();
+        let merged = a
+            .get(&RecordKey::new("ns", "col", "t"))
+            .await
+            .unwrap()
+            .unwrap();
         let text = String::from_utf8(merged.body.bytes().to_vec()).unwrap();
         assert!(text.contains("from_a") && text.contains("from_b") && text.contains("base"));
         // Both stores converge to the same revision.
-        let mb = b.get(&RecordKey::new("ns", "col", "t")).await.unwrap().unwrap();
+        let mb = b
+            .get(&RecordKey::new("ns", "col", "t"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(merged.revision, mb.revision);
     }
 
@@ -228,8 +267,14 @@ mod tests {
     async fn checkpoint_divergence_surfaces_conflict() {
         let a = MemStore::default();
         let b = MemStore::default();
-        let _ = a.put(rec("c", RecordKind::Checkpoint, "a"), None).await.unwrap();
-        let _ = b.put(rec("c", RecordKind::Checkpoint, "b"), None).await.unwrap();
+        let _ = a
+            .put(rec("c", RecordKind::Checkpoint, "a"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("c", RecordKind::Checkpoint, "b"), None)
+            .await
+            .unwrap();
 
         let report = sync(&a, &b).await.unwrap();
         assert_eq!(report.conflicts.len(), 1);
@@ -241,8 +286,14 @@ mod tests {
     async fn memory_tier_divergence_surfaces_conflict() {
         let a = MemStore::default();
         let b = MemStore::default();
-        let _ = a.put(rec("m", RecordKind::MemoryTier, "a"), None).await.unwrap();
-        let _ = b.put(rec("m", RecordKind::MemoryTier, "b"), None).await.unwrap();
+        let _ = a
+            .put(rec("m", RecordKind::MemoryTier, "a"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("m", RecordKind::MemoryTier, "b"), None)
+            .await
+            .unwrap();
 
         let report = sync(&a, &b).await.unwrap();
         assert_eq!(report.conflicts.len(), 1);
@@ -253,8 +304,14 @@ mod tests {
     async fn session_divergence_auto_merges() {
         let a = MemStore::default();
         let b = MemStore::default();
-        let _ = a.put(rec("s", RecordKind::Session, "base\nfrom_a\n"), None).await.unwrap();
-        let _ = b.put(rec("s", RecordKind::Session, "base\nfrom_b\n"), None).await.unwrap();
+        let _ = a
+            .put(rec("s", RecordKind::Session, "base\nfrom_a\n"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("s", RecordKind::Session, "base\nfrom_b\n"), None)
+            .await
+            .unwrap();
 
         let report = sync(&a, &b).await.unwrap();
         assert_eq!(report.merged, vec![RecordKey::new("ns", "col", "s")]);

@@ -17,7 +17,10 @@ impl S3Store {
     /// Build a store from an explicit client and bucket. Use
     /// [`S3Store::connect`] for the common env/endpoint path.
     pub fn new(client: Client, bucket: impl Into<String>) -> Self {
-        Self { client, bucket: bucket.into() }
+        Self {
+            client,
+            bucket: bucket.into(),
+        }
     }
 
     /// Connect using the ambient AWS config (env, profile, IRSA, etc.). If
@@ -35,7 +38,14 @@ impl S3Store {
 
     async fn read(&self, key: &RecordKey) -> Result<Option<Record>> {
         let obj = object_key(key);
-        match self.client.get_object().bucket(&self.bucket).key(&obj).send().await {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&obj)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let data = resp
                     .body

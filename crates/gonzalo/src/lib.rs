@@ -5,13 +5,20 @@
 
 pub use gonzalo_core::{
     Body, Conflict, ContentHash, CoreError, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta,
-    PutResult, Record, RecordKey, RecordKind, Result, Revision, Store, merge,
+    PutResult, Record, RecordKey, RecordKind, Result, Revision, Store, SyncConflict, SyncReport,
+    merge, sync,
 };
 
 pub use gonzalo_domain::{Checkpoint, MemoryTier, RecordCodec, Session, Topic, Turn};
 
 #[cfg(feature = "fs")]
 pub use gonzalo_store_fs::FsStore;
+
+#[cfg(feature = "git")]
+pub use gonzalo_store_git::GitStore;
+
+#[cfg(feature = "s3")]
+pub use gonzalo_store_s3::S3Store;
 
 #[cfg(all(test, feature = "fs"))]
 mod tests {

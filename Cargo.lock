@@ -949,6 +949,8 @@ dependencies = [
  "gonzalo-core",
  "gonzalo-domain",
  "gonzalo-store-fs",
+ "gonzalo-store-git",
+ "gonzalo-store-s3",
  "tempfile",
  "tokio",
 ]
