@@ -1,1 +1,3 @@
-//! Placeholder; populated by subsequent tasks.
+//! Filesystem storage substrate for gonzalo.
+
+mod layout;
