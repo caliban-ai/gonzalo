@@ -21,5 +21,8 @@ pub use store::{Conflict, PutResult, Store};
 pub mod merge;
 pub use merge::{MergeOutcome, merge};
 
+pub mod paths;
+pub use paths::{object_key, record_components, segment};
+
 #[cfg(feature = "conformance")]
 pub mod conformance;
