@@ -18,6 +18,7 @@ gonzalo-store-server = { workspace = true, optional = true }
 gonzalo-vector = { workspace = true, optional = true }
 gonzalo-graph = { workspace = true, optional = true }
 gonzalo-ticket = { workspace = true, optional = true }
+gonzalo-ticket-github = { workspace = true, optional = true }
 
 [features]
 default = ["fs"]
@@ -28,6 +29,7 @@ remote = ["dep:gonzalo-store-server"]
 vector = ["dep:gonzalo-vector"]
 graph = ["dep:gonzalo-graph"]
 ticket = ["dep:gonzalo-ticket"]
+ticket-github = ["dep:gonzalo-ticket-github", "ticket"]
 
 [dev-dependencies]
 tokio    = { workspace = true }
