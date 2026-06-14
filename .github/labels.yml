@@ -80,16 +80,54 @@
 - name: help wanted
   color: '008672'
   description: "Extra attention is needed."
-# area/* (gonzalo)
-- name: area/integration
-  color: '0e8a16'
-  description: "Area: cross-repo / caliban adoption"
-  aliases: ['integration']
+# component marker
+- name: gonzalo
+  color: '006b75'
+  description: "Gonzalo sub-project."
+# area/* shared cross-cutting core
+- name: area/docs
+  color: '1d76db'
+  description: "Area: docs"
+- name: area/ci-cd
+  color: '1d76db'
+  description: "Area: ci-cd"
+- name: area/test
+  color: '1d76db'
+  description: "Area: testing"
 - name: area/security
-  color: 'd93f0b'
-  description: "Area: security / auth hardening"
+  color: '1d76db'
+  description: "Area: security"
   aliases: ['security']
 - name: area/performance
-  color: 'fbca04'
+  color: '1d76db'
   description: "Area: performance"
   aliases: ['performance']
+# area/* (gonzalo subsystems)
+- name: area/integration
+  color: '1d76db'
+  description: "Area: cross-repo / caliban adoption"
+  aliases: ['integration']
+- name: area/core
+  color: '1d76db'
+  description: "Area: core"
+- name: area/store
+  color: '1d76db'
+  description: "Area: store"
+- name: area/server
+  color: '1d76db'
+  description: "Area: server"
+- name: area/proto
+  color: '1d76db'
+  description: "Area: proto"
+- name: area/domain
+  color: '1d76db'
+  description: "Area: domain"
+- name: area/vector
+  color: '1d76db'
+  description: "Area: vector"
+- name: area/graph
+  color: '1d76db'
+  description: "Area: graph"
+- name: area/cli
+  color: '1d76db'
+  description: "Area: cli"
