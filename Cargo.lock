@@ -1195,6 +1195,7 @@ dependencies = [
  "gonzalo-store-git",
  "gonzalo-store-s3",
  "gonzalo-store-server",
+ "gonzalo-ticket",
  "gonzalo-vector",
  "tempfile",
  "tokio",
@@ -1320,6 +1321,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "gonzalo-ticket"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gonzalo-core",
+ "gonzalo-domain",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ members = [
     "crates/gonzalo",
     "crates/gonzalo-vector",
     "crates/gonzalo-graph",
+    "crates/gonzalo-ticket",
     "crates/gonzalo-cli",
 ]
 
@@ -44,6 +45,7 @@ gonzalo-store-server = { path = "crates/gonzalo-store-server" }
 gonzalo-domain = { path = "crates/gonzalo-domain" }
 gonzalo-vector = { path = "crates/gonzalo-vector" }
 gonzalo-graph = { path = "crates/gonzalo-graph" }
+gonzalo-ticket = { path = "crates/gonzalo-ticket" }
 gonzalo-cli   = { path = "crates/gonzalo-cli" }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"

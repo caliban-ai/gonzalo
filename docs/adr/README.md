@@ -34,7 +34,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0007](0007-dual-transport-daemon.md) | Dual-transport daemon: gRPC + HTTP/JSON over one schema | accepted |
 | [0008](0008-capability-layers-over-core.md) | Domain, vector, and graph as capability layers over core | accepted |
 | [0009](0009-workspace-layout-and-facade.md) | Workspace layout and single-facade public surface | accepted |
-| [0010](0010-ticket-system-capability-layer.md) | Ticket systems as a normalized work-item capability layer | proposed |
+| [0010](0010-ticket-system-capability-layer.md) | Ticket systems as a normalized work-item capability layer | accepted |
 
 ## Adding a new ADR
 

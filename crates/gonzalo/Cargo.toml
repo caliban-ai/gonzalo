@@ -17,6 +17,7 @@ gonzalo-store-s3 = { workspace = true, optional = true }
 gonzalo-store-server = { workspace = true, optional = true }
 gonzalo-vector = { workspace = true, optional = true }
 gonzalo-graph = { workspace = true, optional = true }
+gonzalo-ticket = { workspace = true, optional = true }
 
 [features]
 default = ["fs"]
@@ -26,6 +27,7 @@ s3 = ["dep:gonzalo-store-s3"]
 remote = ["dep:gonzalo-store-server"]
 vector = ["dep:gonzalo-vector"]
 graph = ["dep:gonzalo-graph"]
+ticket = ["dep:gonzalo-ticket"]
 
 [dev-dependencies]
 tokio    = { workspace = true }

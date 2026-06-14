@@ -9,7 +9,11 @@ pub use gonzalo_core::{
     merge, sync,
 };
 
-pub use gonzalo_domain::{Checkpoint, MemoryTier, RecordCodec, Session, Topic, Turn};
+pub use gonzalo_domain::{
+    Actor, ActorRole, BodyFormat, Checkpoint, Container, Link, LinkKind, LinkTarget, MemoryTier,
+    Priority, PriorityLevel, Provider, RecordCodec, Resolution, Session, State, StateCategory,
+    Ticket, TicketBody, TicketEvent, Topic, Turn,
+};
 
 #[cfg(feature = "fs")]
 pub use gonzalo_store_fs::FsStore;
@@ -29,6 +33,12 @@ pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
 #[cfg(feature = "graph")]
 pub use gonzalo_graph::{
     CodeGraph, GraphStore, InMemoryGraphStore, Reference, Symbol, SymbolKind, build_rust,
+};
+
+#[cfg(feature = "ticket")]
+pub use gonzalo_ticket::{
+    Capabilities, Cursor, FieldMapping, InMemorySource, Page, SourceError, StateMapping,
+    StateSignal, TicketSource, record_key,
 };
 
 #[cfg(all(test, feature = "fs"))]

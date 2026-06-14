@@ -1,6 +1,6 @@
 # ADR 0010 · Ticket systems as a normalized work-item capability layer
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-06-14
 
 ## Context
@@ -41,8 +41,10 @@ fixed per provider (GitLab free vs Premium; Asana completed vs section vs field)
 
 ## Decision
 
-Model tickets as a **capability layer over core** (ADR 0008), never a core
-concept (ADR 0002). `gonzalo-core` does not change.
+Model tickets as a **capability layer over core** (ADR 0008), not a new core
+*concept* (ADR 0002). The only core change is registering two new `RecordKind`
+variants (`Ticket`, `TicketEvent`) and their merge classes — the same minimal
+touch every domain kind already requires; no new core traits or types enter.
 
 - **Record shape.** New `RecordKind`s — a ticket and an append-only
   ticket-event/comment stream — with a typed `Ticket` view in `gonzalo-domain`,
@@ -88,7 +90,8 @@ concept (ADR 0002). `gonzalo-core` does not change.
 ## Consequences
 
 - **Positive:** Tracked work becomes a first-class `Record` — versioned, synced,
-  conflict-aware — with zero core change. The normalized model is validated across
+  conflict-aware — with only the minimal `RecordKind` registration every domain
+  kind needs. The normalized model is validated across
   nine platforms and nine archetypes, so adding a tenth (Shortcut, ClickUp,
   Azure DevOps variants) is "implement one trait + declare a mapping policy +
   capabilities + fixtures." Read-only-first confines all per-instance write risk
