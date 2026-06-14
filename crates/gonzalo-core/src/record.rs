@@ -11,6 +11,10 @@ pub enum RecordKind {
     Topic,
     Session,
     Checkpoint,
+    /// A tracked work item imported from an external ticket platform.
+    Ticket,
+    /// An append-only comment/event on a ticket.
+    TicketEvent,
 }
 
 /// How concurrent edits to a record of a given kind are reconciled.
@@ -27,8 +31,10 @@ pub enum MergeClass {
 impl RecordKind {
     pub fn merge_class(self) -> MergeClass {
         match self {
-            RecordKind::Topic | RecordKind::Session => MergeClass::AppendOnly,
-            RecordKind::MemoryTier => MergeClass::Structured,
+            RecordKind::Topic | RecordKind::Session | RecordKind::TicketEvent => {
+                MergeClass::AppendOnly
+            }
+            RecordKind::MemoryTier | RecordKind::Ticket => MergeClass::Structured,
             RecordKind::Checkpoint => MergeClass::Opaque,
         }
     }
@@ -82,6 +88,11 @@ mod tests {
         assert_eq!(RecordKind::Session.merge_class(), MergeClass::AppendOnly);
         assert_eq!(RecordKind::MemoryTier.merge_class(), MergeClass::Structured);
         assert_eq!(RecordKind::Checkpoint.merge_class(), MergeClass::Opaque);
+        assert_eq!(RecordKind::Ticket.merge_class(), MergeClass::Structured);
+        assert_eq!(
+            RecordKind::TicketEvent.merge_class(),
+            MergeClass::AppendOnly
+        );
     }
 
     #[test]

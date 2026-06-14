@@ -21,9 +21,10 @@ surfacing, plus capability layers — all consumed through the `gonzalo` facade
 | `gonzalo-store-git` `[git]` | git-backed substrate (commit-per-write, FF pull/push) |
 | `gonzalo-store-s3` `[s3]` | S3-compatible object-store substrate |
 | `gonzalo-store-server` `[remote]` | client substrate over a remote daemon (HTTP or gRPC) |
-| `gonzalo-domain` | typed views: `MemoryTier`, `Topic`, `Session`, `Checkpoint` |
+| `gonzalo-domain` | typed views: `MemoryTier`, `Topic`, `Session`, `Checkpoint`, `Ticket` |
 | `gonzalo-vector` `[vector]` | `Embedder` + `VectorIndex` (exact cosine in-memory index) |
 | `gonzalo-graph` `[graph]` | tree-sitter code graph (`build_rust`, `GraphStore`) |
+| `gonzalo-ticket` `[ticket]` | normalized work-item layer: `TicketSource`, `StateMapping` (ADR 0010) |
 | `gonzalo-proto` / `gonzalo-server` | daemon: gRPC + HTTP/JSON over one service, optional bearer auth (`gonzalod` bin) |
 | `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync` |
 

@@ -1,0 +1,21 @@
+[package]
+name = "gonzalo-ticket"
+description = "Ticket / work-item capability layer for gonzalo (normalized over external trackers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core   = { workspace = true }
+gonzalo-domain = { workspace = true }
+async-trait    = { workspace = true }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
