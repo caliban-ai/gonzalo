@@ -7,6 +7,8 @@
 
 mod mapping;
 mod project_mapping;
+mod project_source;
 mod source;
 
+pub use project_source::GitHubProjectSource;
 pub use source::GitHubSource;
