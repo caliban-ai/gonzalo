@@ -23,8 +23,12 @@ pub enum IngestError {
     Source(#[from] crate::SourceError),
     #[error("store: {0}")]
     Store(#[from] gonzalo_core::CoreError),
-    #[error("write conflict on {0}")]
-    Conflict(String),
+    #[error("write conflict on {key}: expected {expected:?}, store has {current:?}")]
+    Conflict {
+        key: gonzalo_core::RecordKey,
+        expected: Option<Revision>,
+        current: Revision,
+    },
 }
 
 /// Pull all changed tickets from `source` and upsert them into `store`,
@@ -53,6 +57,7 @@ pub async fn ingest(
     Ok(summary)
 }
 
+/// Per-ticket result of an upsert, tallied into [`IngestSummary`].
 enum Outcome {
     Imported,
     Updated,
@@ -97,7 +102,11 @@ async fn upsert(store: &dyn Store, ticket: &Ticket, author: &str) -> Result<Outc
         } else {
             Outcome::Imported
         }),
-        PutResult::Conflict(_) => Err(IngestError::Conflict(format!("{key}"))),
+        PutResult::Conflict(c) => Err(IngestError::Conflict {
+            key: c.key,
+            expected: c.expected,
+            current: c.current.revision,
+        }),
     }
 }
 
@@ -171,5 +180,84 @@ mod tests {
                 unchanged: 1
             }
         );
+    }
+
+    /// A source that returns two pages, driving the pagination loop across the
+    /// cursor boundary. Stateless: it branches on the incoming cursor value.
+    struct PagedSource;
+
+    #[async_trait::async_trait]
+    impl crate::TicketSource for PagedSource {
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities::default()
+        }
+
+        async fn fetch_changed(&self, cursor: &crate::Cursor) -> crate::Result<crate::Page> {
+            match cursor.0.as_deref() {
+                None => Ok(crate::Page {
+                    tickets: vec![ticket("p1", "P1")],
+                    next: crate::Cursor(Some("p2".into())),
+                }),
+                Some("p2") => Ok(crate::Page {
+                    tickets: vec![ticket("p2", "P2")],
+                    next: crate::Cursor::default(),
+                }),
+                Some(other) => Err(crate::SourceError::Backend(format!(
+                    "unexpected cursor: {other}"
+                ))),
+            }
+        }
+
+        async fn get(&self, uid: &str) -> crate::Result<Ticket> {
+            Ok(ticket(uid, uid))
+        }
+    }
+
+    #[tokio::test]
+    async fn paginates_across_multiple_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        let summary = ingest(&PagedSource, &store, "tester").await.unwrap();
+        assert_eq!(summary.imported, 2);
+    }
+
+    /// A store whose `put` always conflicts, to exercise the conflict arm.
+    struct ConflictStore;
+
+    #[async_trait::async_trait]
+    impl gonzalo_core::Store for ConflictStore {
+        async fn get(
+            &self,
+            _key: &gonzalo_core::RecordKey,
+        ) -> gonzalo_core::Result<Option<Record>> {
+            Ok(None)
+        }
+
+        async fn put(
+            &self,
+            record: Record,
+            expected: Option<Revision>,
+        ) -> gonzalo_core::Result<PutResult> {
+            Ok(PutResult::Conflict(Box::new(gonzalo_core::Conflict {
+                key: record.key.clone(),
+                expected,
+                current: record,
+            })))
+        }
+
+        async fn list(
+            &self,
+            _prefix: &gonzalo_core::KeyPrefix,
+        ) -> gonzalo_core::Result<Vec<gonzalo_core::RecordKey>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn surfaces_store_conflict() {
+        let src = InMemorySource::new(vec![ticket("a", "A")]);
+        let err = ingest(&src, &ConflictStore, "tester").await.unwrap_err();
+        assert!(matches!(err, IngestError::Conflict { .. }));
     }
 }
