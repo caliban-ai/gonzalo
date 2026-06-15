@@ -1,0 +1,26 @@
+[package]
+name = "gonzalo-ticket-config"
+description = "Multi-connection ticket config + provider registry for gonzalo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-domain        = { workspace = true }
+gonzalo-ticket        = { workspace = true }
+gonzalo-ticket-github = { workspace = true }
+serde      = { workspace = true }
+toml       = { workspace = true }
+thiserror  = { workspace = true }
+
+# The env-var tests must mutate process env (unsafe in edition 2024), so this
+# crate uses a local `deny` instead of the workspace-wide `forbid`, which cannot
+# be locally overridden. Library code remains unsafe-free.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
