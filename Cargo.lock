@@ -1196,6 +1196,7 @@ dependencies = [
  "gonzalo-store-s3",
  "gonzalo-store-server",
  "gonzalo-ticket",
+ "gonzalo-ticket-asana",
  "gonzalo-ticket-github",
  "gonzalo-ticket-gitlab",
  "gonzalo-ticket-jira",
@@ -1335,6 +1336,19 @@ dependencies = [
  "gonzalo-core",
  "gonzalo-domain",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "gonzalo-ticket-asana"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gonzalo-domain",
+ "gonzalo-ticket",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
