@@ -52,13 +52,23 @@ pub struct AsanaSource {
 impl AsanaSource {
     /// Import tasks from the Asana `project` gid, authenticating with a PAT.
     pub fn new(project: impl Into<String>, token: impl Into<String>) -> Result<Self> {
+        Self::with_base(DEFAULT_BASE, project, token)
+    }
+
+    /// As [`AsanaSource::new`] but against a custom API base (e.g. a test
+    /// server).
+    pub fn with_base(
+        base: &str,
+        project: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent("gonzalo-ticket-asana")
             .build()
             .map_err(be)?;
         Ok(Self {
             client,
-            base: reqwest::Url::parse(DEFAULT_BASE).map_err(be)?,
+            base: reqwest::Url::parse(base).map_err(be)?,
             project: project.into(),
             token: token.into(),
             mapping: None,

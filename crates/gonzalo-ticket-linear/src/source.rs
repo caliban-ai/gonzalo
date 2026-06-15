@@ -69,13 +69,18 @@ impl LinearSource {
     /// Connect with a Linear API key (sent verbatim in the `Authorization`
     /// header, per Linear's personal-API-key scheme).
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
+        Self::with_endpoint(ENDPOINT, api_key)
+    }
+
+    /// Connect against a custom GraphQL endpoint (e.g. a test server).
+    pub fn with_endpoint(endpoint: &str, api_key: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent("gonzalo-ticket-linear")
             .build()
             .map_err(be)?;
         Ok(Self {
             client,
-            endpoint: reqwest::Url::parse(ENDPOINT).map_err(be)?,
+            endpoint: reqwest::Url::parse(endpoint).map_err(be)?,
             api_key: api_key.into(),
             mapping: None,
         })

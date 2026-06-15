@@ -37,6 +37,16 @@ impl GitHubSource {
         Self::build(owner_repo.into(), Some(token.into()), API_ROOT)
     }
 
+    /// Import against a custom API base — GitHub Enterprise (e.g.
+    /// `https://ghe.example.com/api/v3`) or a test server.
+    pub fn with_base(
+        api_root: &str,
+        owner_repo: impl Into<String>,
+        token: Option<String>,
+    ) -> Result<Self> {
+        Self::build(owner_repo.into(), token, api_root)
+    }
+
     fn build(owner_repo: String, token: Option<String>, api_root: &str) -> Result<Self> {
         let (owner, repo) = owner_repo.split_once('/').ok_or_else(|| {
             SourceError::Backend(format!("expected owner/repo, got {owner_repo}"))
