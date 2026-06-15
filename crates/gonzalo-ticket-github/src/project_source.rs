@@ -364,11 +364,14 @@ impl TicketSource for GitHubProjectSource {
     }
 
     async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
-        // Resolve the target category back to a board column.
+        // Resolve the target category back to a board column. An unmapped
+        // category is a genuine capability gap (`Unsupported`); an ambiguous one
+        // is a fixable misconfiguration, so surface the conflicting columns
+        // (`Backend`) to tell the operator what to put in `set_targets`.
         let column = self
             .mapping
             .column_for(target, &self.set_targets)
-            .map_err(|e| SourceError::Unsupported(reverse_reason(&e)))?;
+            .map_err(reverse_error)?;
 
         // uid (owner/repo#number) → parts. `number` here is the ISSUE number
         // (u64); `self.project_number` is the PROJECT number (u32).
@@ -399,6 +402,11 @@ impl TicketSource for GitHubProjectSource {
                 .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
                 .collect::<Vec<_>>()
                 .join("; ");
+            let msg = if msg.is_empty() {
+                format!("{} error(s) with no message", errors.len())
+            } else {
+                msg
+            };
             return Err(SourceError::Backend(format!("github graphql: {msg}")));
         }
         Ok(())
@@ -409,14 +417,17 @@ fn be<E: std::fmt::Display>(e: E) -> SourceError {
     SourceError::Backend(e.to_string())
 }
 
-/// `SourceError::Unsupported` needs a `&'static str`; map the reverse-mapping
-/// failure kind to a stable reason (the detail is in the error's Display).
-fn reverse_reason(e: &gonzalo_ticket::ReverseError) -> &'static str {
+/// Map a reverse-mapping failure to a `SourceError`. `Unmapped` is a capability
+/// gap (no column expresses the category) → `Unsupported`; `Ambiguous` is a
+/// fixable misconfiguration, so carry the conflicting column names → `Backend`.
+fn reverse_error(e: gonzalo_ticket::ReverseError) -> SourceError {
     match e {
-        gonzalo_ticket::ReverseError::Unmapped(_) => "set_state: no column maps to target category",
-        gonzalo_ticket::ReverseError::Ambiguous(_, _) => {
-            "set_state: target category is ambiguous; configure set_targets"
+        gonzalo_ticket::ReverseError::Unmapped(_) => {
+            SourceError::Unsupported("set_state: no column maps to target category")
         }
+        gonzalo_ticket::ReverseError::Ambiguous(cat, cols) => SourceError::Backend(format!(
+            "set_state: category {cat:?} maps to multiple columns {cols:?}; configure set_targets"
+        )),
     }
 }
 
