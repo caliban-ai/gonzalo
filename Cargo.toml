@@ -15,6 +15,7 @@ members = [
     "crates/gonzalo-ticket",
     "crates/gonzalo-ticket-github",
     "crates/gonzalo-ticket-jira",
+    "crates/gonzalo-ticket-linear",
     "crates/gonzalo-cli",
 ]
 
@@ -50,6 +51,7 @@ gonzalo-graph = { path = "crates/gonzalo-graph" }
 gonzalo-ticket = { path = "crates/gonzalo-ticket" }
 gonzalo-ticket-github = { path = "crates/gonzalo-ticket-github" }
 gonzalo-ticket-jira = { path = "crates/gonzalo-ticket-jira" }
+gonzalo-ticket-linear = { path = "crates/gonzalo-ticket-linear" }
 gonzalo-cli   = { path = "crates/gonzalo-cli" }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
