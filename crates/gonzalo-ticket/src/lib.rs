@@ -10,10 +10,12 @@
 //! provider connectors (GitHub, Jira, Linear, …) are separate, feature-gated
 //! crates built on this surface.
 
+pub mod ingest;
 pub mod mapping;
 pub mod mock;
 pub mod source;
 
+pub use ingest::{IngestError, IngestSummary, ingest};
 pub use mapping::{FieldMapping, StateMapping, StateSignal};
 pub use mock::InMemorySource;
 pub use source::{Capabilities, Cursor, Page, Result, SourceError, TicketSource};
