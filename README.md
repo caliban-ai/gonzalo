@@ -29,6 +29,7 @@ surfacing, plus capability layers — all consumed through the `gonzalo` facade
 | `gonzalo-ticket-jira` `[ticket-jira]` | Jira issue connector (`JiraSource`, statusCategory + ADF, read-only) |
 | `gonzalo-ticket-linear` `[ticket-linear]` | Linear issue connector (`LinearSource`, GraphQL, read-only) |
 | `gonzalo-ticket-gitlab` `[ticket-gitlab]` | GitLab issue connector (`GitLabSource`, scoped-label workflow, read-only) |
+| `gonzalo-ticket-asana` `[ticket-asana]` | Asana task connector (`AsanaSource`, completed/section/field signals, read-only) |
 | `gonzalo-proto` / `gonzalo-server` | daemon: gRPC + HTTP/JSON over one service, optional bearer auth (`gonzalod` bin) |
 | `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync` |
 
