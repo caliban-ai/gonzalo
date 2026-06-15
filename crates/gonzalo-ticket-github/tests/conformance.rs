@@ -59,3 +59,23 @@ async fn gets_a_single_issue() {
     assert_eq!(t.state.category, StateCategory::Open);
     assert_ticket_invariants(&t);
 }
+
+#[tokio::test]
+async fn writes_state_and_comment() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/o/r/issues/15"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/o/r/issues/15/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let src = GitHubSource::with_base(&server.uri(), "o/r", Some("tok".into())).unwrap();
+    src.set_state("o/r#15", StateCategory::Done).await.unwrap();
+    src.comment("o/r#15", "hi").await.unwrap();
+}

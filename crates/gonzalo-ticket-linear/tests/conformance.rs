@@ -46,3 +46,19 @@ async fn surfaces_graphql_errors() {
     let err = src.fetch_changed(&Cursor::default()).await.unwrap_err();
     assert!(err.to_string().contains("unauthorized"));
 }
+
+#[tokio::test]
+async fn set_state_resolves_team_state_then_updates() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {"issue": {"team": {"states": {"nodes": [
+                {"id": "st-done", "type": "completed"}
+            ]}}}}
+        })))
+        .mount(&server)
+        .await;
+    let src = LinearSource::with_endpoint(&server.uri(), "k").unwrap();
+    src.set_state("u1", StateCategory::Done).await.unwrap();
+    src.comment("u1", "hi").await.unwrap();
+}

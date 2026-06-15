@@ -69,3 +69,23 @@ async fn completed_signal_policy_variant() {
     let page = src.fetch_changed(&Cursor::default()).await.unwrap();
     assert_eq!(page.tickets[0].state.category, StateCategory::Backlog);
 }
+
+#[tokio::test]
+async fn writes_completed_and_story() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/tasks/1201"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tasks/1201/stories"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let src = AsanaSource::with_base(&server.uri(), "p1", "tok").unwrap();
+    src.set_state("1201", StateCategory::Done).await.unwrap();
+    src.comment("1201", "hi").await.unwrap();
+}
