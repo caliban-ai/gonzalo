@@ -40,6 +40,19 @@ pub struct StateMapping {
     pub default: StateCategory,
 }
 
+/// Failure resolving a normalized category back to a board column for write-back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReverseError {
+    /// No column maps to this category and no override was given.
+    #[error("no column maps to category {0:?}")]
+    Unmapped(StateCategory),
+    /// More than one column maps to this category; an explicit override is required.
+    #[error(
+        "category {0:?} is ambiguous across columns {1:?}; set an explicit set_targets override"
+    )]
+    Ambiguous(StateCategory, Vec<String>),
+}
+
 impl StateMapping {
     /// Translate a raw status value to a normalized category, falling back to
     /// [`StateMapping::default`] when nothing matches.
@@ -57,6 +70,33 @@ impl StateMapping {
             .find(|(k, _)| k.eq_ignore_ascii_case(raw_value))
             .map(|(_, cat)| *cat)
             .unwrap_or(self.default)
+    }
+
+    /// Resolve a normalized `category` back to the board column name to write.
+    ///
+    /// `overrides` (category→column) win outright. Otherwise the column is the
+    /// unique `by_value` key whose category equals `category`. The `default`
+    /// category is a read-time fallback only and is never a write target.
+    pub fn column_for(
+        &self,
+        category: StateCategory,
+        overrides: &BTreeMap<StateCategory, String>,
+    ) -> Result<String, ReverseError> {
+        if let Some(col) = overrides.get(&category) {
+            return Ok(col.clone());
+        }
+        let mut matches: Vec<String> = self
+            .by_value
+            .iter()
+            .filter(|(_, c)| **c == category)
+            .map(|(k, _)| k.clone())
+            .collect();
+        matches.sort(); // deterministic order for the ambiguity message
+        match matches.len() {
+            0 => Err(ReverseError::Unmapped(category)),
+            1 => Ok(matches.pop().unwrap()),
+            _ => Err(ReverseError::Ambiguous(category, matches)),
+        }
     }
 }
 
@@ -140,5 +180,67 @@ mod tests {
         };
         assert_eq!(m.category_of("true"), StateCategory::Done);
         assert_eq!(m.category_of("false"), StateCategory::Open);
+    }
+
+    fn board_mapping() -> StateMapping {
+        // 1:1 columns like the caliban-ai board.
+        let mut by_value = BTreeMap::new();
+        by_value.insert("Backlog".into(), StateCategory::Backlog);
+        by_value.insert("In progress".into(), StateCategory::InProgress);
+        by_value.insert("Done".into(), StateCategory::Done);
+        StateMapping {
+            signal: StateSignal::NativeStatus,
+            by_value,
+            default: StateCategory::Open,
+        }
+    }
+
+    #[test]
+    fn column_for_inverts_unique_mapping() {
+        let m = board_mapping();
+        let none: BTreeMap<StateCategory, String> = BTreeMap::new();
+        assert_eq!(
+            m.column_for(StateCategory::InProgress, &none).unwrap(),
+            "In progress"
+        );
+        assert_eq!(m.column_for(StateCategory::Done, &none).unwrap(), "Done");
+    }
+
+    #[test]
+    fn column_for_unmapped_category_errors() {
+        let m = board_mapping();
+        let none: BTreeMap<StateCategory, String> = BTreeMap::new();
+        assert_eq!(
+            m.column_for(StateCategory::Pending, &none),
+            Err(ReverseError::Unmapped(StateCategory::Pending))
+        );
+    }
+
+    #[test]
+    fn column_for_override_wins_and_resolves_ambiguity() {
+        // Two columns share the Done category → ambiguous without an override.
+        let mut by_value = BTreeMap::new();
+        by_value.insert("Shipped".into(), StateCategory::Done);
+        by_value.insert("Done".into(), StateCategory::Done);
+        let m = StateMapping {
+            signal: StateSignal::NativeStatus,
+            by_value,
+            default: StateCategory::Open,
+        };
+
+        let none: BTreeMap<StateCategory, String> = BTreeMap::new();
+        match m.column_for(StateCategory::Done, &none) {
+            Err(ReverseError::Ambiguous(StateCategory::Done, cols)) => {
+                assert_eq!(cols, vec!["Done".to_string(), "Shipped".to_string()]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(StateCategory::Done, "Shipped".to_string());
+        assert_eq!(
+            m.column_for(StateCategory::Done, &overrides).unwrap(),
+            "Shipped"
+        );
     }
 }
