@@ -1,0 +1,94 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/guide/**"
+      - "docs/adr/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/guide/**"
+      - "docs/adr/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MDBOOK_VERSION: "0.4.52"
+  MDBOOK_ADMONISH_VERSION: "1.20.0"
+  MDBOOK_MERMAID_VERSION: "0.14.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook toolchain
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@${{ env.MDBOOK_VERSION }},mdbook-admonish@${{ env.MDBOOK_ADMONISH_VERSION }},mdbook-mermaid@${{ env.MDBOOK_MERMAID_VERSION }}
+
+      - name: Fetch shared theme from the hub
+        uses: actions/checkout@v4
+        with:
+          repository: caliban-ai/caliban-ai.github.io
+          path: .hub
+          sparse-checkout: theme
+
+      - name: Install shared theme into the guide
+        run: |
+          mkdir -p docs/guide/theme
+          cp .hub/theme/caliban-ai.css docs/guide/theme/caliban-ai.css
+          cp .hub/theme/nav.js docs/guide/theme/nav.js
+
+      - name: Ingest ADRs
+        run: ./docs/guide/sync-adrs.sh
+
+      - name: Build the guide
+        run: mdbook build docs/guide
+
+      - name: Build API docs (rustdoc)
+        run: cargo doc --workspace --no-deps
+
+      - name: Assemble API into the site under /api
+        run: |
+          mkdir -p docs/guide/book/api
+          cp -r target/doc/* docs/guide/book/api/
+          # Generate an index linking to each crate's docs.
+          {
+            echo "<!doctype html><meta charset=utf-8><title>gonzalo API</title><h1>gonzalo API reference</h1><ul>"
+            for d in target/doc/*/; do
+              name="$(basename "$d")"
+              [[ -f "$d/index.html" ]] && echo "<li><a href=\"./$name/index.html\">$name</a></li>"
+            done
+            echo "</ul>"
+          } > docs/guide/book/api/index.html
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/guide/book
+
+  deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
