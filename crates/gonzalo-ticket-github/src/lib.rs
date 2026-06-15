@@ -6,6 +6,7 @@
 //! thin HTTP layer. Read-only in phase 1.
 
 mod mapping;
+mod project_mapping;
 mod source;
 
 pub use source::GitHubSource;
