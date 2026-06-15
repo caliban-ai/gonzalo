@@ -13,7 +13,17 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GqlResponse {
-    pub data: GqlData,
+    #[serde(default)]
+    pub data: Option<GqlData>,
+    #[serde(default)]
+    pub errors: Vec<GqlError>,
+}
+
+/// A GraphQL top-level error (GitHub returns HTTP 200 with these for bad
+/// queries, auth failures, or an unknown org/project).
+#[derive(Debug, Deserialize)]
+pub(crate) struct GqlError {
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +240,7 @@ mod tests {
         let m = board_mapping();
         let tickets: Vec<Ticket> = resp
             .data
+            .unwrap()
             .organization
             .project
             .items

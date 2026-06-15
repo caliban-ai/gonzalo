@@ -4,7 +4,7 @@
 //! to completion and returns an empty `next` cursor; cheap re-sync is the
 //! ingest engine's job (content-hash dedup).
 
-use crate::project_mapping::{GqlResponse, item_to_ticket};
+use crate::project_mapping::{GqlItems, GqlResponse, item_to_ticket};
 use async_trait::async_trait;
 use gonzalo_domain::Ticket;
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
@@ -62,7 +62,7 @@ impl GitHubProjectSource {
                 .error_for_status()
                 .map_err(be)?;
             let parsed: GqlResponse = resp.json().await.map_err(be)?;
-            let items = parsed.data.organization.project.items;
+            let items = items_or_error(parsed)?;
             out.extend(
                 items
                     .nodes
@@ -80,6 +80,26 @@ impl GitHubProjectSource {
         }
         Ok(out)
     }
+}
+
+/// Pull the items page out of a parsed GraphQL response, surfacing any
+/// top-level GraphQL `errors` (GitHub returns these with HTTP 200 for bad
+/// tokens, unknown orgs, or malformed queries) as a `Backend` error rather
+/// than letting a `null` `data` become an opaque deserialize failure.
+pub(crate) fn items_or_error(parsed: GqlResponse) -> Result<GqlItems> {
+    if !parsed.errors.is_empty() {
+        let msg = parsed
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(SourceError::Backend(format!("github graphql: {msg}")));
+    }
+    let data = parsed
+        .data
+        .ok_or_else(|| SourceError::Backend("github graphql: response had no data".into()))?;
+    Ok(data.organization.project.items)
 }
 
 /// Build the GraphQL request body (query + variables). Pure, so it is unit-
@@ -130,6 +150,9 @@ impl TicketSource for GitHubProjectSource {
         })
     }
 
+    /// Find a ticket by uid. Note: this scans the **whole board** (every page)
+    /// on each call — intended for occasional single lookups on a small board,
+    /// not for calling in a loop. Bulk consumers should use `fetch_changed`.
     async fn get(&self, uid: &str) -> Result<Ticket> {
         self.fetch_all()
             .await?
@@ -178,5 +201,23 @@ mod tests {
         assert_eq!(src.org, "caliban-ai");
         assert_eq!(src.project_number, 1);
         assert!(!src.capabilities().push);
+    }
+
+    #[test]
+    fn graphql_errors_surface_as_backend() {
+        let body = r#"{"data": null, "errors": [{"message": "Bad credentials"}]}"#;
+        let parsed: crate::project_mapping::GqlResponse = serde_json::from_str(body).unwrap();
+        let err = items_or_error(parsed).unwrap_err();
+        match err {
+            gonzalo_ticket::SourceError::Backend(m) => assert!(m.contains("Bad credentials")),
+            other => panic!("expected Backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_data_without_errors_is_backend() {
+        let body = r#"{"data": null}"#;
+        let parsed: crate::project_mapping::GqlResponse = serde_json::from_str(body).unwrap();
+        assert!(items_or_error(parsed).is_err());
     }
 }
