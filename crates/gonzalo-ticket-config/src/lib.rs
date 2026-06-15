@@ -148,6 +148,9 @@ pub fn write_targets(conn: &Connection) -> Result<BTreeMap<StateCategory, String
     Ok(out)
 }
 
+/// Parse a normalized state-category name (`triage`, `backlog`, `open`,
+/// `in_progress`, `pending`, `done`, `canceled`) into a [`StateCategory`].
+/// Returns `None` for any other string. Shared by config parsing and the CLI.
 pub fn parse_category(s: &str) -> Option<StateCategory> {
     Some(match s {
         "triage" => StateCategory::Triage,
