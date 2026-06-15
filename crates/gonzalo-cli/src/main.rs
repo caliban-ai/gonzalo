@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use gonzalo_cli::{get, list, migrate, status, sync_stores, ticket_sync};
+use gonzalo_cli::{get, list, migrate, status, sync_stores, ticket_move, ticket_sync};
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
 
@@ -104,6 +104,19 @@ enum TicketCommands {
         root: PathBuf,
         /// Ticket uid (owner/repo#number).
         uid: String,
+    },
+    /// Move a board card to the column for a normalized state category.
+    Move {
+        /// Path to the tickets TOML config.
+        #[arg(long, default_value = "tickets.toml")]
+        config: PathBuf,
+        /// Connection name (optional when only one is configured).
+        #[arg(long)]
+        connection: Option<String>,
+        /// Ticket uid (owner/repo#number).
+        uid: String,
+        /// Target category: triage|backlog|open|in_progress|pending|done|canceled.
+        category: String,
     },
 }
 
@@ -224,6 +237,15 @@ async fn main() -> Result<()> {
                     Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
                     None => println!("not found"),
                 }
+            }
+            TicketCommands::Move {
+                config,
+                connection,
+                uid,
+                category,
+            } => {
+                ticket_move(&config, connection.as_deref(), &uid, &category).await?;
+                println!("moved {uid} → {category}");
             }
         },
     }

@@ -8,7 +8,7 @@ use gonzalo_core::{
 };
 use gonzalo_store_fs::FsStore;
 use gonzalo_ticket::IngestSummary;
-use gonzalo_ticket_config::Config;
+use gonzalo_ticket_config::{Config, Connection, parse_category};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -195,6 +195,48 @@ pub async fn ticket_sync(
         });
     }
     Ok(reports)
+}
+
+// ─── ticket move ─────────────────────────────────────────────────────────────
+
+/// Move a board card to the column for `category`. Selects the connection named
+/// `connection`, or the sole connection if there is exactly one.
+pub async fn ticket_move(
+    config_path: &Path,
+    connection: Option<&str>,
+    uid: &str,
+    category: &str,
+) -> Result<()> {
+    let cat = parse_category(category)
+        .ok_or_else(|| anyhow::anyhow!("unknown state category {category:?}"))?;
+    let config = Config::load(config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let conn = select_connection(&config.connections, connection)?;
+    let source = gonzalo_ticket_config::build_source(conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    source
+        .set_state(uid, cat)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Pick the requested connection by name, or the only one if unambiguous.
+fn select_connection<'a>(
+    connections: &'a [Connection],
+    name: Option<&str>,
+) -> Result<&'a Connection> {
+    match name {
+        Some(n) => connections
+            .iter()
+            .find(|c| c.name == n)
+            .ok_or_else(|| anyhow::anyhow!("no connection named {n:?}")),
+        None => match connections {
+            [one] => Ok(one),
+            [] => Err(anyhow::anyhow!("no connections configured")),
+            _ => Err(anyhow::anyhow!(
+                "multiple connections configured; pass --connection <name>"
+            )),
+        },
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -386,5 +428,41 @@ mod tests {
 
         let reports = ticket_sync(&cfg_path, root.path(), "tester").await.unwrap();
         assert!(reports.is_empty());
+    }
+
+    // ── ticket_move: unknown category errors before any network call ─────────
+
+    #[tokio::test]
+    async fn ticket_move_unknown_category_errors() {
+        let cfg = TempDir::new().unwrap();
+        let cfg_path = cfg.path().join("tickets.toml");
+        std::fs::write(
+            &cfg_path,
+            "[[connection]]\nname=\"b\"\nprovider=\"github-projects\"\norg=\"o\"\nproject=1\ntoken_env=\"X\"\n",
+        )
+        .unwrap();
+        // "frozen" is not a valid category → error before any network call.
+        let err = ticket_move(&cfg_path, None, "o/r#1", "frozen")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("category"), "got {err}");
+    }
+
+    // ── ticket_move: ambiguous connection requires --connection ─────────────
+
+    #[tokio::test]
+    async fn ticket_move_requires_connection_when_many() {
+        let cfg = TempDir::new().unwrap();
+        let cfg_path = cfg.path().join("tickets.toml");
+        std::fs::write(
+            &cfg_path,
+            "[[connection]]\nname=\"a\"\nprovider=\"github-projects\"\norg=\"o\"\nproject=1\ntoken_env=\"X\"\n\
+             [[connection]]\nname=\"b\"\nprovider=\"github-projects\"\norg=\"o\"\nproject=2\ntoken_env=\"Y\"\n",
+        )
+        .unwrap();
+        let err = ticket_move(&cfg_path, None, "o/r#1", "done")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("connection"), "got {err}");
     }
 }

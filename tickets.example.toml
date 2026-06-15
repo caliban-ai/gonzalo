@@ -18,3 +18,10 @@ default       = "open"
 "In progress" = "in_progress"
 "Blocked"     = "pending"
 "Done"        = "done"
+
+# Optional: write-back overrides for `gonzalo ticket move`. Only needed when two
+# columns map to the same category (the reverse of state_map is ambiguous).
+# Keys are category names; values are the board column to move a card to.
+# [connection.set_targets]
+# done = "Done"
+# in_progress = "In progress"
