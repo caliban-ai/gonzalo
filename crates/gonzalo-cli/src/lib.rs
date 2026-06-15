@@ -6,6 +6,8 @@ use gonzalo_core::{
     segment,
 };
 use gonzalo_store_fs::FsStore;
+use gonzalo_ticket::IngestSummary;
+use gonzalo_ticket_config::Config;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -162,6 +164,36 @@ pub async fn sync_stores(a: &Path, b: &Path) -> Result<SyncSummary> {
         merged: report.merged.len(),
         conflicts: report.conflicts.len(),
     })
+}
+
+// ─── ticket sync ───────────────────────────────────────────────────────────
+
+/// Per-connection ingest result.
+pub struct TicketSyncReport {
+    pub connection: String,
+    pub summary: IngestSummary,
+}
+
+/// Load the ticket config, build each connection's source, and ingest its
+/// tickets into the fs store at `root`.
+pub async fn ticket_sync(
+    config_path: &Path,
+    root: &Path,
+    author: &str,
+) -> Result<Vec<TicketSyncReport>> {
+    let config = Config::load(config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let store = FsStore::new(root);
+    let mut reports = Vec::new();
+    for (name, source) in config.sources().map_err(|e| anyhow::anyhow!("{e}"))? {
+        let summary = gonzalo_ticket::ingest(source.as_ref(), &store, author)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        reports.push(TicketSyncReport {
+            connection: name,
+            summary,
+        });
+    }
+    Ok(reports)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -340,5 +372,18 @@ mod tests {
         // Store B should now have the key.
         let keys = list(store_b.path(), None, None).await.unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    // ── ticket_sync: empty config → no reports ───────────────────────────────
+
+    #[tokio::test]
+    async fn ticket_sync_with_no_connections_returns_no_reports() {
+        let root = TempDir::new().unwrap();
+        let cfg = TempDir::new().unwrap();
+        let cfg_path = cfg.path().join("tickets.toml");
+        std::fs::write(&cfg_path, "").unwrap(); // empty config = zero connections
+
+        let reports = ticket_sync(&cfg_path, root.path(), "tester").await.unwrap();
+        assert!(reports.is_empty());
     }
 }
