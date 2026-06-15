@@ -25,18 +25,38 @@ surfacing, plus capability layers — all consumed through the `gonzalo` facade
 | `gonzalo-vector` `[vector]` | `Embedder` + `VectorIndex` (exact cosine in-memory index) |
 | `gonzalo-graph` `[graph]` | tree-sitter code graph (`build_rust`, `GraphStore`) |
 | `gonzalo-ticket` `[ticket]` | normalized work-item layer: `TicketSource`, `StateMapping` (ADR 0010) |
-| `gonzalo-ticket-github` `[ticket-github]` | GitHub issue connector (`GitHubSource`, read + write-back) |
+| `gonzalo-ticket-github` `[ticket-github]` | GitHub connectors: `GitHubSource` (REST issues, read + write-back); `GitHubProjectSource` (Projects v2 board over GraphQL, read-only) |
 | `gonzalo-ticket-jira` `[ticket-jira]` | Jira issue connector (`JiraSource`, statusCategory + ADF, transition write-back) |
 | `gonzalo-ticket-linear` `[ticket-linear]` | Linear issue connector (`LinearSource`, GraphQL, read + write-back) |
 | `gonzalo-ticket-gitlab` `[ticket-gitlab]` | GitLab issue connector (`GitLabSource`, scoped-label workflow, read + write-back) |
 | `gonzalo-ticket-asana` `[ticket-asana]` | Asana task connector (`AsanaSource`, completed/section/field signals, read + write-back) |
+| `gonzalo-ticket-config` | multi-connection ticket config (`tickets.toml`) + provider registry → `Box<dyn TicketSource>` |
 | `gonzalo-knowledge` `[knowledge]` | knowledge store: `KnowledgeStore` over records + vector by `RecordKey` (ADR 0011) |
-| `gonzalo-proto` / `gonzalo-server` | daemon: gRPC + HTTP/JSON over one service, optional bearer auth (`gonzalod` bin) |
-| `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync` |
+| `gonzalo-proto` / `gonzalo-server` | daemon: gRPC + HTTP/JSON over one service, optional bearer auth (`gonzalod` bin); `TicketSync` RPC + `POST /v1/tickets/sync` |
+| `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync`, `ticket sync`/`list`/`get` |
 
 Every storage substrate passes a shared conformance suite shipped by
 `gonzalo-core`. The consistency model surfaces concurrent edits as
 `PutResult::Conflict` (never silently lost) and auto-merges append-only kinds.
+
+## Tickets
+
+Gonzalo can import the shared caliban-ai Kanban board (GitHub Projects v2 #1)
+into a store as first-class ticket records, with each card's board column
+normalized into a `State.category`. Configure connections in a `tickets.toml`
+(see `tickets.example.toml`):
+
+```bash
+export KANBAN_PROJECT_PAT=ghp_...           # PAT with read:project + repo scope
+cp tickets.example.toml tickets.toml
+gonzalo ticket sync --config tickets.toml --root ./store
+gonzalo ticket list --root ./store
+gonzalo ticket get  --root ./store "caliban-ai/gonzalo#15"
+```
+
+The daemon exposes the same operation: `POST /v1/tickets/sync` with a JSON
+connection body, or the `TicketSync` gRPC. Write-back (moving cards) is not yet
+implemented — this is a read-only import (ADR 0010 phase 1).
 
 ## License
 

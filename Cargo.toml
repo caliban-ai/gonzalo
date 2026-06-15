@@ -14,6 +14,7 @@ members = [
     "crates/gonzalo-graph",
     "crates/gonzalo-ticket",
     "crates/gonzalo-ticket-github",
+    "crates/gonzalo-ticket-config",
     "crates/gonzalo-ticket-jira",
     "crates/gonzalo-ticket-linear",
     "crates/gonzalo-ticket-gitlab",
@@ -53,6 +54,7 @@ gonzalo-vector = { path = "crates/gonzalo-vector" }
 gonzalo-graph = { path = "crates/gonzalo-graph" }
 gonzalo-ticket = { path = "crates/gonzalo-ticket" }
 gonzalo-ticket-github = { path = "crates/gonzalo-ticket-github" }
+gonzalo-ticket-config = { path = "crates/gonzalo-ticket-config" }
 gonzalo-ticket-jira = { path = "crates/gonzalo-ticket-jira" }
 gonzalo-ticket-linear = { path = "crates/gonzalo-ticket-linear" }
 gonzalo-ticket-gitlab = { path = "crates/gonzalo-ticket-gitlab" }
@@ -64,6 +66,7 @@ async-trait = "0.1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "1"
+toml        = "0.8"
 blake3      = "1"
 tempfile    = "3"
 wiremock    = "0.6"

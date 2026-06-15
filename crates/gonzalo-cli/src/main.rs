@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use gonzalo_cli::{get, list, migrate, status, sync_stores};
+use gonzalo_cli::{get, list, migrate, status, sync_stores, ticket_sync};
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
 
@@ -69,6 +69,41 @@ enum Commands {
         a: PathBuf,
         /// Root directory of store B.
         b: PathBuf,
+    },
+    /// Read external ticket boards into the store, and inspect imported tickets.
+    Ticket {
+        #[command(subcommand)]
+        command: TicketCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TicketCommands {
+    /// Sync all configured ticket connections into the store.
+    Sync {
+        /// Path to the tickets TOML config.
+        #[arg(long, default_value = "tickets.toml")]
+        config: PathBuf,
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Author recorded on imported records.
+        #[arg(long, default_value = "gonzalo-cli")]
+        author: String,
+    },
+    /// List imported ticket record keys.
+    List {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Show one imported ticket record by uid (e.g. "caliban-ai/gonzalo#15").
+    Get {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Ticket uid (owner/repo#number).
+        uid: String,
     },
 }
 
@@ -152,6 +187,45 @@ async fn main() -> Result<()> {
             println!("merged:      {}", summary.merged);
             println!("conflicts:   {}", summary.conflicts);
         }
+
+        Commands::Ticket { command } => match command {
+            TicketCommands::Sync {
+                config,
+                root,
+                author,
+            } => {
+                let reports = ticket_sync(&config, &root, &author).await?;
+                if reports.is_empty() {
+                    println!("(no connections configured)");
+                }
+                for r in reports {
+                    println!(
+                        "{}: imported {} updated {} unchanged {}",
+                        r.connection, r.summary.imported, r.summary.updated, r.summary.unchanged
+                    );
+                }
+            }
+            TicketCommands::List { root } => {
+                let keys = list(&root, Some("tickets".into()), None).await?;
+                if keys.is_empty() {
+                    println!("(no tickets)");
+                } else {
+                    for k in keys {
+                        println!("{k}");
+                    }
+                }
+            }
+            TicketCommands::Get { root, uid } => {
+                // Phase 1: github-projects is the only provider, so every ticket
+                // record lives under collection "github" (see gonzalo_ticket::record_key).
+                // `ticket list` (above) filters only the "tickets" namespace, so it
+                // spans all providers; `get` needs the exact collection.
+                match get(&root, "tickets", "github", &uid).await? {
+                    Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
+                    None => println!("not found"),
+                }
+            }
+        },
     }
 
     Ok(())

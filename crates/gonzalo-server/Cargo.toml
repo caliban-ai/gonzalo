@@ -12,6 +12,8 @@ repository.workspace = true
 gonzalo-core  = { workspace = true }
 gonzalo-proto = { workspace = true }
 gonzalo-store-fs = { workspace = true }
+gonzalo-ticket        = { workspace = true }
+gonzalo-ticket-config = { workspace = true }
 tonic         = { workspace = true }
 prost         = { workspace = true }
 axum          = { workspace = true }
@@ -19,9 +21,19 @@ tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "ne
 tokio-stream  = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+thiserror     = { workspace = true }
 
-[lints]
-workspace = true
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# The ticket_sync test must mutate process env (unsafe in edition 2024), so this
+# crate uses a local `deny` instead of the workspace-wide `forbid`, which cannot
+# be locally overridden. Library code remains unsafe-free.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
 
 [[bin]]
 name = "gonzalod"

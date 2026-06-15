@@ -13,9 +13,12 @@ gonzalo-core   = { workspace = true }
 gonzalo-domain = { workspace = true }
 async-trait    = { workspace = true }
 thiserror      = { workspace = true }
+serde          = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio            = { workspace = true }
+gonzalo-store-fs = { workspace = true }
+tempfile         = { workspace = true }
 
 [lints]
 workspace = true

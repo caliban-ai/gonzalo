@@ -1,0 +1,20 @@
+# Example ticket config for the shared caliban-ai Kanban board (GitHub Projects v2 #1).
+# Copy to tickets.toml and set KANBAN_PROJECT_PAT in your environment.
+[[connection]]
+name      = "caliban-ai-board"
+provider  = "github-projects"
+org       = "caliban-ai"
+project   = 1
+token_env = "KANBAN_PROJECT_PAT"
+
+# Status column names are matched case-sensitively against the board's
+# Projects v2 "Status" field; unmatched columns fall back to `default`.
+# These match the caliban-ai #1 board's columns as of 2026-06 (verified by a
+# live sync); adjust if the board's columns are renamed.
+[connection.state_map]
+default       = "open"
+"Backlog"     = "backlog"
+"Todo"        = "open"
+"In progress" = "in_progress"
+"Blocked"     = "pending"
+"Done"        = "done"

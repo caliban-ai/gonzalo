@@ -9,6 +9,7 @@ service Gonzalo {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc List(ListRequest) returns (ListResponse);
+  rpc TicketSync(TicketSyncRequest) returns (TicketSyncResponse);
 }
 
 message GetRequest {
@@ -45,4 +46,17 @@ message ListRequest {
 message ListResponse {
   // JSON of each RecordKey.
   repeated bytes keys_json = 1;
+}
+
+message TicketSyncRequest {
+  // JSON of gonzalo_ticket_config::Connection.
+  bytes connection_json = 1;
+}
+
+// Unlike the other responses (which carry bytes ..._json), the sync summary is
+// three small counts, so they ride as plain numeric fields.
+message TicketSyncResponse {
+  uint64 imported = 1;
+  uint64 updated = 2;
+  uint64 unchanged = 3;
 }

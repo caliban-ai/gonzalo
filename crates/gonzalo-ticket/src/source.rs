@@ -52,8 +52,12 @@ pub enum SourceError {
 pub type Result<T> = std::result::Result<T, SourceError>;
 
 /// A source of tickets from an external platform.
+///
+/// Requires `Send + Sync` (like [`gonzalo_core::Store`]) so a
+/// `Box<dyn TicketSource>` can be driven across threads — the daemon ingests
+/// over `Send` futures on the gRPC and HTTP transports.
 #[async_trait]
-pub trait TicketSource {
+pub trait TicketSource: Send + Sync {
     /// What this source supports. Callers consult this before attempting writes.
     fn capabilities(&self) -> Capabilities;
 
