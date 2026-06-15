@@ -4,7 +4,8 @@
 use crate::Service;
 use gonzalo_core::{KeyPrefix, PutResult, Record, RecordKey, Revision};
 use gonzalo_proto::v1::{
-    GetRequest, GetResponse, ListRequest, ListResponse, PutRequest, PutResponse,
+    GetRequest, GetResponse, ListRequest, ListResponse, PutRequest, PutResponse, TicketSyncRequest,
+    TicketSyncResponse,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };
 use tonic::{Request, Response, Status};
@@ -75,6 +76,25 @@ impl Gonzalo for GrpcAdapter {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(internal)?;
         Ok(Response::new(ListResponse { keys_json }))
+    }
+
+    async fn ticket_sync(
+        &self,
+        req: Request<TicketSyncRequest>,
+    ) -> Result<Response<TicketSyncResponse>, Status> {
+        let r = req.into_inner();
+        let conn: gonzalo_ticket_config::Connection =
+            serde_json::from_slice(&r.connection_json).map_err(internal)?;
+        let summary = self
+            .service
+            .ticket_sync(&conn, "gonzalod")
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(TicketSyncResponse {
+            imported: summary.imported as u64,
+            updated: summary.updated as u64,
+            unchanged: summary.unchanged as u64,
+        }))
     }
 }
 

@@ -23,6 +23,7 @@ pub fn router(service: Service, auth: Option<String>) -> Router {
             get(get_record).put(put_record),
         )
         .route("/v1/keys", get(list_keys))
+        .route("/v1/tickets/sync", axum::routing::post(ticket_sync))
         .with_state(Arc::new(service));
     if let Some(token) = auth {
         let token = Arc::new(token);
@@ -92,6 +93,16 @@ async fn list_keys(State(svc): State<Arc<Service>>, Query(q): Query<ListQuery>) 
     };
     match svc.list(&prefix).await {
         Ok(keys) => (StatusCode::OK, Json(keys)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+async fn ticket_sync(
+    State(svc): State<Arc<Service>>,
+    Json(conn): Json<gonzalo_ticket_config::Connection>,
+) -> Response {
+    match svc.ticket_sync(&conn, "gonzalod").await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(e) => server_error(e),
     }
 }
