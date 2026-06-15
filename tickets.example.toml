@@ -1,0 +1,15 @@
+# Example ticket config for the shared caliban-ai Kanban board (GitHub Projects v2 #1).
+# Copy to tickets.toml and set KANBAN_PROJECT_PAT in your environment.
+[[connection]]
+name      = "caliban-ai-board"
+provider  = "github-projects"
+org       = "caliban-ai"
+project   = 1
+token_env = "KANBAN_PROJECT_PAT"
+
+[connection.state_map]
+default       = "open"
+"Todo"        = "open"
+"In Progress" = "in_progress"
+"Blocked"     = "pending"
+"Done"        = "done"
