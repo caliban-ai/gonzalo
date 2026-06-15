@@ -30,7 +30,7 @@ pub enum Provider {
 /// Normalized lifecycle category — the cross-platform spine (ADR 0010). Each
 /// provider's native status maps onto exactly one of these via a
 /// `StateMapping`; the raw status is retained on [`State`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateCategory {
     Triage,
     Backlog,

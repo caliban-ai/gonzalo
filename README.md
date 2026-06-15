@@ -25,7 +25,7 @@ surfacing, plus capability layers — all consumed through the `gonzalo` facade
 | `gonzalo-vector` `[vector]` | `Embedder` + `VectorIndex` (exact cosine in-memory index) |
 | `gonzalo-graph` `[graph]` | tree-sitter code graph (`build_rust`, `GraphStore`) |
 | `gonzalo-ticket` `[ticket]` | normalized work-item layer: `TicketSource`, `StateMapping` (ADR 0010) |
-| `gonzalo-ticket-github` `[ticket-github]` | GitHub connectors: `GitHubSource` (REST issues, read + write-back); `GitHubProjectSource` (Projects v2 board over GraphQL, read-only) |
+| `gonzalo-ticket-github` `[ticket-github]` | GitHub connectors: `GitHubSource` (REST issues, read + write-back); `GitHubProjectSource` (Projects v2 board over GraphQL, read + card move) |
 | `gonzalo-ticket-jira` `[ticket-jira]` | Jira issue connector (`JiraSource`, statusCategory + ADF, transition write-back) |
 | `gonzalo-ticket-linear` `[ticket-linear]` | Linear issue connector (`LinearSource`, GraphQL, read + write-back) |
 | `gonzalo-ticket-gitlab` `[ticket-gitlab]` | GitLab issue connector (`GitLabSource`, scoped-label workflow, read + write-back) |
@@ -54,9 +54,15 @@ gonzalo ticket list --root ./store
 gonzalo ticket get  --root ./store "caliban-ai/gonzalo#15"
 ```
 
-The daemon exposes the same operation: `POST /v1/tickets/sync` with a JSON
-connection body, or the `TicketSync` gRPC. Write-back (moving cards) is not yet
-implemented — this is a read-only import (ADR 0010 phase 1).
+Move a card to a column (write-back):
+
+```bash
+gonzalo ticket move --config tickets.toml "caliban-ai/gonzalo#15" in_progress
+```
+
+The daemon exposes the same sync operation: `POST /v1/tickets/sync` with a JSON
+connection body, or the `TicketSync` gRPC. Board write-back is now supported via
+`ticket move`, which updates a card's column on GitHub Projects v2 (ADR 0010).
 
 ## License
 

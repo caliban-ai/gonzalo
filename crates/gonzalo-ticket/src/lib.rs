@@ -17,7 +17,7 @@ pub mod mock;
 pub mod source;
 
 pub use ingest::{IngestError, IngestSummary, ingest};
-pub use mapping::{FieldMapping, StateMapping, StateSignal};
+pub use mapping::{FieldMapping, ReverseError, StateMapping, StateSignal};
 pub use mock::InMemorySource;
 pub use source::{Capabilities, Cursor, Page, Result, SourceError, TicketSource};
 

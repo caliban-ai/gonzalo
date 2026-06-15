@@ -40,6 +40,11 @@ pub struct Connection {
     /// fallback category; all other keys are board column names.
     #[serde(default)]
     pub state_map: BTreeMap<String, String>,
+    /// Optional category→column overrides for write-back (`set_state`), for
+    /// boards where two columns map to the same category. Keys are category
+    /// names (same vocabulary as `state_map` values).
+    #[serde(default)]
+    pub set_targets: BTreeMap<String, String>,
 }
 
 /// Config / registry failures.
@@ -95,8 +100,10 @@ pub fn build_source(conn: &Connection) -> Result<Box<dyn TicketSource>, ConfigEr
     match conn.provider.as_str() {
         "github-projects" => {
             let mapping = state_mapping(conn)?;
+            let targets = write_targets(conn)?;
             let src = GitHubProjectSource::new(&conn.org, conn.project, token, mapping)
-                .map_err(|e| ConfigError::Source(e.to_string()))?;
+                .map_err(|e| ConfigError::Source(e.to_string()))?
+                .with_write_targets(targets);
             Ok(Box::new(src))
         }
         other => Err(ConfigError::UnknownProvider {
@@ -127,7 +134,24 @@ fn state_mapping(conn: &Connection) -> Result<StateMapping, ConfigError> {
     })
 }
 
-fn parse_category(s: &str) -> Option<StateCategory> {
+/// Parse a connection's `set_targets` (category-name → column) into typed
+/// categories.
+pub fn write_targets(conn: &Connection) -> Result<BTreeMap<StateCategory, String>, ConfigError> {
+    let mut out = BTreeMap::new();
+    for (cat, column) in &conn.set_targets {
+        let parsed = parse_category(cat).ok_or_else(|| ConfigError::BadCategory {
+            conn: conn.name.clone(),
+            value: cat.clone(),
+        })?;
+        out.insert(parsed, column.clone());
+    }
+    Ok(out)
+}
+
+/// Parse a normalized state-category name (`triage`, `backlog`, `open`,
+/// `in_progress`, `pending`, `done`, `canceled`) into a [`StateCategory`].
+/// Returns `None` for any other string. Shared by config parsing and the CLI.
+pub fn parse_category(s: &str) -> Option<StateCategory> {
     Some(match s {
         "triage" => StateCategory::Triage,
         "backlog" => StateCategory::Backlog,
@@ -259,6 +283,44 @@ default = "open"
             std::env::remove_var("MULTI_TEST_TOKEN_A");
             std::env::remove_var("MULTI_TEST_TOKEN_B");
         }
+    }
+
+    const WITH_TARGETS: &str = r#"
+[[connection]]
+name      = "caliban-ai-board"
+provider  = "github-projects"
+org       = "caliban-ai"
+project   = 1
+token_env = "TEST_TICKET_TOKEN"
+
+[connection.state_map]
+default = "open"
+"Done"  = "done"
+"Shipped" = "done"
+
+[connection.set_targets]
+done = "Shipped"
+"#;
+
+    #[test]
+    fn parses_set_targets_into_categories() {
+        let cfg = parse(WITH_TARGETS).unwrap();
+        let c = &cfg.connections[0];
+        let targets = write_targets(c).unwrap();
+        assert_eq!(
+            targets.get(&StateCategory::Done).map(String::as_str),
+            Some("Shipped")
+        );
+    }
+
+    #[test]
+    fn set_targets_with_bad_category_errors() {
+        let text = WITH_TARGETS.replace("done = \"Shipped\"", "finished = \"Shipped\"");
+        let cfg = parse(&text).unwrap();
+        assert!(matches!(
+            write_targets(&cfg.connections[0]),
+            Err(ConfigError::BadCategory { .. })
+        ));
     }
 
     #[test]
