@@ -1,0 +1,23 @@
+[package]
+name = "gonzalo-ticket-gitlab"
+description = "GitLab issue connector for gonzalo's ticket layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-domain = { workspace = true }
+gonzalo-ticket = { workspace = true }
+async-trait    = { workspace = true }
+reqwest        = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

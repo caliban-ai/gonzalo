@@ -1197,6 +1197,7 @@ dependencies = [
  "gonzalo-store-server",
  "gonzalo-ticket",
  "gonzalo-ticket-github",
+ "gonzalo-ticket-gitlab",
  "gonzalo-ticket-jira",
  "gonzalo-ticket-linear",
  "gonzalo-vector",
@@ -1339,6 +1340,19 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-github"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gonzalo-domain",
+ "gonzalo-ticket",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "gonzalo-ticket-gitlab"
 version = "0.1.0"
 dependencies = [
  "async-trait",
