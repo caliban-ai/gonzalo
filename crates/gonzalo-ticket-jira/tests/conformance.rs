@@ -64,3 +64,26 @@ async fn state_mapping_policy_variant_overrides_status_category() {
     let page = src.fetch_changed(&Cursor::default()).await.unwrap();
     assert_eq!(page.tickets[0].state.category, StateCategory::Pending);
 }
+
+#[tokio::test]
+async fn set_state_picks_a_transition_into_target_category() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/ENG-1/transitions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "transitions": [
+                {"id": "11", "to": {"statusCategory": {"key": "new"}}},
+                {"id": "31", "to": {"statusCategory": {"key": "done"}}}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/issue/ENG-1/transitions"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let src = JiraSource::new(&server.uri(), "e", "t").unwrap();
+    src.set_state("ENG-1", StateCategory::Done).await.unwrap();
+}

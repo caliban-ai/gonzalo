@@ -9,7 +9,7 @@
 
 use crate::mapping::{GlIssue, issue_to_ticket};
 use async_trait::async_trait;
-use gonzalo_domain::Ticket;
+use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
 
 const DEFAULT_BASE: &str = "https://gitlab.com";
@@ -56,8 +56,9 @@ impl GitLabSource {
         self
     }
 
-    /// `.../api/v4/projects/<url-encoded project>/issues[/<trailing>]`.
-    fn issues_url(&self, trailing: Option<&str>) -> Result<reqwest::Url> {
+    /// `.../api/v4/projects/<url-encoded project>/issues[/<trailing>...]`. Each
+    /// `trailing` element is a distinct, individually-encoded segment.
+    fn issues_url(&self, trailing: &[&str]) -> Result<reqwest::Url> {
         let mut url = self.base.clone();
         {
             let mut seg = url
@@ -68,9 +69,7 @@ impl GitLabSource {
             seg.extend(["api", "v4", "projects"]);
             seg.push(&self.project);
             seg.push("issues");
-            if let Some(t) = trailing {
-                seg.push(t);
-            }
+            seg.extend(trailing);
         }
         Ok(url)
     }
@@ -83,11 +82,15 @@ impl GitLabSource {
 #[async_trait]
 impl TicketSource for GitLabSource {
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            push: true,
+            comments: true,
+            ..Capabilities::default()
+        }
     }
 
     async fn fetch_changed(&self, cursor: &Cursor) -> Result<Page> {
-        let mut url = self.issues_url(None)?;
+        let mut url = self.issues_url(&[])?;
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("scope", "all");
@@ -121,13 +124,7 @@ impl TicketSource for GitLabSource {
     }
 
     async fn get(&self, uid: &str) -> Result<Ticket> {
-        let iid = uid
-            .rsplit_once('#')
-            .map(|(_, n)| n)
-            .unwrap_or(uid)
-            .parse::<u64>()
-            .map_err(|_| SourceError::Backend(format!("cannot parse iid from uid {uid}")))?;
-        let url = self.issues_url(Some(&iid.to_string()))?;
+        let url = self.issues_url(&[&issue_iid(uid)?.to_string()])?;
         let resp = self
             .auth(self.client.get(url))
             .send()
@@ -142,6 +139,52 @@ impl TicketSource for GitLabSource {
             self.mapping.as_ref(),
         ))
     }
+
+    async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
+        // GitLab issue state is binary; map terminal categories to `close`,
+        // everything else to `reopen`. (Scoped-label workflow writes are a
+        // future addition.)
+        let event = match target {
+            StateCategory::Done | StateCategory::Canceled => "close",
+            _ => "reopen",
+        };
+        let url = self.issues_url(&[&issue_iid(uid)?.to_string()])?;
+        self.auth(
+            self.client
+                .put(url)
+                .json(&serde_json::json!({ "state_event": event })),
+        )
+        .send()
+        .await
+        .map_err(be)?
+        .error_for_status()
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn comment(&self, uid: &str, body: &str) -> Result<()> {
+        let url = self.issues_url(&[&issue_iid(uid)?.to_string(), "notes"])?;
+        self.auth(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({ "body": body })),
+        )
+        .send()
+        .await
+        .map_err(be)?
+        .error_for_status()
+        .map_err(be)?;
+        Ok(())
+    }
+}
+
+/// Parse the issue `iid` from a `uid` (`group/proj#N` or a bare `N`).
+fn issue_iid(uid: &str) -> Result<u64> {
+    uid.rsplit_once('#')
+        .map(|(_, n)| n)
+        .unwrap_or(uid)
+        .parse::<u64>()
+        .map_err(|_| SourceError::Backend(format!("cannot parse iid from uid {uid}")))
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
@@ -156,18 +199,19 @@ mod tests {
     fn url_encodes_project_path() {
         let src = GitLabSource::new("group/sub/proj", "tok").unwrap();
         assert_eq!(
-            src.issues_url(None).unwrap().as_str(),
+            src.issues_url(&[]).unwrap().as_str(),
             "https://gitlab.com/api/v4/projects/group%2Fsub%2Fproj/issues"
         );
         assert_eq!(
-            src.issues_url(Some("7")).unwrap().as_str(),
-            "https://gitlab.com/api/v4/projects/group%2Fsub%2Fproj/issues/7"
+            src.issues_url(&["7", "notes"]).unwrap().as_str(),
+            "https://gitlab.com/api/v4/projects/group%2Fsub%2Fproj/issues/7/notes"
         );
     }
 
     #[test]
-    fn read_only_capabilities() {
-        let src = GitLabSource::new("g/p", "t").unwrap();
-        assert!(!src.capabilities().push);
+    fn write_capabilities_enabled() {
+        let caps = GitLabSource::new("g/p", "t").unwrap().capabilities();
+        assert!(caps.push);
+        assert!(caps.comments);
     }
 }

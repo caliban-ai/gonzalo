@@ -9,9 +9,42 @@
 
 use crate::mapping::{JiraIssue, issue_to_ticket};
 use async_trait::async_trait;
-use gonzalo_domain::Ticket;
+use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
 use serde::Deserialize;
+
+/// The statusCategory key a target [`StateCategory`] should land in.
+fn target_status_category(target: StateCategory) -> &'static str {
+    match target {
+        StateCategory::InProgress | StateCategory::Pending => "indeterminate",
+        StateCategory::Done | StateCategory::Canceled => "done",
+        // Triage / Backlog / Open
+        _ => "new",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TransitionsResponse {
+    #[serde(default)]
+    transitions: Vec<Transition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Transition {
+    id: String,
+    to: TransitionTo,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransitionTo {
+    #[serde(rename = "statusCategory")]
+    status_category: StatusCategoryRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusCategoryRef {
+    key: String,
+}
 
 const FIELDS: &[&str] = &[
     "summary",
@@ -95,9 +128,11 @@ impl JiraSource {
 #[async_trait]
 impl TicketSource for JiraSource {
     fn capabilities(&self) -> Capabilities {
-        // Phase 1: read-only. `transitions_required` records that a future
-        // write-back must move state via transitions, not a field set.
+        // `transitions_required` records that set_state moves state via a
+        // workflow transition, not a field set.
         Capabilities {
+            push: true,
+            comments: true,
             transitions_required: true,
             ..Capabilities::default()
         }
@@ -146,6 +181,66 @@ impl TicketSource for JiraSource {
         let issue: JiraIssue = resp.json().await.map_err(be)?;
         Ok(issue_to_ticket(&issue, self.mapping.as_ref()))
     }
+
+    async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
+        // Jira state moves through workflow transitions: list the available
+        // ones for this issue and pick one landing in the target statusCategory.
+        let list_url = self.url(&["rest", "api", "3", "issue", uid, "transitions"])?;
+        let resp = self
+            .auth(self.client.get(list_url))
+            .send()
+            .await
+            .map_err(be)?
+            .error_for_status()
+            .map_err(be)?;
+        let available: TransitionsResponse = resp.json().await.map_err(be)?;
+
+        let want = target_status_category(target);
+        let transition = available
+            .transitions
+            .iter()
+            .find(|t| t.to.status_category.key == want)
+            .ok_or_else(|| {
+                SourceError::Backend(format!(
+                    "no available transition into statusCategory '{want}' for {uid}"
+                ))
+            })?;
+
+        let post_url = self.url(&["rest", "api", "3", "issue", uid, "transitions"])?;
+        self.auth(
+            self.client
+                .post(post_url)
+                .json(&serde_json::json!({ "transition": { "id": transition.id } })),
+        )
+        .send()
+        .await
+        .map_err(be)?
+        .error_for_status()
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn comment(&self, uid: &str, body: &str) -> Result<()> {
+        // v3 comments are ADF; wrap the text in a minimal document.
+        let adf = serde_json::json!({
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{ "type": "text", "text": body }]
+                }]
+            }
+        });
+        let url = self.url(&["rest", "api", "3", "issue", uid, "comment"])?;
+        self.auth(self.client.post(url).json(&adf))
+            .send()
+            .await
+            .map_err(be)?
+            .error_for_status()
+            .map_err(be)?;
+        Ok(())
+    }
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
@@ -178,7 +273,8 @@ mod tests {
         let src = JiraSource::new("https://acme.atlassian.net", "me@acme.co", "tok").unwrap();
         let caps = src.capabilities();
         assert!(caps.transitions_required);
-        assert!(!caps.push);
+        assert!(caps.push);
+        assert!(caps.comments);
     }
 
     #[test]

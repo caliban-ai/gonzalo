@@ -9,7 +9,7 @@
 
 use crate::mapping::{AsanaTask, task_to_ticket};
 use async_trait::async_trait;
-use gonzalo_domain::Ticket;
+use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
 use serde::Deserialize;
 
@@ -102,6 +102,8 @@ impl TicketSource for AsanaSource {
         Capabilities {
             single_assignee: true,
             custom_fields: true,
+            push: true,
+            comments: true,
             ..Capabilities::default()
         }
     }
@@ -149,6 +151,40 @@ impl TicketSource for AsanaSource {
         let one: OneResponse = resp.json().await.map_err(be)?;
         Ok(task_to_ticket(&one.data, self.mapping.as_ref()))
     }
+
+    async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
+        // The portable Asana write is the `completed` flag: terminal categories
+        // complete the task, others reopen it. (Section / custom-field moves are
+        // a future addition.)
+        let completed = matches!(target, StateCategory::Done | StateCategory::Canceled);
+        let url = self.url(&["tasks", uid])?;
+        self.auth(
+            self.client
+                .put(url)
+                .json(&serde_json::json!({ "data": { "completed": completed } })),
+        )
+        .send()
+        .await
+        .map_err(be)?
+        .error_for_status()
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn comment(&self, uid: &str, body: &str) -> Result<()> {
+        let url = self.url(&["tasks", uid, "stories"])?;
+        self.auth(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({ "data": { "text": body } })),
+        )
+        .send()
+        .await
+        .map_err(be)?
+        .error_for_status()
+        .map_err(be)?;
+        Ok(())
+    }
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
@@ -177,6 +213,7 @@ mod tests {
         let caps = AsanaSource::new("1201", "tok").unwrap().capabilities();
         assert!(caps.single_assignee);
         assert!(caps.custom_fields);
-        assert!(!caps.push);
+        assert!(caps.push);
+        assert!(caps.comments);
     }
 }

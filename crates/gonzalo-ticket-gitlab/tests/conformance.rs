@@ -56,3 +56,23 @@ async fn scoped_label_policy_and_cursor_advance() {
     assert_ticket_invariants(&page.tickets[0]);
     assert_write_gating(&src, "g/p#7").await;
 }
+
+#[tokio::test]
+async fn writes_state_and_note() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/issues/7$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/issues/7/notes$"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let src = GitLabSource::with_base(&server.uri(), "g/p", "tok").unwrap();
+    src.set_state("g/p#7", StateCategory::Done).await.unwrap();
+    src.comment("g/p#7", "hi").await.unwrap();
+}
