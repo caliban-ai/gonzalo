@@ -43,10 +43,19 @@ pub struct StateMapping {
 impl StateMapping {
     /// Translate a raw status value to a normalized category, falling back to
     /// [`StateMapping::default`] when nothing matches.
+    ///
+    /// Matching prefers an exact key, then falls back to a case-insensitive
+    /// match — a board's status/column names are unique within one field, so a
+    /// case-only variant (e.g. config `"In Progress"` vs board `"In progress"`)
+    /// can never collide with a genuinely different column.
     pub fn category_of(&self, raw_value: &str) -> StateCategory {
+        if let Some(cat) = self.by_value.get(raw_value) {
+            return *cat;
+        }
         self.by_value
-            .get(raw_value)
-            .copied()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(raw_value))
+            .map(|(_, cat)| *cat)
             .unwrap_or(self.default)
     }
 }
@@ -96,6 +105,26 @@ mod tests {
     fn unmapped_raw_value_falls_back_to_default() {
         let m = gitlab_free_mapping();
         assert_eq!(m.category_of("something-bespoke"), StateCategory::Open);
+    }
+
+    #[test]
+    fn matches_case_insensitively_when_no_exact_key() {
+        // Config key "In Progress" should still resolve a board column reported
+        // as "In progress" (the real caliban-ai #1 casing). Exact match wins
+        // when present; case-only variants fall through to the case-insensitive
+        // pass rather than the default.
+        let mut by_value = BTreeMap::new();
+        by_value.insert("In Progress".into(), StateCategory::InProgress);
+        by_value.insert("Done".into(), StateCategory::Done);
+        let m = StateMapping {
+            signal: StateSignal::NativeStatus,
+            by_value,
+            default: StateCategory::Open,
+        };
+        assert_eq!(m.category_of("In Progress"), StateCategory::InProgress); // exact
+        assert_eq!(m.category_of("In progress"), StateCategory::InProgress); // case-insensitive
+        assert_eq!(m.category_of("DONE"), StateCategory::Done);
+        assert_eq!(m.category_of("Backlog"), StateCategory::Open); // truly unmapped → default
     }
 
     #[test]
