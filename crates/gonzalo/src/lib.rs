@@ -44,6 +44,9 @@ pub use gonzalo_ticket::{
 #[cfg(feature = "ticket-github")]
 pub use gonzalo_ticket_github::GitHubSource;
 
+#[cfg(feature = "ticket-jira")]
+pub use gonzalo_ticket_jira::JiraSource;
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;

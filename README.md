@@ -26,6 +26,7 @@ surfacing, plus capability layers — all consumed through the `gonzalo` facade
 | `gonzalo-graph` `[graph]` | tree-sitter code graph (`build_rust`, `GraphStore`) |
 | `gonzalo-ticket` `[ticket]` | normalized work-item layer: `TicketSource`, `StateMapping` (ADR 0010) |
 | `gonzalo-ticket-github` `[ticket-github]` | GitHub issue connector (`GitHubSource`, read-only) |
+| `gonzalo-ticket-jira` `[ticket-jira]` | Jira issue connector (`JiraSource`, statusCategory + ADF, read-only) |
 | `gonzalo-proto` / `gonzalo-server` | daemon: gRPC + HTTP/JSON over one service, optional bearer auth (`gonzalod` bin) |
 | `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync` |
 
