@@ -216,6 +216,10 @@ async fn main() -> Result<()> {
                 }
             }
             TicketCommands::Get { root, uid } => {
+                // Phase 1: github-projects is the only provider, so every ticket
+                // record lives under collection "github" (see gonzalo_ticket::record_key).
+                // `ticket list` (above) filters only the "tickets" namespace, so it
+                // spans all providers; `get` needs the exact collection.
                 match get(&root, "tickets", "github", &uid).await? {
                     Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
                     None => println!("not found"),

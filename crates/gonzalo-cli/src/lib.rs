@@ -1,5 +1,6 @@
 //! Command implementations for the gonzalo admin CLI.
 
+use anyhow::Context;
 use anyhow::Result;
 use gonzalo_core::{
     Body, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind, Revision, Store,
@@ -181,13 +182,13 @@ pub async fn ticket_sync(
     root: &Path,
     author: &str,
 ) -> Result<Vec<TicketSyncReport>> {
-    let config = Config::load(config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = Config::load(config_path).context("loading ticket config")?;
     let store = FsStore::new(root);
     let mut reports = Vec::new();
-    for (name, source) in config.sources().map_err(|e| anyhow::anyhow!("{e}"))? {
+    for (name, source) in config.sources().context("building ticket sources")? {
         let summary = gonzalo_ticket::ingest(source.as_ref(), &store, author)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .with_context(|| format!("syncing connection {name}"))?;
         reports.push(TicketSyncReport {
             connection: name,
             summary,
