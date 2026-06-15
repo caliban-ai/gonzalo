@@ -50,6 +50,9 @@ pub use gonzalo_ticket_jira::JiraSource;
 #[cfg(feature = "ticket-linear")]
 pub use gonzalo_ticket_linear::LinearSource;
 
+#[cfg(feature = "ticket-gitlab")]
+pub use gonzalo_ticket_gitlab::GitLabSource;
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
