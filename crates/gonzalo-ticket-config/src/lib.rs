@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// A named, live ticket source built from a connection.
+/// A named, live ticket source built from a connection: `(connection name, source)`.
+///
+/// The first tuple element (`.0`) is the connection's name; the second is its
+/// live source.
 pub type NamedSource = (String, Box<dyn TicketSource>);
 
 /// Top-level config: a list of connections.
@@ -213,6 +216,49 @@ default       = "open"
         unsafe {
             std::env::remove_var("TEST_TICKET_TOKEN")
         };
+    }
+
+    #[test]
+    fn parses_and_builds_multiple_connections() {
+        const TWO: &str = r#"
+[[connection]]
+name      = "board-a"
+provider  = "github-projects"
+org       = "org-a"
+project   = 1
+token_env = "MULTI_TEST_TOKEN_A"
+[connection.state_map]
+default = "open"
+
+[[connection]]
+name      = "board-b"
+provider  = "github-projects"
+org       = "org-b"
+project   = 2
+token_env = "MULTI_TEST_TOKEN_B"
+[connection.state_map]
+default = "open"
+"#;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = parse(TWO).unwrap();
+        assert_eq!(cfg.connections.len(), 2);
+        assert_eq!(cfg.connections[0].name, "board-a");
+        assert_eq!(cfg.connections[1].name, "board-b");
+
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("MULTI_TEST_TOKEN_A", "x");
+            std::env::set_var("MULTI_TEST_TOKEN_B", "y");
+        }
+        let sources = cfg.sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].0, "board-a");
+        assert_eq!(sources[1].0, "board-b");
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("MULTI_TEST_TOKEN_A");
+            std::env::remove_var("MULTI_TEST_TOKEN_B");
+        }
     }
 
     #[test]
