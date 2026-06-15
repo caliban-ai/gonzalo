@@ -209,13 +209,13 @@ pub async fn ticket_move(
 ) -> Result<()> {
     let cat = parse_category(category)
         .ok_or_else(|| anyhow::anyhow!("unknown state category {category:?}"))?;
-    let config = Config::load(config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = Config::load(config_path).context("loading ticket config")?;
     let conn = select_connection(&config.connections, connection)?;
-    let source = gonzalo_ticket_config::build_source(conn).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let source = gonzalo_ticket_config::build_source(conn).context("building ticket source")?;
     source
         .set_state(uid, cat)
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .with_context(|| format!("moving {uid} to {category}"))?;
     Ok(())
 }
 
