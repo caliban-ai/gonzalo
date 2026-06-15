@@ -1,21 +1,24 @@
-//! A read-only [`TicketSource`] over the GitHub **GraphQL** API, reading the
-//! org Projects v2 board. Phase 1: `capabilities()` is all-false. The board has
-//! no reliable "changed since" filter, so `fetch_changed` pages the whole board
-//! to completion and returns an empty `next` cursor; cheap re-sync is the
-//! ingest engine's job (content-hash dedup).
+//! A [`TicketSource`] over the GitHub **GraphQL** API, reading the org Projects
+//! v2 board. `get`/`fetch_changed` are the read path: the board has no reliable
+//! "changed since" filter, so `fetch_changed` pages the whole board to
+//! completion and returns an empty `next` cursor; cheap re-sync is the ingest
+//! engine's job (content-hash dedup).
+//!
+//! Write-back: `capabilities().push` is `true` and `set_state` moves a card by
+//! resolving the target category back to a board column (via [`StateMapping`],
+//! with per-source overrides from [`GitHubProjectSource::with_write_targets`])
+//! and updating the project's Status single-select field on that issue's item.
 
 use crate::project_mapping::{GqlItems, GqlResponse, item_to_ticket};
 use async_trait::async_trait;
-use gonzalo_domain::Ticket;
+use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 /// Resolved coordinates for a single Projects v2 card write.
-// Pure write-back helpers (Task 2): consumed by `set_state` in Task 3; until
-// then they are exercised only by unit tests.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ItemCoords {
     pub item_id: String,
@@ -24,7 +27,6 @@ pub(crate) struct ItemCoords {
     pub option_id: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ItemLookupResponse {
     #[serde(default)]
@@ -33,39 +35,33 @@ pub(crate) struct ItemLookupResponse {
     pub errors: Vec<crate::project_mapping::GqlError>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ItemLookupData {
     pub repository: Option<LookupRepo>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupRepo {
     pub issue: Option<LookupIssue>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupIssue {
     #[serde(rename = "projectItems")]
     pub project_items: LookupItems,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupItems {
     pub nodes: Vec<LookupItem>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupItem {
     pub id: String,
     pub project: LookupProject,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupProject {
     pub id: String,
@@ -76,14 +72,12 @@ pub(crate) struct LookupProject {
     pub field: Option<LookupField>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupField {
     pub id: String,
     pub options: Vec<LookupOption>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct LookupOption {
     pub id: String,
@@ -99,6 +93,7 @@ pub struct GitHubProjectSource {
     project_number: u32,
     token: String,
     mapping: StateMapping,
+    set_targets: BTreeMap<StateCategory, String>,
 }
 
 impl GitHubProjectSource {
@@ -121,7 +116,32 @@ impl GitHubProjectSource {
             project_number: number,
             token: token.into(),
             mapping,
+            set_targets: BTreeMap::new(),
         })
+    }
+
+    /// Set the category→column overrides used by `set_state` for boards where
+    /// two columns share a category (the reverse of `state_map` is ambiguous).
+    pub fn with_write_targets(mut self, targets: BTreeMap<StateCategory, String>) -> Self {
+        self.set_targets = targets;
+        self
+    }
+
+    /// POST a GraphQL body and return the parsed JSON, surfacing transport
+    /// errors as `Backend`.
+    async fn post(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.client
+            .post(&self.endpoint)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(be)?
+            .error_for_status()
+            .map_err(be)?
+            .json()
+            .await
+            .map_err(be)
     }
 
     /// Page the whole board into a flat list of tickets.
@@ -217,7 +237,6 @@ query($org: String!, $number: Int!, $cursor: String) {
 
 /// GraphQL body that finds an issue's board item across its projects, with each
 /// project's Status single-select field id + options. Pure / network-free.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn project_item_query(owner: &str, repo: &str, number: u64) -> serde_json::Value {
     const QUERY: &str = r#"
 query($owner: String!, $repo: String!, $number: Int!) {
@@ -245,7 +264,6 @@ query($owner: String!, $repo: String!, $number: Int!) {
 }
 
 /// GraphQL body that sets a card's single-select Status option. Pure.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn set_option_mutation(
     project_id: &str,
     item_id: &str,
@@ -270,7 +288,6 @@ mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
 /// Pick the issue's item on the project numbered `project_number`, then resolve
 /// `column` to its single-select option id (case-insensitive). Surfaces GraphQL
 /// `errors` and missing pieces as `Backend`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_item(
     resp: ItemLookupResponse,
     project_number: u32,
@@ -321,7 +338,10 @@ pub(crate) fn resolve_item(
 #[async_trait]
 impl TicketSource for GitHubProjectSource {
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default() // read-only in phase 1
+        Capabilities {
+            push: true,
+            ..Capabilities::default()
+        }
     }
 
     async fn fetch_changed(&self, _cursor: &Cursor) -> Result<Page> {
@@ -342,17 +362,81 @@ impl TicketSource for GitHubProjectSource {
             .find(|t| t.uid == uid)
             .ok_or_else(|| SourceError::Backend(format!("ticket {uid} not found on board")))
     }
+
+    async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
+        // Resolve the target category back to a board column.
+        let column = self
+            .mapping
+            .column_for(target, &self.set_targets)
+            .map_err(|e| SourceError::Unsupported(reverse_reason(&e)))?;
+
+        // uid (owner/repo#number) → parts. `number` here is the ISSUE number
+        // (u64); `self.project_number` is the PROJECT number (u32).
+        let (owner, repo, number) = parse_board_uid(uid)?;
+
+        // Look up the issue's item on this project + the column's option id.
+        let lookup: ItemLookupResponse = serde_json::from_value(
+            self.post(&project_item_query(&owner, &repo, number))
+                .await?,
+        )
+        .map_err(be)?;
+        let coords = resolve_item(lookup, self.project_number, &column)?;
+
+        // Mutate; check the mutation response for top-level GraphQL errors.
+        let resp = self
+            .post(&set_option_mutation(
+                &coords.project_id,
+                &coords.item_id,
+                &coords.field_id,
+                &coords.option_id,
+            ))
+            .await?;
+        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let msg = errors
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(SourceError::Backend(format!("github graphql: {msg}")));
+        }
+        Ok(())
+    }
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
     SourceError::Backend(e.to_string())
 }
 
+/// `SourceError::Unsupported` needs a `&'static str`; map the reverse-mapping
+/// failure kind to a stable reason (the detail is in the error's Display).
+fn reverse_reason(e: &gonzalo_ticket::ReverseError) -> &'static str {
+    match e {
+        gonzalo_ticket::ReverseError::Unmapped(_) => "set_state: no column maps to target category",
+        gonzalo_ticket::ReverseError::Ambiguous(_, _) => {
+            "set_state: target category is ambiguous; configure set_targets"
+        }
+    }
+}
+
+/// Parse a board uid `owner/repo#number` into its parts.
+fn parse_board_uid(uid: &str) -> Result<(String, String, u64)> {
+    let (repo_path, num) = uid
+        .rsplit_once('#')
+        .ok_or_else(|| SourceError::Backend(format!("expected owner/repo#number, got {uid}")))?;
+    let (owner, repo) = repo_path
+        .split_once('/')
+        .ok_or_else(|| SourceError::Backend(format!("expected owner/repo#number, got {uid}")))?;
+    let number = num
+        .parse::<u64>()
+        .map_err(|_| SourceError::Backend(format!("bad issue number in uid {uid}")))?;
+    Ok((owner.to_string(), repo.to_string(), number))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gonzalo_domain::StateCategory;
-    use std::collections::BTreeMap;
 
     fn mapping() -> StateMapping {
         StateMapping {
@@ -378,11 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn constructs_a_read_only_source() {
+    fn constructs_a_source_from_org_and_number() {
         let src = GitHubProjectSource::new("caliban-ai", 1, "tok", mapping()).unwrap();
         assert_eq!(src.org, "caliban-ai");
         assert_eq!(src.project_number, 1);
-        assert!(!src.capabilities().push);
+        assert!(src.set_targets.is_empty());
     }
 
     #[test]
@@ -477,5 +561,38 @@ mod tests {
     fn resolve_item_errors_on_unknown_column() {
         let resp: ItemLookupResponse = serde_json::from_str(ITEM_LOOKUP).unwrap();
         assert!(resolve_item(resp, 1, "Nonexistent").is_err());
+    }
+
+    #[test]
+    fn board_source_advertises_push_capability() {
+        let src = GitHubProjectSource::new("caliban-ai", 1, "tok", mapping()).unwrap();
+        assert!(src.capabilities().push);
+        assert!(!src.capabilities().comments);
+    }
+
+    #[tokio::test]
+    async fn set_state_rejects_category_with_no_column() {
+        // mapping() has an empty by_value, so no column maps to Done → Unsupported.
+        let src = GitHubProjectSource::new("caliban-ai", 1, "tok", mapping()).unwrap();
+        let err = src
+            .set_state("caliban-ai/gonzalo#1", StateCategory::Done)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn with_write_targets_stores_overrides() {
+        let mut t = BTreeMap::new();
+        t.insert(StateCategory::Done, "Shipped".to_string());
+        let src = GitHubProjectSource::new("caliban-ai", 1, "tok", mapping())
+            .unwrap()
+            .with_write_targets(t);
+        assert_eq!(
+            src.set_targets
+                .get(&StateCategory::Done)
+                .map(String::as_str),
+            Some("Shipped")
+        );
     }
 }
