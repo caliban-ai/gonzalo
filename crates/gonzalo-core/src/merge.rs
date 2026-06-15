@@ -19,12 +19,119 @@ pub enum MergeOutcome {
 /// - `AppendOnly`: union of lines from base→ours and base→theirs, in a
 ///   stable order (base lines, then new ours lines, then new theirs lines),
 ///   de-duplicated. Suits append-only topics and transcripts.
-/// - `Structured`: deferred to M2 (returns `NeedsResolution` for now).
+/// - `Structured`: field-level 3-way merge of JSON object bodies (see
+///   [`structured_merge`]). Disjoint field edits auto-merge; the same field
+///   changed differently on both sides is a genuine conflict.
 /// - `Opaque`: always `NeedsResolution`.
 pub fn merge(class: MergeClass, base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
     match class {
         MergeClass::AppendOnly => append_only_merge(base, ours, theirs),
-        MergeClass::Structured | MergeClass::Opaque => MergeOutcome::NeedsResolution,
+        MergeClass::Structured => structured_merge(base, ours, theirs),
+        MergeClass::Opaque => MergeOutcome::NeedsResolution,
+    }
+}
+
+/// Field-level 3-way merge of JSON bodies.
+///
+/// Each body is parsed as JSON. For every key, the standard 3-way rule applies:
+/// if only one side changed it from `base`, take that side; if both changed it
+/// the same way, take it; if both changed it differently, recurse when both are
+/// objects, otherwise surface a conflict. Non-object roots, or bodies that
+/// aren't valid JSON, fall back to `NeedsResolution` (the safe default — a
+/// caller resolves rather than risk a wrong merge).
+fn structured_merge(base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
+    let (Ok(base), Ok(ours), Ok(theirs)) = (
+        serde_json::from_slice::<serde_json::Value>(base.bytes()),
+        serde_json::from_slice::<serde_json::Value>(ours.bytes()),
+        serde_json::from_slice::<serde_json::Value>(theirs.bytes()),
+    ) else {
+        return MergeOutcome::NeedsResolution;
+    };
+    match merge_value(&base, &ours, &theirs) {
+        Some(merged) => match serde_json::to_vec(&merged) {
+            Ok(bytes) => MergeOutcome::Merged(Body::Inline(bytes)),
+            Err(_) => MergeOutcome::NeedsResolution,
+        },
+        None => MergeOutcome::NeedsResolution,
+    }
+}
+
+/// 3-way merge of a single JSON value. Returns `None` on a genuine conflict.
+///
+/// Scalars and arrays are merged atomically (by equality); objects are merged
+/// key-by-key via [`merge_field`], which models presence so a key deleted on one
+/// side is honored rather than turned into `null`.
+fn merge_value(
+    base: &serde_json::Value,
+    ours: &serde_json::Value,
+    theirs: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    // Both sides agree (covers "neither changed" and "both changed identically").
+    if ours == theirs {
+        return Some(ours.clone());
+    }
+    // Only one side diverged from base — take the side that changed.
+    if ours == base {
+        return Some(theirs.clone());
+    }
+    if theirs == base {
+        return Some(ours.clone());
+    }
+    // Both changed differently. Recurse only when all three are objects;
+    // anything else (scalars, arrays, type changes) is a genuine conflict.
+    match (base.as_object(), ours.as_object(), theirs.as_object()) {
+        (Some(base_obj), Some(ours_obj), Some(theirs_obj)) => {
+            let mut out = serde_json::Map::new();
+            let mut keys: Vec<&String> = base_obj
+                .keys()
+                .chain(ours_obj.keys())
+                .chain(theirs_obj.keys())
+                .collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                // `?` propagates a conflict; `Some(v)` keeps the key, `None`
+                // drops it (deleted on the winning side).
+                if let Some(v) =
+                    merge_field(base_obj.get(key), ours_obj.get(key), theirs_obj.get(key))?
+                {
+                    out.insert(key.clone(), v);
+                }
+            }
+            Some(serde_json::Value::Object(out))
+        }
+        _ => None,
+    }
+}
+
+/// 3-way merge of one object field, modeling presence as `Option` (inner
+/// `None` = the key is absent/deleted). The outer `Option` is the merge result:
+/// `None` = genuine conflict; `Some(Some(v))` = keep `v`; `Some(None)` = drop
+/// the key.
+fn merge_field(
+    base: Option<&serde_json::Value>,
+    ours: Option<&serde_json::Value>,
+    theirs: Option<&serde_json::Value>,
+) -> Option<Option<serde_json::Value>> {
+    // Both sides agree on presence + value.
+    if ours == theirs {
+        return Some(ours.cloned());
+    }
+    // Only one side changed relative to base — take the changed side.
+    if ours == base {
+        return Some(theirs.cloned());
+    }
+    if theirs == base {
+        return Some(ours.cloned());
+    }
+    // Both changed differently: recurse if both are still present objects,
+    // else it's a genuine conflict (incl. modify/delete).
+    match (ours, theirs) {
+        (Some(o), Some(t)) => {
+            let b = base.unwrap_or(&serde_json::Value::Null);
+            merge_value(b, o, t).map(Some)
+        }
+        _ => None,
     }
 }
 
@@ -111,12 +218,123 @@ mod tests {
         );
     }
 
-    #[test]
-    fn structured_needs_resolution_in_m1() {
-        let b = body("x\n");
-        assert_eq!(
-            merge(MergeClass::Structured, &b, &b, &b),
+    /// Run a structured merge over JSON string inputs and return the parsed
+    /// merged value, panicking if the merge needed resolution.
+    fn structured(base: &str, ours: &str, theirs: &str) -> serde_json::Value {
+        match merge(
+            MergeClass::Structured,
+            &body(base),
+            &body(ours),
+            &body(theirs),
+        ) {
+            MergeOutcome::Merged(b) => serde_json::from_slice(b.bytes()).unwrap(),
+            MergeOutcome::NeedsResolution => panic!("expected a merge, got NeedsResolution"),
+        }
+    }
+
+    fn structured_conflicts(base: &str, ours: &str, theirs: &str) -> bool {
+        matches!(
+            merge(
+                MergeClass::Structured,
+                &body(base),
+                &body(ours),
+                &body(theirs),
+            ),
             MergeOutcome::NeedsResolution
+        )
+    }
+
+    #[test]
+    fn structured_merges_disjoint_field_edits() {
+        // ours changes `name`, theirs changes `content` — both survive.
+        let merged = structured(
+            r#"{"name":"a","content":"x"}"#,
+            r#"{"name":"b","content":"x"}"#,
+            r#"{"name":"a","content":"y"}"#,
         );
+        assert_eq!(merged, serde_json::json!({"name":"b","content":"y"}));
+    }
+
+    #[test]
+    fn structured_takes_the_only_changed_side() {
+        // Only theirs changed a field; ours is identical to base.
+        let merged = structured(r#"{"k":1,"j":2}"#, r#"{"k":1,"j":2}"#, r#"{"k":9,"j":2}"#);
+        assert_eq!(merged, serde_json::json!({"k":9,"j":2}));
+    }
+
+    #[test]
+    fn structured_adds_new_keys_from_both_sides() {
+        let merged = structured(r#"{"a":1}"#, r#"{"a":1,"b":2}"#, r#"{"a":1,"c":3}"#);
+        assert_eq!(merged, serde_json::json!({"a":1,"b":2,"c":3}));
+    }
+
+    #[test]
+    fn structured_conflicts_on_same_field_changed_differently() {
+        assert!(structured_conflicts(
+            r#"{"k":1}"#,
+            r#"{"k":2}"#,
+            r#"{"k":3}"#,
+        ));
+    }
+
+    #[test]
+    fn structured_merges_nested_objects() {
+        // Disjoint edits within a nested object merge field-by-field.
+        let merged = structured(
+            r#"{"meta":{"a":1,"b":2}}"#,
+            r#"{"meta":{"a":9,"b":2}}"#,
+            r#"{"meta":{"a":1,"b":8}}"#,
+        );
+        assert_eq!(merged, serde_json::json!({"meta":{"a":9,"b":8}}));
+    }
+
+    #[test]
+    fn structured_conflicts_on_nested_same_field() {
+        assert!(structured_conflicts(
+            r#"{"meta":{"a":1}}"#,
+            r#"{"meta":{"a":2}}"#,
+            r#"{"meta":{"a":3}}"#,
+        ));
+    }
+
+    #[test]
+    fn structured_honors_one_sided_deletion() {
+        // ours deletes `b`, theirs leaves it untouched → deleted.
+        let merged = structured(r#"{"a":1,"b":2}"#, r#"{"a":1}"#, r#"{"a":1,"b":2}"#);
+        assert_eq!(merged, serde_json::json!({"a":1}));
+    }
+
+    #[test]
+    fn structured_conflicts_on_modify_delete() {
+        // ours deletes `b`, theirs modifies it → genuine conflict.
+        assert!(structured_conflicts(
+            r#"{"a":1,"b":2}"#,
+            r#"{"a":1}"#,
+            r#"{"a":1,"b":9}"#,
+        ));
+    }
+
+    #[test]
+    fn structured_arrays_merge_atomically() {
+        // Identical array edit on both sides → fine.
+        let merged = structured(r#"{"xs":[1]}"#, r#"{"xs":[1,2]}"#, r#"{"xs":[1,2]}"#);
+        assert_eq!(merged, serde_json::json!({"xs":[1,2]}));
+        // Divergent array edits → conflict (atomic).
+        assert!(structured_conflicts(
+            r#"{"xs":[1]}"#,
+            r#"{"xs":[1,2]}"#,
+            r#"{"xs":[1,3]}"#,
+        ));
+    }
+
+    #[test]
+    fn structured_non_json_falls_back_to_needs_resolution() {
+        assert!(structured_conflicts("not json", "also not", "nope"));
+    }
+
+    #[test]
+    fn structured_non_object_root_conflict_needs_resolution() {
+        // Scalar roots changed differently → NeedsResolution (no field structure).
+        assert!(structured_conflicts("1", "2", "3"));
     }
 }
