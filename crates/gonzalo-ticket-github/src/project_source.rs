@@ -8,8 +8,87 @@ use crate::project_mapping::{GqlItems, GqlResponse, item_to_ticket};
 use async_trait::async_trait;
 use gonzalo_domain::Ticket;
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
+use serde::Deserialize;
 
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
+
+/// Resolved coordinates for a single Projects v2 card write.
+// Pure write-back helpers (Task 2): consumed by `set_state` in Task 3; until
+// then they are exercised only by unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ItemCoords {
+    pub item_id: String,
+    pub project_id: String,
+    pub field_id: String,
+    pub option_id: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ItemLookupResponse {
+    #[serde(default)]
+    pub data: Option<ItemLookupData>,
+    #[serde(default)]
+    pub errors: Vec<crate::project_mapping::GqlError>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ItemLookupData {
+    pub repository: Option<LookupRepo>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupRepo {
+    pub issue: Option<LookupIssue>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupIssue {
+    #[serde(rename = "projectItems")]
+    pub project_items: LookupItems,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupItems {
+    pub nodes: Vec<LookupItem>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupItem {
+    pub id: String,
+    pub project: LookupProject,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupProject {
+    pub id: String,
+    pub number: u32,
+    /// The project's Status single-select field (id + options), read from the
+    /// project definition so it is present even when the card has no status set.
+    /// `None` if the project has no such field.
+    pub field: Option<LookupField>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupField {
+    pub id: String,
+    pub options: Vec<LookupOption>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct LookupOption {
+    pub id: String,
+    pub name: String,
+}
 
 /// Reads issues on an org's Projects v2 board, with their Status column mapped
 /// to a normalized state category via [`StateMapping`].
@@ -136,6 +215,109 @@ query($org: String!, $number: Int!, $cursor: String) {
     })
 }
 
+/// GraphQL body that finds an issue's board item across its projects, with each
+/// project's Status single-select field id + options. Pure / network-free.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn project_item_query(owner: &str, repo: &str, number: u64) -> serde_json::Value {
+    const QUERY: &str = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      projectItems(first: 20) {
+        nodes {
+          id
+          project {
+            id
+            number
+            field(name: "Status") {
+              ... on ProjectV2SingleSelectField { id options { id name } }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+    serde_json::json!({
+        "query": QUERY,
+        "variables": { "owner": owner, "repo": repo, "number": number },
+    })
+}
+
+/// GraphQL body that sets a card's single-select Status option. Pure.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn set_option_mutation(
+    project_id: &str,
+    item_id: &str,
+    field_id: &str,
+    option_id: &str,
+) -> serde_json::Value {
+    const QUERY: &str = r#"
+mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $project, itemId: $item, fieldId: $field,
+    value: { singleSelectOptionId: $option }
+  }) { projectV2Item { id } }
+}"#;
+    serde_json::json!({
+        "query": QUERY,
+        "variables": {
+            "project": project_id, "item": item_id, "field": field_id, "option": option_id
+        },
+    })
+}
+
+/// Pick the issue's item on the project numbered `project_number`, then resolve
+/// `column` to its single-select option id (case-insensitive). Surfaces GraphQL
+/// `errors` and missing pieces as `Backend`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_item(
+    resp: ItemLookupResponse,
+    project_number: u32,
+    column: &str,
+) -> Result<ItemCoords> {
+    if !resp.errors.is_empty() {
+        let msg = resp
+            .errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(SourceError::Backend(format!("github graphql: {msg}")));
+    }
+    let nodes = resp
+        .data
+        .and_then(|d| d.repository)
+        .and_then(|r| r.issue)
+        .map(|i| i.project_items.nodes)
+        .ok_or_else(|| SourceError::Backend("issue not found".into()))?;
+    let item = nodes
+        .into_iter()
+        .find(|n| n.project.number == project_number)
+        .ok_or_else(|| {
+            SourceError::Backend(format!("issue is not on project #{project_number}"))
+        })?;
+    let field = item
+        .project
+        .field
+        .ok_or_else(|| SourceError::Backend("project has no Status single-select field".into()))?;
+    let option = field
+        .options
+        .iter()
+        .find(|o| o.name.eq_ignore_ascii_case(column))
+        .ok_or_else(|| {
+            SourceError::Backend(format!(
+                "no Status option named {column:?} on project #{project_number}"
+            ))
+        })?;
+    Ok(ItemCoords {
+        item_id: item.id,
+        project_id: item.project.id,
+        field_id: field.id,
+        option_id: option.id.clone(),
+    })
+}
+
 #[async_trait]
 impl TicketSource for GitHubProjectSource {
     fn capabilities(&self) -> Capabilities {
@@ -219,5 +401,81 @@ mod tests {
         let body = r#"{"data": null}"#;
         let parsed: crate::project_mapping::GqlResponse = serde_json::from_str(body).unwrap();
         assert!(items_or_error(parsed).is_err());
+    }
+
+    #[test]
+    fn project_item_query_carries_owner_repo_number() {
+        let b = project_item_query("caliban-ai", "gonzalo", 19);
+        assert_eq!(b["variables"]["owner"], "caliban-ai");
+        assert_eq!(b["variables"]["repo"], "gonzalo");
+        assert_eq!(b["variables"]["number"], 19);
+        assert!(b["query"].as_str().unwrap().contains("projectItems"));
+    }
+
+    #[test]
+    fn set_option_mutation_carries_four_ids() {
+        let b = set_option_mutation("PROJ", "ITEM", "FIELD", "OPT");
+        assert_eq!(b["variables"]["project"], "PROJ");
+        assert_eq!(b["variables"]["item"], "ITEM");
+        assert_eq!(b["variables"]["field"], "FIELD");
+        assert_eq!(b["variables"]["option"], "OPT");
+        assert!(
+            b["query"]
+                .as_str()
+                .unwrap()
+                .contains("updateProjectV2ItemFieldValue")
+        );
+    }
+
+    const ITEM_LOOKUP: &str = r#"{
+      "data": { "repository": { "issue": { "projectItems": { "nodes": [
+        {
+          "id": "ITEM_OTHER",
+          "project": {
+            "id": "PROJ_OTHER", "number": 7,
+            "field": { "id": "F_OTHER", "options": [{ "id": "o1", "name": "Done" }] }
+          }
+        },
+        {
+          "id": "ITEM_1",
+          "project": {
+            "id": "PROJ_1", "number": 1,
+            "field": { "id": "FIELD_1", "options": [
+              { "id": "opt_todo", "name": "Todo" },
+              { "id": "opt_ip", "name": "In progress" },
+              { "id": "opt_done", "name": "Done" }
+            ] }
+          }
+        }
+      ] } } } }
+    }"#;
+
+    #[test]
+    fn resolve_item_picks_target_project_and_option() {
+        let resp: ItemLookupResponse = serde_json::from_str(ITEM_LOOKUP).unwrap();
+        let r = resolve_item(resp, 1, "In progress").unwrap();
+        assert_eq!(r.item_id, "ITEM_1");
+        assert_eq!(r.project_id, "PROJ_1");
+        assert_eq!(r.field_id, "FIELD_1");
+        assert_eq!(r.option_id, "opt_ip");
+    }
+
+    #[test]
+    fn resolve_item_matches_option_case_insensitively() {
+        let resp: ItemLookupResponse = serde_json::from_str(ITEM_LOOKUP).unwrap();
+        let r = resolve_item(resp, 1, "in PROGRESS").unwrap();
+        assert_eq!(r.option_id, "opt_ip");
+    }
+
+    #[test]
+    fn resolve_item_errors_when_issue_not_on_board() {
+        let resp: ItemLookupResponse = serde_json::from_str(ITEM_LOOKUP).unwrap();
+        assert!(resolve_item(resp, 99, "Done").is_err());
+    }
+
+    #[test]
+    fn resolve_item_errors_on_unknown_column() {
+        let resp: ItemLookupResponse = serde_json::from_str(ITEM_LOOKUP).unwrap();
+        assert!(resolve_item(resp, 1, "Nonexistent").is_err());
     }
 }
