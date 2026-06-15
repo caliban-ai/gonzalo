@@ -93,6 +93,7 @@ mod tests {
             project: 1,
             token_env: "SVC_TEST_TOKEN".into(),
             state_map: BTreeMap::new(),
+            set_targets: BTreeMap::new(),
         };
         let result = svc.ticket_sync(&conn, "tester").await;
         #[allow(unsafe_code)]
