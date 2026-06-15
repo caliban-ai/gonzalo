@@ -19,6 +19,7 @@ gonzalo-vector = { workspace = true, optional = true }
 gonzalo-graph = { workspace = true, optional = true }
 gonzalo-ticket = { workspace = true, optional = true }
 gonzalo-ticket-github = { workspace = true, optional = true }
+gonzalo-ticket-jira = { workspace = true, optional = true }
 
 [features]
 default = ["fs"]
@@ -30,6 +31,7 @@ vector = ["dep:gonzalo-vector"]
 graph = ["dep:gonzalo-graph"]
 ticket = ["dep:gonzalo-ticket"]
 ticket-github = ["dep:gonzalo-ticket-github", "ticket"]
+ticket-jira = ["dep:gonzalo-ticket-jira", "ticket"]
 
 [dev-dependencies]
 tokio    = { workspace = true }
