@@ -41,6 +41,9 @@ pub use gonzalo_ticket::{
     StateSignal, TicketSource, record_key,
 };
 
+#[cfg(feature = "ticket-github")]
+pub use gonzalo_ticket_github::GitHubSource;
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
