@@ -1268,6 +1268,7 @@ dependencies = [
  "gonzalo-core",
  "gonzalo-domain",
  "gonzalo-graph",
+ "gonzalo-knowledge",
  "gonzalo-store-fs",
  "gonzalo-store-git",
  "gonzalo-store-s3",
@@ -1324,6 +1325,19 @@ dependencies = [
  "serde_json",
  "tree-sitter",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "gonzalo-knowledge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gonzalo-core",
+ "gonzalo-domain",
+ "gonzalo-store-fs",
+ "gonzalo-vector",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
