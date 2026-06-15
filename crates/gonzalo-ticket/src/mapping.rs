@@ -94,7 +94,7 @@ impl StateMapping {
         matches.sort(); // deterministic order for the ambiguity message
         match matches.len() {
             0 => Err(ReverseError::Unmapped(category)),
-            1 => Ok(matches.pop().unwrap()),
+            1 => Ok(matches.swap_remove(0)),
             _ => Err(ReverseError::Ambiguous(category, matches)),
         }
     }
@@ -213,6 +213,15 @@ mod tests {
         assert_eq!(
             m.column_for(StateCategory::Pending, &none),
             Err(ReverseError::Unmapped(StateCategory::Pending))
+        );
+
+        // An override short-circuits before the Unmapped path: a category with
+        // no by_value column can still resolve to a column via set_targets.
+        let mut overrides = BTreeMap::new();
+        overrides.insert(StateCategory::Pending, "Blocked".to_string());
+        assert_eq!(
+            m.column_for(StateCategory::Pending, &overrides).unwrap(),
+            "Blocked"
         );
     }
 
