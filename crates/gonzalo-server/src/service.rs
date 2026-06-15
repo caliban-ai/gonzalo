@@ -30,17 +30,42 @@ impl Service {
     }
 
     /// Build a source for `conn` from the registry and ingest its tickets into
-    /// the backing store. Errors are flattened to strings at this boundary so
-    /// both transports can surface them uniformly.
+    /// the backing store. The error is typed so each transport can return the
+    /// right status: a misconfigured request is a client error, a
+    /// build/ingest failure is a server error.
     pub async fn ticket_sync(
         &self,
         conn: &Connection,
         author: &str,
-    ) -> std::result::Result<IngestSummary, String> {
-        let source = gonzalo_ticket_config::build_source(conn).map_err(|e| e.to_string())?;
+    ) -> std::result::Result<IngestSummary, TicketSyncError> {
+        let source = gonzalo_ticket_config::build_source(conn).map_err(classify_config_err)?;
         gonzalo_ticket::ingest(source.as_ref(), self.store.as_ref(), author)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| TicketSyncError::Internal(e.to_string()))
+    }
+}
+
+/// Error from a ticket sync, split so transports can return the right status:
+/// a misconfigured request is a client error (400 / invalid_argument), a
+/// build/ingest/transport failure is a server error (500 / internal).
+#[derive(Debug, thiserror::Error)]
+pub enum TicketSyncError {
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+/// A misconfigured connection is the caller's fault; a failure constructing the
+/// underlying client is ours.
+fn classify_config_err(e: gonzalo_ticket_config::ConfigError) -> TicketSyncError {
+    use gonzalo_ticket_config::ConfigError::*;
+    let msg = e.to_string();
+    match e {
+        Read(..) | Parse(..) | MissingEnv { .. } | UnknownProvider { .. } | BadCategory { .. } => {
+            TicketSyncError::BadRequest(msg)
+        }
+        Source(..) => TicketSyncError::Internal(msg),
     }
 }
 
@@ -69,11 +94,13 @@ mod tests {
             token_env: "SVC_TEST_TOKEN".into(),
             state_map: BTreeMap::new(),
         };
-        let err = svc.ticket_sync(&conn, "tester").await.unwrap_err();
-        assert!(err.contains("unknown provider"));
+        let result = svc.ticket_sync(&conn, "tester").await;
         #[allow(unsafe_code)]
         unsafe {
-            std::env::remove_var("SVC_TEST_TOKEN")
-        };
+            std::env::remove_var("SVC_TEST_TOKEN");
+        }
+        let err = result.unwrap_err();
+        assert!(matches!(err, TicketSyncError::BadRequest(_)), "got {err:?}");
+        assert!(err.to_string().contains("unknown provider"));
     }
 }

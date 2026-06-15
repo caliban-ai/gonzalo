@@ -53,6 +53,8 @@ message TicketSyncRequest {
   bytes connection_json = 1;
 }
 
+// Unlike the other responses (which carry bytes ..._json), the sync summary is
+// three small counts, so they ride as plain numeric fields.
 message TicketSyncResponse {
   uint64 imported = 1;
   uint64 updated = 2;

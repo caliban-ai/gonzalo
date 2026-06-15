@@ -83,13 +83,16 @@ impl Gonzalo for GrpcAdapter {
         req: Request<TicketSyncRequest>,
     ) -> Result<Response<TicketSyncResponse>, Status> {
         let r = req.into_inner();
-        let conn: gonzalo_ticket_config::Connection =
-            serde_json::from_slice(&r.connection_json).map_err(internal)?;
+        let conn: gonzalo_ticket_config::Connection = serde_json::from_slice(&r.connection_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let summary = self
             .service
             .ticket_sync(&conn, "gonzalod")
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| match e {
+                crate::service::TicketSyncError::BadRequest(m) => Status::invalid_argument(m),
+                crate::service::TicketSyncError::Internal(m) => Status::internal(m),
+            })?;
         Ok(Response::new(TicketSyncResponse {
             imported: summary.imported as u64,
             updated: summary.updated as u64,

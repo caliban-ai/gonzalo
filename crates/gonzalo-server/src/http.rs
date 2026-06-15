@@ -103,7 +103,12 @@ async fn ticket_sync(
 ) -> Response {
     match svc.ticket_sync(&conn, "gonzalod").await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
-        Err(e) => server_error(e),
+        Err(crate::service::TicketSyncError::BadRequest(m)) => {
+            (StatusCode::BAD_REQUEST, m).into_response()
+        }
+        Err(crate::service::TicketSyncError::Internal(m)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, m).into_response()
+        }
     }
 }
 
