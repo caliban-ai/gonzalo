@@ -7,10 +7,50 @@
 
 use crate::mapping::{LinearIssue, issue_to_ticket};
 use async_trait::async_trait;
-use gonzalo_domain::Ticket;
+use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+/// The Linear workflow-state `type` a target [`StateCategory`] maps onto.
+fn target_state_type(target: StateCategory) -> &'static str {
+    match target {
+        StateCategory::Triage => "triage",
+        StateCategory::Backlog => "backlog",
+        StateCategory::InProgress | StateCategory::Pending => "started",
+        StateCategory::Done => "completed",
+        StateCategory::Canceled => "canceled",
+        // Open
+        _ => "unstarted",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueTeamData {
+    issue: Option<IssueTeam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueTeam {
+    team: Team,
+}
+
+#[derive(Debug, Deserialize)]
+struct Team {
+    states: StateNodes,
+}
+
+#[derive(Debug, Deserialize)]
+struct StateNodes {
+    nodes: Vec<WorkflowState>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowState {
+    id: String,
+    #[serde(rename = "type")]
+    type_: String,
+}
 
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
@@ -69,13 +109,18 @@ impl LinearSource {
     /// Connect with a Linear API key (sent verbatim in the `Authorization`
     /// header, per Linear's personal-API-key scheme).
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
+        Self::with_endpoint(ENDPOINT, api_key)
+    }
+
+    /// Connect against a custom GraphQL endpoint (e.g. a test server).
+    pub fn with_endpoint(endpoint: &str, api_key: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent("gonzalo-ticket-linear")
             .build()
             .map_err(be)?;
         Ok(Self {
             client,
-            endpoint: reqwest::Url::parse(ENDPOINT).map_err(be)?,
+            endpoint: reqwest::Url::parse(endpoint).map_err(be)?,
             api_key: api_key.into(),
             mapping: None,
         })
@@ -123,7 +168,11 @@ impl LinearSource {
 #[async_trait]
 impl TicketSource for LinearSource {
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            push: true,
+            comments: true,
+            ..Capabilities::default()
+        }
     }
 
     async fn fetch_changed(&self, cursor: &Cursor) -> Result<Page> {
@@ -156,6 +205,43 @@ impl TicketSource for LinearSource {
             .ok_or_else(|| SourceError::Backend(format!("no linear issue {uid}")))?;
         Ok(issue_to_ticket(&issue, self.mapping.as_ref()))
     }
+
+    async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
+        // Linear states are workspace-defined; resolve a state of the issue's
+        // team whose `type` matches the target, then update the issue to it.
+        let states_query =
+            "query($id: String!) { issue(id: $id) { team { states { nodes { id type } } } } }";
+        let data: IssueTeamData = self
+            .query(states_query, serde_json::json!({ "id": uid }))
+            .await?;
+        let team = data
+            .issue
+            .ok_or_else(|| SourceError::Backend(format!("no linear issue {uid}")))?
+            .team;
+        let want = target_state_type(target);
+        let state = team
+            .states
+            .nodes
+            .iter()
+            .find(|s| s.type_ == want)
+            .ok_or_else(|| {
+                SourceError::Backend(format!("team has no workflow state of type '{want}'"))
+            })?;
+
+        let mutation = "mutation($id: String!, $sid: String!) { issueUpdate(id: $id, input: { stateId: $sid }) { success } }";
+        let _: serde_json::Value = self
+            .query(mutation, serde_json::json!({ "id": uid, "sid": state.id }))
+            .await?;
+        Ok(())
+    }
+
+    async fn comment(&self, uid: &str, body: &str) -> Result<()> {
+        let mutation = "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }";
+        let _: serde_json::Value = self
+            .query(mutation, serde_json::json!({ "id": uid, "body": body }))
+            .await?;
+        Ok(())
+    }
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
@@ -167,9 +253,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_source_is_read_only() {
+    fn endpoint_and_write_capabilities() {
         let src = LinearSource::new("lin_api_xxx").unwrap();
-        assert!(!src.capabilities().push);
+        assert!(src.capabilities().push);
+        assert!(src.capabilities().comments);
         assert_eq!(src.endpoint.as_str(), "https://api.linear.app/graphql");
     }
 

@@ -22,6 +22,8 @@ gonzalo-ticket-github = { workspace = true, optional = true }
 gonzalo-ticket-jira = { workspace = true, optional = true }
 gonzalo-ticket-linear = { workspace = true, optional = true }
 gonzalo-ticket-gitlab = { workspace = true, optional = true }
+gonzalo-ticket-asana = { workspace = true, optional = true }
+gonzalo-knowledge = { workspace = true, optional = true }
 
 [features]
 default = ["fs"]
@@ -31,11 +33,13 @@ s3 = ["dep:gonzalo-store-s3"]
 remote = ["dep:gonzalo-store-server"]
 vector = ["dep:gonzalo-vector"]
 graph = ["dep:gonzalo-graph"]
+knowledge = ["dep:gonzalo-knowledge", "vector"]
 ticket = ["dep:gonzalo-ticket"]
 ticket-github = ["dep:gonzalo-ticket-github", "ticket"]
 ticket-jira = ["dep:gonzalo-ticket-jira", "ticket"]
 ticket-linear = ["dep:gonzalo-ticket-linear", "ticket"]
 ticket-gitlab = ["dep:gonzalo-ticket-gitlab", "ticket"]
+ticket-asana = ["dep:gonzalo-ticket-asana", "ticket"]
 
 [dev-dependencies]
 tokio    = { workspace = true }

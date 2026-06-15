@@ -8,7 +8,7 @@
 
 use crate::mapping::{GhIssue, issue_to_ticket};
 use async_trait::async_trait;
-use gonzalo_domain::Ticket;
+use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, TicketSource};
 
 const API_ROOT: &str = "https://api.github.com";
@@ -37,6 +37,16 @@ impl GitHubSource {
         Self::build(owner_repo.into(), Some(token.into()), API_ROOT)
     }
 
+    /// Import against a custom API base — GitHub Enterprise (e.g.
+    /// `https://ghe.example.com/api/v3`) or a test server.
+    pub fn with_base(
+        api_root: &str,
+        owner_repo: impl Into<String>,
+        token: Option<String>,
+    ) -> Result<Self> {
+        Self::build(owner_repo.into(), token, api_root)
+    }
+
     fn build(owner_repo: String, token: Option<String>, api_root: &str) -> Result<Self> {
         let (owner, repo) = owner_repo.split_once('/').ok_or_else(|| {
             SourceError::Backend(format!("expected owner/repo, got {owner_repo}"))
@@ -56,18 +66,17 @@ impl GitHubSource {
         })
     }
 
-    /// Build an issues URL under the configured repo, e.g. `.../issues` or
-    /// `.../issues/15`.
-    fn issues_url(&self, trailing: Option<&str>) -> Result<reqwest::Url> {
+    /// Build an issues URL under the configured repo, e.g. `.../issues`,
+    /// `.../issues/15`, or `.../issues/15/comments`. Each `trailing` element is a
+    /// distinct, individually-encoded path segment.
+    fn issues_url(&self, trailing: &[&str]) -> Result<reqwest::Url> {
         let mut url = self.api_root.clone();
         {
             let mut seg = url
                 .path_segments_mut()
                 .map_err(|_| SourceError::Backend("api root cannot be a base".into()))?;
             seg.extend(["repos", &self.owner, &self.repo, "issues"]);
-            if let Some(t) = trailing {
-                seg.push(t);
-            }
+            seg.extend(trailing);
         }
         Ok(url)
     }
@@ -84,12 +93,15 @@ impl GitHubSource {
 #[async_trait]
 impl TicketSource for GitHubSource {
     fn capabilities(&self) -> Capabilities {
-        // Phase 1: read-only. Write-back lands in a later increment.
-        Capabilities::default()
+        Capabilities {
+            push: true,
+            comments: true,
+            ..Capabilities::default()
+        }
     }
 
     async fn fetch_changed(&self, cursor: &Cursor) -> Result<Page> {
-        let mut url = self.issues_url(None)?;
+        let mut url = self.issues_url(&[])?;
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("state", "all");
@@ -122,15 +134,7 @@ impl TicketSource for GitHubSource {
     }
 
     async fn get(&self, uid: &str) -> Result<Ticket> {
-        let number = uid
-            .rsplit_once('#')
-            .map(|(_, n)| n)
-            .unwrap_or(uid)
-            .parse::<u64>()
-            .map_err(|_| {
-                SourceError::Backend(format!("cannot parse issue number from uid {uid}"))
-            })?;
-        let url = self.issues_url(Some(&number.to_string()))?;
+        let url = self.issues_url(&[&issue_number(uid)?.to_string()])?;
         let resp = self
             .send(self.client.get(url))
             .send()
@@ -141,6 +145,52 @@ impl TicketSource for GitHubSource {
         let issue: GhIssue = resp.json().await.map_err(be)?;
         Ok(issue_to_ticket(&issue, &self.owner_repo))
     }
+
+    async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
+        // GitHub state is binary + reason: closed/completed, closed/not_planned,
+        // or open. Categories collapse onto those.
+        let (state, reason) = match target {
+            StateCategory::Done => ("closed", Some("completed")),
+            StateCategory::Canceled => ("closed", Some("not_planned")),
+            _ => ("open", None),
+        };
+        let mut body = serde_json::json!({ "state": state });
+        if let Some(r) = reason {
+            body["state_reason"] = serde_json::json!(r);
+        }
+        let url = self.issues_url(&[&issue_number(uid)?.to_string()])?;
+        self.send(self.client.patch(url).json(&body))
+            .send()
+            .await
+            .map_err(be)?
+            .error_for_status()
+            .map_err(be)?;
+        Ok(())
+    }
+
+    async fn comment(&self, uid: &str, body: &str) -> Result<()> {
+        let url = self.issues_url(&[&issue_number(uid)?.to_string(), "comments"])?;
+        self.send(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({ "body": body })),
+        )
+        .send()
+        .await
+        .map_err(be)?
+        .error_for_status()
+        .map_err(be)?;
+        Ok(())
+    }
+}
+
+/// Parse the issue number from a `uid` (`owner/repo#N` or a bare `N`).
+fn issue_number(uid: &str) -> Result<u64> {
+    uid.rsplit_once('#')
+        .map(|(_, n)| n)
+        .unwrap_or(uid)
+        .parse::<u64>()
+        .map_err(|_| SourceError::Backend(format!("cannot parse issue number from uid {uid}")))
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
@@ -160,12 +210,12 @@ mod tests {
     fn builds_issue_urls_under_the_repo() {
         let src = GitHubSource::new("caliban-ai/gonzalo").unwrap();
         assert_eq!(
-            src.issues_url(None).unwrap().as_str(),
+            src.issues_url(&[]).unwrap().as_str(),
             "https://api.github.com/repos/caliban-ai/gonzalo/issues"
         );
         assert_eq!(
-            src.issues_url(Some("15")).unwrap().as_str(),
-            "https://api.github.com/repos/caliban-ai/gonzalo/issues/15"
+            src.issues_url(&["15", "comments"]).unwrap().as_str(),
+            "https://api.github.com/repos/caliban-ai/gonzalo/issues/15/comments"
         );
     }
 }

@@ -1,6 +1,6 @@
 [package]
-name = "gonzalo-ticket-gitlab"
-description = "GitLab issue connector for gonzalo's ticket layer"
+name = "gonzalo-ticket-asana"
+description = "Asana task connector for gonzalo's ticket layer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

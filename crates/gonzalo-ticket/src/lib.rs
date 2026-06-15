@@ -10,6 +10,7 @@
 //! provider connectors (GitHub, Jira, Linear, …) are separate, feature-gated
 //! crates built on this surface.
 
+pub mod conformance;
 pub mod ingest;
 pub mod mapping;
 pub mod mock;
