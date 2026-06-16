@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+/.claude/worktrees/
 /docs/guide/book
 /docs/guide/src/adr/
 /docs/guide/theme/caliban-ai.css
