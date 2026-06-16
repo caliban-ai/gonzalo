@@ -4,8 +4,8 @@
 //! which is correct for append-only union.
 
 use crate::{
-    Body, Identity, KeyPrefix, MergeOutcome, Meta, Record, RecordKey, Result, Revision, Store,
-    merge,
+    Body, Identity, KeyPrefix, MergeOutcome, Meta, PutResult, Record, RecordKey, Result, Revision,
+    Store, merge,
 };
 use std::collections::BTreeSet;
 
@@ -31,10 +31,41 @@ pub struct SyncReport {
     pub conflicts: Vec<SyncConflict>,
 }
 
+/// Upper bound on sync passes before giving up on a non-quiescent pair.
+///
+/// Each pass re-reads both stores, so a store that settles converges within
+/// one extra pass. The cap only bites when writers never stop racing the merge
+/// window (livelock guard): rather than spin forever, sync returns the last
+/// pass's best-effort report.
+const MAX_SYNC_PASSES: usize = 16;
+
 /// Reconcile stores `a` and `b`. After a clean run (no `conflicts`), both
 /// stores hold the same set of records for every key.
+///
+/// Stores need not be quiescent. A single pass can lose a write that lands in
+/// the read→merge→write window (the OCC `put` returns `Conflict`); sync re-runs
+/// the pass until one completes without any such race (a fixpoint), bounded by
+/// [`MAX_SYNC_PASSES`] so continuous concurrent writes can't livelock it.
 pub async fn sync(a: &dyn Store, b: &dyn Store) -> Result<SyncReport> {
     let mut report = SyncReport::default();
+    for _ in 0..MAX_SYNC_PASSES {
+        let (pass, raced) = sync_pass(a, b).await?;
+        report = pass;
+        if !raced {
+            break; // quiescent: this pass landed cleanly, stores have converged.
+        }
+    }
+    Ok(report)
+}
+
+/// One reconciliation pass over the union of keys. Returns the pass's report
+/// and whether any write lost an OCC race (`true` ⇒ a store changed mid-pass,
+/// so the caller should re-loop). A `NeedsResolution` merge conflict is a
+/// terminal divergence (surfaced in the report), not a race, and does not
+/// trigger a re-loop.
+async fn sync_pass(a: &dyn Store, b: &dyn Store) -> Result<(SyncReport, bool)> {
+    let mut report = SyncReport::default();
+    let mut raced = false;
 
     let mut keys: BTreeSet<RecordKey> = BTreeSet::new();
     keys.extend(a.list(&KeyPrefix::default()).await?);
@@ -45,12 +76,18 @@ pub async fn sync(a: &dyn Store, b: &dyn Store) -> Result<SyncReport> {
         let rb = b.get(&key).await?;
         match (ra, rb) {
             (Some(rec), None) => {
-                copy(b, &rec).await?;
-                report.copied_to_b.push(key);
+                if copy(b, &rec).await? {
+                    report.copied_to_b.push(key);
+                } else {
+                    raced = true;
+                }
             }
             (None, Some(rec)) => {
-                copy(a, &rec).await?;
-                report.copied_to_a.push(key);
+                if copy(a, &rec).await? {
+                    report.copied_to_a.push(key);
+                } else {
+                    raced = true;
+                }
             }
             (Some(rec_a), Some(rec_b)) => {
                 if rec_a.revision == rec_b.revision {
@@ -64,9 +101,15 @@ pub async fn sync(a: &dyn Store, b: &dyn Store) -> Result<SyncReport> {
                 ) {
                     MergeOutcome::Merged(body) => {
                         let merged = build_merged(&key, &rec_a, &rec_b, body);
-                        overwrite(a, &merged, &rec_a.revision).await?;
-                        overwrite(b, &merged, &rec_b.revision).await?;
-                        report.merged.push(key);
+                        let la = overwrite(a, &merged, &rec_a.revision).await?;
+                        let lb = overwrite(b, &merged, &rec_b.revision).await?;
+                        if la && lb {
+                            report.merged.push(key);
+                        } else {
+                            // At least one side raced; re-loop to reconcile the
+                            // store that moved against the now-merged peer.
+                            raced = true;
+                        }
                     }
                     MergeOutcome::NeedsResolution => {
                         report.conflicts.push(SyncConflict {
@@ -80,21 +123,26 @@ pub async fn sync(a: &dyn Store, b: &dyn Store) -> Result<SyncReport> {
             (None, None) => {}
         }
     }
-    Ok(report)
+    Ok((report, raced))
 }
 
-async fn copy(dst: &dyn Store, rec: &Record) -> Result<()> {
-    // Create in dst; if dst already changed concurrently we leave it (M2).
-    let _ = dst.put(rec.clone(), None).await?;
-    Ok(())
+/// Create `rec` in `dst`. Returns `false` if `dst` changed concurrently
+/// (the key already exists), signalling the caller to re-loop.
+async fn copy(dst: &dyn Store, rec: &Record) -> Result<bool> {
+    Ok(matches!(
+        dst.put(rec.clone(), None).await?,
+        PutResult::Committed(_)
+    ))
 }
 
-async fn overwrite(dst: &dyn Store, rec: &Record, expected: &Revision) -> Result<()> {
-    // Conflict means a concurrent mutation raced the merge window. M2 assumes
-    // quiescent stores; the report won't reflect this case. Tightening to a
-    // re-loop is deferred.
-    let _ = dst.put(rec.clone(), Some(expected.clone())).await?;
-    Ok(())
+/// Conditionally overwrite `dst` with `rec`, expecting revision `expected`.
+/// Returns `false` if a concurrent mutation raced the merge window (`put`
+/// returned `Conflict`), signalling the caller to re-loop.
+async fn overwrite(dst: &dyn Store, rec: &Record, expected: &Revision) -> Result<bool> {
+    Ok(matches!(
+        dst.put(rec.clone(), Some(expected.clone())).await?,
+        PutResult::Committed(_)
+    ))
 }
 
 fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
@@ -163,6 +211,105 @@ mod tests {
             let rev = record.revision.clone();
             g.insert(record.key.clone(), record);
             Ok(PutResult::Committed(rev))
+        }
+        async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| prefix.matches(k))
+                .cloned()
+                .collect())
+        }
+    }
+
+    /// A store that returns one spurious `Conflict` on the first conditional
+    /// (`expected.is_some()`) `put` per key — a concurrent writer that races
+    /// the first overwrite — then behaves normally. Forces the sync re-loop to
+    /// retry and still converge.
+    #[derive(Default)]
+    struct FlakyOnceStore {
+        inner: Mutex<BTreeMap<RecordKey, Record>>,
+        tripped: Mutex<std::collections::HashSet<RecordKey>>,
+    }
+
+    #[async_trait]
+    impl Store for FlakyOnceStore {
+        async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
+            Ok(self.inner.lock().unwrap().get(key).cloned())
+        }
+        async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            if expected.is_some() && self.tripped.lock().unwrap().insert(record.key.clone()) {
+                let current = self
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .get(&record.key)
+                    .cloned()
+                    .unwrap();
+                return Ok(PutResult::Conflict(Box::new(Conflict {
+                    key: record.key.clone(),
+                    expected,
+                    current,
+                })));
+            }
+            let mut g = self.inner.lock().unwrap();
+            let current = g.get(&record.key).map(|r| r.revision.clone());
+            if current != expected {
+                if let Some(cur) = g.get(&record.key).cloned() {
+                    return Ok(PutResult::Conflict(Box::new(Conflict {
+                        key: record.key.clone(),
+                        expected,
+                        current: cur,
+                    })));
+                }
+                return Err(crate::CoreError::NotFound(record.key.clone()));
+            }
+            let rev = record.revision.clone();
+            g.insert(record.key.clone(), record);
+            Ok(PutResult::Committed(rev))
+        }
+        async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| prefix.matches(k))
+                .cloned()
+                .collect())
+        }
+    }
+
+    /// A store whose conditional `put` *always* races (a concurrent writer that
+    /// never stops). Initial creates (`expected == None`) commit; every
+    /// overwrite conflicts. Used to prove the re-loop is bounded and terminates.
+    #[derive(Default)]
+    struct AlwaysRacyStore(Mutex<BTreeMap<RecordKey, Record>>);
+
+    #[async_trait]
+    impl Store for AlwaysRacyStore {
+        async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            let mut g = self.0.lock().unwrap();
+            match expected {
+                None if !g.contains_key(&record.key) => {
+                    let rev = record.revision.clone();
+                    g.insert(record.key.clone(), record);
+                    Ok(PutResult::Committed(rev))
+                }
+                _ => {
+                    let current = g.get(&record.key).cloned().unwrap();
+                    Ok(PutResult::Conflict(Box::new(Conflict {
+                        key: record.key.clone(),
+                        expected,
+                        current,
+                    })))
+                }
+            }
         }
         async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
             Ok(self
@@ -316,5 +463,60 @@ mod tests {
         let report = sync(&a, &b).await.unwrap();
         assert_eq!(report.merged, vec![RecordKey::new("ns", "col", "s")]);
         assert!(report.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn re_loops_until_a_racing_store_converges() {
+        // B races the first overwrite (non-quiescent during the merge window).
+        // A single pass would swallow that conflict and leave B un-synced; the
+        // re-loop must retry until both stores converge.
+        let a = MemStore::default();
+        let b = FlakyOnceStore::default();
+        let _ = a
+            .put(rec("t", RecordKind::Topic, "base\nfrom_a\n"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("t", RecordKind::Topic, "base\nfrom_b\n"), None)
+            .await
+            .unwrap();
+
+        let report = sync(&a, &b).await.unwrap();
+
+        assert!(report.conflicts.is_empty());
+        let key = RecordKey::new("ns", "col", "t");
+        let ra = a.get(&key).await.unwrap().unwrap();
+        let rb = b.get(&key).await.unwrap().unwrap();
+        // Both stores converged despite B racing the first overwrite.
+        assert_eq!(ra.revision, rb.revision);
+        let text = String::from_utf8(rb.body.bytes().to_vec()).unwrap();
+        assert!(text.contains("from_a") && text.contains("from_b"));
+        assert_eq!(report.merged, vec![key]);
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_terminates_under_continuous_writes() {
+        // Both stores race *every* overwrite — a non-quiescent pair that never
+        // settles. The re-loop must be bounded: sync returns (does not hang)
+        // and reports the divergence as unresolved rather than spinning.
+        let a = AlwaysRacyStore::default();
+        let b = AlwaysRacyStore::default();
+        let _ = a
+            .put(rec("t", RecordKind::Topic, "base\nfrom_a\n"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("t", RecordKind::Topic, "base\nfrom_b\n"), None)
+            .await
+            .unwrap();
+
+        let report = sync(&a, &b).await.unwrap();
+
+        // No overwrite ever committed, so nothing converged.
+        let key = RecordKey::new("ns", "col", "t");
+        let ra = a.get(&key).await.unwrap().unwrap();
+        let rb = b.get(&key).await.unwrap().unwrap();
+        assert_ne!(ra.revision, rb.revision);
+        assert!(report.merged.is_empty());
     }
 }
