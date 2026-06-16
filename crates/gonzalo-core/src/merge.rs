@@ -1,6 +1,8 @@
 //! Merge strategies keyed by `MergeClass`. Used by `Sync` (M2) and by
 //! callers resolving a `PutResult::Conflict`.
 
+use std::collections::HashSet;
+
 use crate::record::{Body, MergeClass};
 
 /// The result of attempting an automatic merge of two divergent bodies.
@@ -165,14 +167,15 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
 
 /// Lines present in `bytes` but not in `base_lines`, preserving order and
 /// dropping duplicates.
-fn new_lines<'a>(base_lines: &[&[u8]], bytes: &'a [u8]) -> Vec<&'a [u8]> {
-    // TODO(m2): for large bodies (externalized sessions), switch this O(n^2)
-    // linear scan to a HashSet-based membership check.
-    let mut seen: Vec<&[u8]> = base_lines.to_vec();
+fn new_lines<'a>(base_lines: &[&'a [u8]], bytes: &'a [u8]) -> Vec<&'a [u8]> {
+    // HashSet membership keeps this O(n) for large bodies (externalized
+    // sessions). `insert` returns false for a line already in `base_lines` or
+    // seen earlier in `bytes`, so the first occurrence wins and order is
+    // preserved via `out`.
+    let mut seen: HashSet<&[u8]> = base_lines.iter().copied().collect();
     let mut out = Vec::new();
     for line in split_lines(bytes) {
-        if !seen.contains(&line) {
-            seen.push(line);
+        if seen.insert(line) {
             out.push(line);
         }
     }
@@ -207,6 +210,25 @@ mod tests {
             panic!("expected merge");
         };
         assert_eq!(m, body("a\nb\n"));
+    }
+
+    #[test]
+    fn append_only_dedups_new_lines_across_sides_and_within_a_side() {
+        // ours re-adds base lines plus new lines, one of which it repeats;
+        // theirs re-adds an ours-new line plus its own new ones. The base is
+        // emitted verbatim (assumed already-canonical), then only the genuinely
+        // new ours lines, then the genuinely new theirs lines — each new line
+        // appearing exactly once, in first-occurrence order. This pins the
+        // membership-and-order semantics the HashSet refactor must preserve.
+        let base = body("a\nb\na\n");
+        let ours = body("a\nb\nc\nc\nd\n");
+        let theirs = body("b\nd\ne\nf\n");
+        let MergeOutcome::Merged(m) = merge(MergeClass::AppendOnly, &base, &ours, &theirs) else {
+            panic!("expected merge");
+        };
+        // base verbatim: a,b,a | ours-new (deduped vs base + within): c,d
+        // | theirs-new (deduped vs base + ours-new): e,f
+        assert_eq!(m, body("a\nb\na\nc\nd\ne\nf\n"));
     }
 
     #[test]
