@@ -4,9 +4,10 @@ mod layout;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Store, store::Conflict,
+    CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store, store::Conflict,
 };
-use std::path::PathBuf;
+use rustix::fs::{FlockOperation, flock};
+use std::path::{Path, PathBuf};
 
 /// A `Store` backed by JSON files under a root directory.
 pub struct FsStore {
@@ -38,46 +39,17 @@ impl Store for FsStore {
         self.read_record(key).await
     }
 
-    async fn put(
-        &self,
-        record: Record,
-        expected: Option<gonzalo_core::Revision>,
-    ) -> Result<PutResult> {
-        // Optimistic concurrency: the stored revision must equal `expected`.
-        // NOTE(TOCTOU): this read-then-write is racy without advisory locking — a
-        // concurrent writer can commit between our read and rename, causing a silent
-        // lost update. Acceptable for M1; file locking is deferred to a later milestone.
-        let current = self.read_record(&record.key).await?;
-        let current_rev = current.as_ref().map(|r| r.revision.clone());
-        if current_rev != expected {
-            if let Some(current) = current {
-                return Ok(PutResult::Conflict(Box::new(Conflict {
-                    key: record.key.clone(),
-                    expected,
-                    current,
-                })));
-            }
-            // expected referenced a revision but nothing exists: treat as conflict
-            return Err(CoreError::NotFound(record.key.clone()));
-        }
-
-        let path = layout::record_path(&self.root, &record.key);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| CoreError::Backend(e.to_string()))?;
-        }
-        let bytes =
-            serde_json::to_vec_pretty(&record).map_err(|e| CoreError::Serde(e.to_string()))?;
-        // Atomic write: temp file + rename.
-        let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &bytes)
+    async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        // The OCC read-check-write-rename is a critical section: without
+        // serialization a concurrent writer can commit between our read and our
+        // rename, silently losing an update. Hold a per-record advisory file
+        // lock (flock) across the whole section so writers — in this process or
+        // another — serialize. flock is blocking, so run it on a blocking
+        // thread rather than stalling the async runtime.
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || put_locked(&root, record, expected))
             .await
-            .map_err(|e| CoreError::Backend(e.to_string()))?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| CoreError::Backend(e.to_string()))?;
-        Ok(PutResult::Committed(record.revision))
+            .map_err(|e| CoreError::Backend(format!("put task panicked: {e}")))?
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
@@ -85,6 +57,59 @@ impl Store for FsStore {
         collect_keys(&self.root, prefix, &mut out).await?;
         Ok(out)
     }
+}
+
+/// Perform the conditional `put` under a per-record advisory lock. Blocking by
+/// design (held across read→check→write→rename); call from `spawn_blocking`.
+///
+/// The lock is a sibling `<id>.json.lock` file held exclusively via `flock`,
+/// released when `lock` drops. It guards only writers — `get`/`list` stay
+/// lock-free — which is sufficient: the lost update is a write/write race, and
+/// the final `rename` is atomic so readers never observe a torn file.
+fn put_locked(root: &Path, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+    let path = layout::record_path(root, &record.key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+    }
+
+    // Acquire the exclusive lock; it lives until `lock` drops at function end.
+    let lock_path = path.with_extension("json.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    flock(&lock, FlockOperation::LockExclusive).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+    // Critical section: revision check and write are now serialized per record.
+    let current = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<Record>(&bytes)
+                .map_err(|e| CoreError::Serde(e.to_string()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(CoreError::Backend(e.to_string())),
+    };
+    let current_rev = current.as_ref().map(|r| r.revision.clone());
+    if current_rev != expected {
+        if let Some(current) = current {
+            return Ok(PutResult::Conflict(Box::new(Conflict {
+                key: record.key.clone(),
+                expected,
+                current,
+            })));
+        }
+        // expected referenced a revision but nothing exists: treat as conflict
+        return Err(CoreError::NotFound(record.key.clone()));
+    }
+
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|e| CoreError::Serde(e.to_string()))?;
+    // Atomic write: temp file + rename.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| CoreError::Backend(e.to_string()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| CoreError::Backend(e.to_string()))?;
+    Ok(PutResult::Committed(record.revision))
 }
 
 /// Walk `<root>/<ns>/<col>/<id>.json` and collect keys matching `prefix`.
