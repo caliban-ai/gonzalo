@@ -12,6 +12,7 @@ repository.workspace = true
 gonzalo-core = { workspace = true }
 async-trait  = { workspace = true }
 serde_json   = { workspace = true }
+rustix       = { workspace = true }
 tokio        = { workspace = true, features = ["fs", "io-util", "rt", "macros"] }
 
 [dev-dependencies]
