@@ -3,7 +3,8 @@
 //! tests. The factory returns a fresh, empty store per invocation.
 
 use crate::{
-    Body, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind, Revision, Store,
+    BlobStore, Body, ContentHash, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey,
+    RecordKind, Revision, Store,
 };
 use std::collections::BTreeMap;
 
@@ -71,6 +72,50 @@ async fn stale_expected_returns_conflict<S: Store>(store: &S) {
         }
         PutResult::Committed(_) => panic!("expected conflict for stale write"),
     }
+}
+
+/// Run the full blob-store suite against a store produced by `factory`
+/// (a fresh, empty [`BlobStore`] per invocation).
+pub async fn run_blob_store_conformance<B, F, Fut>(factory: F)
+where
+    B: BlobStore,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = B>,
+{
+    blob_get_absent_returns_none(&factory().await).await;
+    blob_put_then_get_roundtrips(&factory().await).await;
+    blob_put_is_content_addressed_and_idempotent(&factory().await).await;
+}
+
+async fn blob_get_absent_returns_none<B: BlobStore>(store: &B) {
+    assert_eq!(
+        store.get_blob(&ContentHash::of(b"absent")).await.unwrap(),
+        None
+    );
+}
+
+async fn blob_put_then_get_roundtrips<B: BlobStore>(store: &B) {
+    let content = b"symbols + references for one file";
+    let hash = store.put_blob(content).await.unwrap();
+    assert_eq!(hash, ContentHash::of(content));
+    assert_eq!(
+        store.get_blob(&hash).await.unwrap().as_deref(),
+        Some(&content[..])
+    );
+}
+
+async fn blob_put_is_content_addressed_and_idempotent<B: BlobStore>(store: &B) {
+    let content = b"deterministic slice body";
+    // Storing the same content twice yields the same hash and never conflicts.
+    let first = store.put_blob(content).await.unwrap();
+    let second = store.put_blob(content).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first, ContentHash::of(content));
+    // The content is still intact after the second (no-op) write.
+    assert_eq!(
+        store.get_blob(&first).await.unwrap().as_deref(),
+        Some(&content[..])
+    );
 }
 
 async fn list_filters_by_prefix<S: Store>(store: &S) {
