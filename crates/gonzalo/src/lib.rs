@@ -32,7 +32,8 @@ pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
 
 #[cfg(feature = "graph")]
 pub use gonzalo_graph::{
-    CodeGraph, GraphStore, InMemoryGraphStore, Reference, Symbol, SymbolKind, build_rust,
+    CodeGraph, GraphStore, InMemoryGraphStore, Located, Reference, Symbol, SymbolKind, assemble,
+    build_rust,
 };
 
 #[cfg(feature = "ticket")]

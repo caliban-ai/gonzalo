@@ -1324,8 +1324,12 @@ dependencies = [
 name = "gonzalo-graph"
 version = "0.1.0"
 dependencies = [
+ "gonzalo-core",
+ "gonzalo-store-fs",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tree-sitter",
  "tree-sitter-rust",
 ]

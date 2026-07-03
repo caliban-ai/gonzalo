@@ -3,9 +3,10 @@
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use tree_sitter::{Node, Parser};
 
-/// Parse `src` (the contents of `file`) and extract its symbols and
-/// name-based references.
-pub fn build_rust(file: &str, src: &str) -> CodeGraph {
+/// Parse `src` (one file's contents) into a **path-agnostic** slice: its
+/// symbols and name-based references, with no file path (ADR 0012). The path is
+/// supplied later at assembly from the manifest.
+pub fn build_rust(src: &str) -> CodeGraph {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -15,7 +16,7 @@ pub fn build_rust(file: &str, src: &str) -> CodeGraph {
     };
     let mut graph = CodeGraph::default();
     let bytes = src.as_bytes();
-    walk(tree.root_node(), bytes, file, None, &mut graph);
+    walk(tree.root_node(), bytes, None, &mut graph);
     graph
 }
 
@@ -75,7 +76,7 @@ fn call_name(func: Node<'_>, bytes: &[u8]) -> Option<String> {
     }
 }
 
-fn walk(node: Node<'_>, bytes: &[u8], file: &str, current_fn: Option<&str>, graph: &mut CodeGraph) {
+fn walk(node: Node<'_>, bytes: &[u8], current_fn: Option<&str>, graph: &mut CodeGraph) {
     let mut enclosing = current_fn.map(str::to_string);
 
     if let Some(kind) = item_kind(node.kind())
@@ -84,7 +85,6 @@ fn walk(node: Node<'_>, bytes: &[u8], file: &str, current_fn: Option<&str>, grap
         graph.symbols.push(Symbol {
             name: name.clone(),
             kind,
-            file: file.to_string(),
             start_line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
         });
@@ -100,14 +100,13 @@ fn walk(node: Node<'_>, bytes: &[u8], file: &str, current_fn: Option<&str>, grap
         graph.references.push(Reference {
             name,
             from: enclosing.clone(),
-            file: file.to_string(),
             line: node.start_position().row + 1,
         });
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, bytes, file, enclosing.as_deref(), graph);
+        walk(child, bytes, enclosing.as_deref(), graph);
     }
 }
 
@@ -129,7 +128,7 @@ fn main() {
 
     #[test]
     fn extracts_definitions() {
-        let g = build_rust("lib.rs", SRC);
+        let g = build_rust(SRC);
         let names: Vec<(&str, SymbolKind)> = g
             .symbols
             .iter()
@@ -142,7 +141,7 @@ fn main() {
 
     #[test]
     fn records_call_with_enclosing_fn() {
-        let g = build_rust("lib.rs", SRC);
+        let g = build_rust(SRC);
         let call = g
             .references
             .iter()
@@ -153,7 +152,7 @@ fn main() {
 
     #[test]
     fn symbol_lines_are_one_based() {
-        let g = build_rust("lib.rs", SRC);
+        let g = build_rust(SRC);
         let main = g.symbols.iter().find(|s| s.name == "main").unwrap();
         assert!(main.start_line >= 1 && main.end_line >= main.start_line);
     }
