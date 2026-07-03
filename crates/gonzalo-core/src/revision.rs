@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A content hash (blake3, hex-encoded) of a record body.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ContentHash(pub String);
 
 impl ContentHash {

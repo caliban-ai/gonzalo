@@ -107,6 +107,51 @@ impl BlobStore for FsStore {
             Err(e) => Err(CoreError::Backend(e.to_string())),
         }
     }
+
+    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        let dir = layout::blobs_dir(&self.root);
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            // No blobs dir yet == no blobs.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(CoreError::Backend(e.to_string())),
+        };
+        let mut out = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // A committed blob's filename is exactly its blake3 hex hash. In-flight
+            // temp files (`<hash>.tmp.<pid>.<nonce>`) and any stray files carry a
+            // `.` and are skipped, so a concurrent `put_blob` is never mistaken for
+            // a collectable blob.
+            if is_blob_hash(&name) {
+                out.push(ContentHash(name));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+        let path = layout::blob_path(&self.root, hash);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            // Idempotent: an already-absent blob is a successful no-op.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Backend(e.to_string())),
+        }
+    }
+}
+
+/// Whether `name` is a committed blob's filename: blake3 hex, `[0-9a-f]{64}`.
+/// Excludes in-flight temp files and any stray non-blob entries.
+fn is_blob_hash(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Perform the conditional `put` under a per-record advisory lock. Blocking by
