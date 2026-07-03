@@ -13,7 +13,7 @@ pub mod record;
 pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
 pub mod manifest;
-pub use manifest::Manifest;
+pub use manifest::{Manifest, Reconciliation, desired_set};
 
 pub mod error;
 pub use error::{CoreError, Result};
