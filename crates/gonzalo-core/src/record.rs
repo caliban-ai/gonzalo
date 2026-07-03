@@ -15,6 +15,9 @@ pub enum RecordKind {
     Ticket,
     /// An append-only comment/event on a ticket.
     TicketEvent,
+    /// A per-view code-graph manifest: `(repo, view_id) -> { path -> content_hash }`.
+    /// Regenerable from source; reconciled last-writer-wins. See ADR 0012.
+    GraphManifest,
 }
 
 /// How concurrent edits to a record of a given kind are reconciled.
@@ -41,6 +44,7 @@ impl RecordKind {
             }
             RecordKind::MemoryTier | RecordKind::Ticket => MergeClass::Structured,
             RecordKind::Checkpoint => MergeClass::Opaque,
+            RecordKind::GraphManifest => MergeClass::Derived,
         }
     }
 }
@@ -124,6 +128,7 @@ mod tests {
             RecordKind::TicketEvent.merge_class(),
             MergeClass::AppendOnly
         );
+        assert_eq!(RecordKind::GraphManifest.merge_class(), MergeClass::Derived);
     }
 
     #[test]
