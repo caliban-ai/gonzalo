@@ -53,4 +53,12 @@ pub trait BlobStore: Send + Sync {
 
     /// Fetch blob content by hash, or `None` if absent.
     async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>>;
+
+    /// List the hashes of every stored blob. Order is unspecified. Used by GC
+    /// to enumerate candidates for sweeping (ADR 0012).
+    async fn list_blobs(&self) -> Result<Vec<ContentHash>>;
+
+    /// Delete the blob addressed by `hash`. Deleting an absent blob is an
+    /// idempotent no-op — GC may race another sweeper or a re-put.
+    async fn delete_blob(&self, hash: &ContentHash) -> Result<()>;
 }

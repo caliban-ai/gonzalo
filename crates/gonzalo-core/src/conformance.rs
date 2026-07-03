@@ -85,6 +85,8 @@ where
     blob_get_absent_returns_none(&factory().await).await;
     blob_put_then_get_roundtrips(&factory().await).await;
     blob_put_is_content_addressed_and_idempotent(&factory().await).await;
+    blob_list_reports_stored_hashes(&factory().await).await;
+    blob_delete_removes_and_is_idempotent(&factory().await).await;
 }
 
 async fn blob_get_absent_returns_none<B: BlobStore>(store: &B) {
@@ -116,6 +118,26 @@ async fn blob_put_is_content_addressed_and_idempotent<B: BlobStore>(store: &B) {
         store.get_blob(&first).await.unwrap().as_deref(),
         Some(&content[..])
     );
+}
+
+async fn blob_list_reports_stored_hashes<B: BlobStore>(store: &B) {
+    assert!(store.list_blobs().await.unwrap().is_empty());
+    let h1 = store.put_blob(b"slice one").await.unwrap();
+    let h2 = store.put_blob(b"slice two").await.unwrap();
+    let mut listed = store.list_blobs().await.unwrap();
+    listed.sort();
+    let mut want = vec![h1, h2];
+    want.sort();
+    assert_eq!(listed, want);
+}
+
+async fn blob_delete_removes_and_is_idempotent<B: BlobStore>(store: &B) {
+    let hash = store.put_blob(b"to be collected").await.unwrap();
+    assert!(store.get_blob(&hash).await.unwrap().is_some());
+    store.delete_blob(&hash).await.unwrap();
+    assert_eq!(store.get_blob(&hash).await.unwrap(), None);
+    // Deleting an absent blob succeeds (idempotent).
+    store.delete_blob(&hash).await.unwrap();
 }
 
 async fn list_filters_by_prefix<S: Store>(store: &S) {

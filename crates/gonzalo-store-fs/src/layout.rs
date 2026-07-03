@@ -11,10 +11,15 @@ pub fn record_path(root: &Path, key: &RecordKey) -> PathBuf {
     root.join(ns).join(col).join(file)
 }
 
+/// The directory holding all content-addressed blobs: `<root>/blobs`.
+pub fn blobs_dir(root: &Path) -> PathBuf {
+    root.join("blobs")
+}
+
 /// The file path for a content-addressed blob under `root`: `<root>/blobs/<hash>`.
 /// The hash is blake3 hex (`[0-9a-f]{64}`), so it is a safe single path segment.
 pub fn blob_path(root: &Path, hash: &ContentHash) -> PathBuf {
-    root.join("blobs").join(&hash.0)
+    blobs_dir(root).join(&hash.0)
 }
 
 #[cfg(test)]

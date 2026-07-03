@@ -15,6 +15,9 @@ pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 pub mod manifest;
 pub use manifest::{Manifest, Reconciliation, desired_set};
 
+pub mod gc;
+pub use gc::{GcReport, gc_blobs, live_slice_hashes, unreferenced_slices};
+
 pub mod error;
 pub use error::{CoreError, Result};
 
