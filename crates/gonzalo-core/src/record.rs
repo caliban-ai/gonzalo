@@ -1,6 +1,6 @@
 //! The universal persisted unit and its classification.
 
-use crate::{Identity, RecordKey, Revision};
+use crate::{ContentHash, Identity, RecordKey, Revision};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -40,18 +40,44 @@ impl RecordKind {
     }
 }
 
-/// A record body. M1 stores bytes inline; the `Blob` content-addressed
-/// variant is reserved for M2 (large session/checkpoint externalization).
+/// A record body. `Inline` stores bytes directly in the record; `Blob`
+/// references content held out-of-line in a content-addressed [`BlobStore`],
+/// so byte-identical bodies (e.g. code-graph slices shared across worktrees)
+/// are stored once. See ADR 0012.
+///
+/// [`BlobStore`]: crate::store::BlobStore
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Body {
     Inline(Vec<u8>),
+    /// Content stored out-of-line under `hash` in a [`BlobStore`]; `len` is the
+    /// referenced content's byte length. The record itself carries only the
+    /// reference — the bytes are fetched via `BlobStore::get_blob`.
+    ///
+    /// [`BlobStore`]: crate::store::BlobStore
+    Blob {
+        hash: ContentHash,
+        len: u64,
+    },
 }
 
 impl Body {
-    /// The bytes used for content hashing and merging.
+    /// Build a blob body referencing `content` by its content hash. The content
+    /// itself is written separately via `BlobStore::put_blob`.
+    pub fn blob(content: &[u8]) -> Self {
+        Body::Blob {
+            hash: ContentHash::of(content),
+            len: content.len() as u64,
+        }
+    }
+
+    /// The bytes used for content hashing and merging. For a `Blob` these are
+    /// the reference's hash bytes, not the referenced content — identical
+    /// content yields an identical reference, so the record's revision is
+    /// stable under content-addressed dedup.
     pub fn bytes(&self) -> &[u8] {
         match self {
             Body::Inline(b) => b,
+            Body::Blob { hash, .. } => hash.0.as_bytes(),
         }
     }
 }
@@ -98,5 +124,25 @@ mod tests {
     #[test]
     fn body_exposes_bytes() {
         assert_eq!(Body::Inline(b"hi".to_vec()).bytes(), b"hi");
+    }
+
+    #[test]
+    fn blob_body_references_content_by_hash() {
+        let body = Body::blob(b"fn main() {}");
+        match &body {
+            Body::Blob { hash, len } => {
+                assert_eq!(*hash, crate::ContentHash::of(b"fn main() {}"));
+                assert_eq!(*len, 12);
+            }
+            _ => panic!("expected Body::Blob"),
+        }
+    }
+
+    #[test]
+    fn blob_body_bytes_are_stable_per_content() {
+        // Identical content -> identical body bytes -> identical revision (the
+        // record-level face of content-addressed dedup).
+        assert_eq!(Body::blob(b"same").bytes(), Body::blob(b"same").bytes());
+        assert_ne!(Body::blob(b"same").bytes(), Body::blob(b"diff").bytes());
     }
 }

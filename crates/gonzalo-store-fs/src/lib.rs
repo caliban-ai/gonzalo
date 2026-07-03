@@ -4,10 +4,12 @@ mod layout;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store, store::Conflict,
+    BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
+    Store, store::Conflict,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A `Store` backed by JSON files under a root directory.
 pub struct FsStore {
@@ -56,6 +58,54 @@ impl Store for FsStore {
         let mut out = Vec::new();
         collect_keys(&self.root, prefix, &mut out).await?;
         Ok(out)
+    }
+}
+
+/// Process-unique nonce for blob temp files, so concurrent writers never share
+/// a temp path (see `put_blob`).
+static BLOB_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[async_trait]
+impl BlobStore for FsStore {
+    async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+        let hash = ContentHash::of(content);
+        let path = layout::blob_path(&self.root, &hash);
+
+        // Write-if-absent: identical content hashes to the same path, so an
+        // existing blob is already exactly these bytes — nothing to do.
+        if tokio::fs::try_exists(&path)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?
+        {
+            return Ok(hash);
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+        }
+
+        // Atomic publish: write a process-unique temp, then rename into place.
+        // Content-addressing makes a same-content race benign (byte-identical),
+        // and the unique temp keeps two racing writers from clobbering one temp.
+        let nonce = BLOB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
+        tokio::fs::write(&tmp, content)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(hash)
+    }
+
+    async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+        let path = layout::blob_path(&self.root, hash);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CoreError::Backend(e.to_string())),
+        }
     }
 }
 

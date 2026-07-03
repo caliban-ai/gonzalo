@@ -1,6 +1,6 @@
 //! The generic storage substrate trait and write-outcome types.
 
-use crate::{Record, RecordKey, Result, Revision};
+use crate::{ContentHash, Record, RecordKey, Result, Revision};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -36,4 +36,21 @@ pub trait Store: Send + Sync {
 
     /// List keys matching `prefix`.
     async fn list(&self, prefix: &crate::KeyPrefix) -> Result<Vec<RecordKey>>;
+}
+
+/// A content-addressed blob store for out-of-line record bodies
+/// ([`Body::Blob`]). Content is keyed by its [`ContentHash`], so byte-identical
+/// bodies — e.g. code-graph slices shared across worktrees (ADR 0012) — are
+/// stored once. Writes are **write-if-absent**: storing content that already
+/// exists is an idempotent no-op, never a conflict (same hash ⇒ same bytes).
+///
+/// [`Body::Blob`]: crate::Body::Blob
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    /// Store `content` addressed by its hash, write-if-absent, and return the
+    /// hash. Idempotent: storing identical content again is a no-op.
+    async fn put_blob(&self, content: &[u8]) -> Result<ContentHash>;
+
+    /// Fetch blob content by hash, or `None` if absent.
+    async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>>;
 }
