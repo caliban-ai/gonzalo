@@ -63,6 +63,70 @@ impl Manifest {
             serde_json::from_slice(body.bytes()).map_err(|e| CoreError::Serde(e.to_string()))?;
         Ok(Self { entries })
     }
+
+    /// Reconcile this manifest against the `desired` `path -> content_hash` set
+    /// of a working tree, returning the change sets and the reconciled manifest.
+    ///
+    /// The A/M/D classification is a pure **set difference**, so it is robust to
+    /// missed events — a full reconcile always converges the manifest onto the
+    /// tree regardless of how the desired set was sourced (a `git diff` stream is
+    /// only an optimization for building it). Unchanged paths (present in both
+    /// with an equal hash) appear in none of the change sets. Each set is sorted
+    /// for deterministic output, and the reconciled manifest equals `desired`.
+    pub fn reconcile(&self, desired: &BTreeMap<String, ContentHash>) -> Reconciliation {
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        for (path, hash) in desired {
+            match self.entries.get(path) {
+                None => added.push(path.clone()),
+                Some(current) if current != hash => modified.push(path.clone()),
+                Some(_) => {} // unchanged
+            }
+        }
+        let deleted = self
+            .entries
+            .keys()
+            .filter(|path| !desired.contains_key(*path))
+            .cloned()
+            .collect();
+        // BTreeMap iteration is already key-sorted, so `added`/`modified`/
+        // `deleted` come out sorted without an explicit sort.
+        Reconciliation {
+            added,
+            modified,
+            deleted,
+            manifest: Manifest {
+                entries: desired.clone(),
+            },
+        }
+    }
+}
+
+/// Build the desired `path -> content_hash` set for a working tree by hashing
+/// each file's content. The output feeds [`Manifest::reconcile`].
+pub fn desired_set<P, C>(entries: impl IntoIterator<Item = (P, C)>) -> BTreeMap<String, ContentHash>
+where
+    P: Into<String>,
+    C: AsRef<[u8]>,
+{
+    entries
+        .into_iter()
+        .map(|(path, content)| (path.into(), ContentHash::of(content.as_ref())))
+        .collect()
+}
+
+/// The result of reconciling a [`Manifest`] against a working tree: the change
+/// sets (each sorted) plus the reconciled manifest, which equals the tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// Paths present in the tree but not the old manifest.
+    pub added: Vec<String>,
+    /// Paths in both whose content hash changed.
+    pub modified: Vec<String>,
+    /// Paths in the old manifest but no longer in the tree.
+    pub deleted: Vec<String>,
+    /// The manifest after reconciliation (equal to the desired tree set).
+    pub manifest: Manifest,
 }
 
 #[cfg(test)]
@@ -138,5 +202,75 @@ mod tests {
             RecordKind::GraphManifest.merge_class(),
             crate::MergeClass::Derived
         );
+    }
+
+    #[test]
+    fn desired_set_hashes_each_tree_entry() {
+        let desired = desired_set([("a.rs", "one"), ("b.rs", "two")]);
+        assert_eq!(desired.get("a.rs"), Some(&hash("one")));
+        assert_eq!(desired.get("b.rs"), Some(&hash("two")));
+        assert_eq!(desired.len(), 2);
+    }
+
+    #[test]
+    fn reconcile_classifies_added_modified_deleted() {
+        let mut current = Manifest::new();
+        current.insert("keep.rs", hash("same")); // unchanged
+        current.insert("edit.rs", hash("old")); // modified
+        current.insert("gone.rs", hash("bye")); // deleted
+
+        let desired = desired_set([("keep.rs", "same"), ("edit.rs", "new"), ("add.rs", "fresh")]);
+
+        let r = current.reconcile(&desired);
+        assert_eq!(r.added, vec!["add.rs".to_string()]);
+        assert_eq!(r.modified, vec!["edit.rs".to_string()]);
+        assert_eq!(r.deleted, vec!["gone.rs".to_string()]);
+    }
+
+    #[test]
+    fn reconciled_manifest_equals_the_desired_tree() {
+        let mut current = Manifest::new();
+        current.insert("gone.rs", hash("bye"));
+        let desired = desired_set([("add.rs", "fresh")]);
+
+        let r = current.reconcile(&desired);
+        assert_eq!(r.manifest.entries, desired);
+    }
+
+    #[test]
+    fn reconcile_reports_nothing_when_tree_matches_manifest() {
+        let mut current = Manifest::new();
+        current.insert("a.rs", hash("x"));
+        current.insert("b.rs", hash("y"));
+        let desired = desired_set([("a.rs", "x"), ("b.rs", "y")]);
+
+        let r = current.reconcile(&desired);
+        assert!(r.added.is_empty());
+        assert!(r.modified.is_empty());
+        assert!(r.deleted.is_empty());
+        assert_eq!(r.manifest.entries, current.entries);
+    }
+
+    #[test]
+    fn reconcile_from_empty_marks_all_added() {
+        let desired = desired_set([("b.rs", "2"), ("a.rs", "1")]);
+        let r = Manifest::new().reconcile(&desired);
+        // Sorted, deterministic.
+        assert_eq!(r.added, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert!(r.modified.is_empty());
+        assert!(r.deleted.is_empty());
+    }
+
+    #[test]
+    fn reconcile_to_empty_marks_all_deleted() {
+        let mut current = Manifest::new();
+        current.insert("b.rs", hash("2"));
+        current.insert("a.rs", hash("1"));
+
+        let r = current.reconcile(&BTreeMap::new());
+        assert_eq!(r.deleted, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert!(r.added.is_empty());
+        assert!(r.modified.is_empty());
+        assert!(r.manifest.entries.is_empty());
     }
 }
