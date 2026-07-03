@@ -25,11 +25,16 @@ pub enum MergeOutcome {
 ///   [`structured_merge`]). Disjoint field edits auto-merge; the same field
 ///   changed differently on both sides is a genuine conflict.
 /// - `Opaque`: always `NeedsResolution`.
+/// - `Derived`: never `NeedsResolution`. The body is regenerable and views are
+///   single-writer (ADR 0012), so a divergence is a rare race resolved by
+///   last-writer-wins — deterministically keeping `ours`; the discarded side
+///   can be re-derived from source.
 pub fn merge(class: MergeClass, base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
     match class {
         MergeClass::AppendOnly => append_only_merge(base, ours, theirs),
         MergeClass::Structured => structured_merge(base, ours, theirs),
         MergeClass::Opaque => MergeOutcome::NeedsResolution,
+        MergeClass::Derived => MergeOutcome::Merged(ours.clone()),
     }
 }
 
@@ -238,6 +243,21 @@ mod tests {
             merge(MergeClass::Opaque, &b, &b, &b),
             MergeOutcome::NeedsResolution
         );
+    }
+
+    #[test]
+    fn derived_takes_ours_deterministically() {
+        // Derived bodies are regenerable (e.g. per-view code-graph manifests),
+        // so reconciliation never surfaces a conflict — it deterministically
+        // keeps `ours` (last-writer-wins). Divergence is rare by construction
+        // (single-writer-per-view) and the discarded side can be re-derived.
+        let base = body("base");
+        let ours = body("ours-version");
+        let theirs = body("theirs-version");
+        let MergeOutcome::Merged(m) = merge(MergeClass::Derived, &base, &ours, &theirs) else {
+            panic!("Derived must merge, never NeedsResolution");
+        };
+        assert_eq!(m, ours);
     }
 
     /// Run a structured merge over JSON string inputs and return the parsed

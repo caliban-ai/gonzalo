@@ -26,6 +26,11 @@ pub enum MergeClass {
     Structured,
     /// No safe automatic merge; surface to the caller.
     Opaque,
+    /// Regenerable / don't-merge (e.g. per-view code-graph manifests, ADR 0012).
+    /// The body can be re-derived from source, and views are single-writer, so a
+    /// divergence is rare and reconciled by last-writer-wins rather than a
+    /// content merge — never a surfaced conflict.
+    Derived,
 }
 
 impl RecordKind {
