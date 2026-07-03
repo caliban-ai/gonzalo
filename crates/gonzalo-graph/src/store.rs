@@ -5,7 +5,7 @@
 //! results while the stored [`Symbol`]/[`Reference`] stay path-free.
 
 use crate::model::{CodeGraph, Located, Reference, Symbol};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Structural queries over an assembled view (a set of path-keyed slices).
 pub trait GraphStore: Send + Sync {
@@ -22,6 +22,33 @@ pub trait GraphStore: Send + Sync {
     fn references_to(&self, name: &str) -> Vec<Located<Reference>>;
     /// Distinct enclosing-function names that reference `name`.
     fn callers_of(&self, name: &str) -> Vec<String>;
+    /// Distinct names referenced from within `name` (the inverse of
+    /// [`callers_of`](Self::callers_of)), sorted.
+    fn callees(&self, name: &str) -> Vec<String>;
+
+    /// The transitive closure of callers: every symbol that could be affected if
+    /// `name` changes, reached by walking [`callers_of`](Self::callers_of)
+    /// breadth-first. Runs server-side (never ships the whole graph); the seed
+    /// `name` is excluded, and cycles terminate via a visited set. Returned
+    /// sorted.
+    fn impact(&self, name: &str) -> Vec<String> {
+        let mut visited = BTreeSet::from([name.to_string()]);
+        let mut queue: VecDeque<String> = VecDeque::new();
+        for caller in self.callers_of(name) {
+            if visited.insert(caller.clone()) {
+                queue.push_back(caller);
+            }
+        }
+        while let Some(current) = queue.pop_front() {
+            for caller in self.callers_of(&current) {
+                if visited.insert(caller.clone()) {
+                    queue.push_back(caller);
+                }
+            }
+        }
+        visited.remove(name);
+        visited.into_iter().collect()
+    }
 }
 
 /// An in-memory [`GraphStore`], one slice per path.
@@ -95,6 +122,19 @@ impl GraphStore for InMemoryGraphStore {
         callers.dedup();
         callers
     }
+
+    fn callees(&self, name: &str) -> Vec<String> {
+        let mut callees: Vec<String> = self
+            .slices
+            .values()
+            .flat_map(|g| g.references.iter())
+            .filter(|r| r.from.as_deref() == Some(name))
+            .map(|r| r.name.clone())
+            .collect();
+        callees.sort();
+        callees.dedup();
+        callees
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +203,55 @@ fn b() { helper(); }
         let refs = s.references_to("helper");
         assert_eq!(refs.len(), 2);
         assert!(refs.iter().all(|r| r.path == "lib.rs"));
+    }
+
+    const CHAIN: &str = r#"
+fn leaf() {}
+fn mid() { leaf(); }
+fn top() { mid(); }
+fn other() { leaf(); }
+"#;
+
+    fn chain() -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("chain.rs", build_rust(CHAIN));
+        s
+    }
+
+    #[test]
+    fn callees_lists_names_called_from_a_function() {
+        let s = chain();
+        assert_eq!(s.callees("mid"), vec!["leaf".to_string()]);
+        assert_eq!(s.callees("top"), vec!["mid".to_string()]);
+        assert!(s.callees("leaf").is_empty());
+    }
+
+    #[test]
+    fn callees_dedups_repeated_calls() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("d.rs", build_rust("fn f() { g(); g(); h(); }"));
+        assert_eq!(s.callees("f"), vec!["g".to_string(), "h".to_string()]);
+    }
+
+    #[test]
+    fn impact_is_the_transitive_caller_closure() {
+        let s = chain();
+        // Everything transitively affected if `leaf` changes: its callers mid &
+        // other, and mid's caller top.
+        assert_eq!(
+            s.impact("leaf"),
+            vec!["mid".to_string(), "other".to_string(), "top".to_string()]
+        );
+        assert_eq!(s.impact("mid"), vec!["top".to_string()]);
+        assert!(s.impact("top").is_empty());
+    }
+
+    #[test]
+    fn impact_excludes_the_seed_and_survives_cycles() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("cyc.rs", build_rust("fn a() { b(); } fn b() { a(); }"));
+        // a<->b mutually recurse; impact must terminate and not report the seed.
+        assert_eq!(s.impact("a"), vec!["b".to_string()]);
+        assert_eq!(s.impact("b"), vec!["a".to_string()]);
     }
 }
