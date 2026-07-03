@@ -102,7 +102,9 @@ pub fn knowledge_text(record: &Record) -> Option<String> {
             .ok()
             .map(|t| format!("{}\n{}\n{}", t.title, t.body.markdown, t.labels.join(" "))),
         RecordKind::TicketEvent => TicketEvent::from_body(&record.body).ok().map(|e| e.body),
-        RecordKind::Checkpoint => None,
+        // Not knowledge-bearing: a checkpoint is opaque state; a graph manifest
+        // is a path -> content-hash map, not natural-language text (ADR 0011/0012).
+        RecordKind::Checkpoint | RecordKind::GraphManifest => None,
     }
 }
 

@@ -12,6 +12,9 @@ pub use revision::{ContentHash, Revision};
 pub mod record;
 pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
+pub mod manifest;
+pub use manifest::Manifest;
+
 pub mod error;
 pub use error::{CoreError, Result};
 
