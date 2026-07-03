@@ -3,10 +3,12 @@
 //! `callers_of`). Rust is the first supported language (tree-sitter-rust);
 //! the model and store are language-agnostic so more grammars can be added.
 
+pub mod assembly;
 pub mod builder;
 pub mod model;
 pub mod store;
 
+pub use assembly::assemble;
 pub use builder::build_rust;
-pub use model::{CodeGraph, Reference, Symbol, SymbolKind};
+pub use model::{CodeGraph, Located, Reference, Symbol, SymbolKind};
 pub use store::{GraphStore, InMemoryGraphStore};
