@@ -1442,6 +1442,7 @@ dependencies = [
  "async-trait",
  "gonzalo-core",
  "gonzalo-domain",
+ "gonzalo-graph",
  "gonzalo-store-fs",
  "gonzalo-vector",
  "tempfile",
