@@ -6,7 +6,8 @@ use gonzalo_core::{
     BlobStore, Body, ContentHash, Identity, KeyPrefix, Manifest, Meta, PutResult, Record,
     RecordKey, RecordKind, Revision, Store, segment,
 };
-use gonzalo_graph::{Language, build};
+use gonzalo_graph::{CodeGraph, Language, build};
+use gonzalo_parse::ParserPool;
 use gonzalo_store_fs::FsStore;
 use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::{Config, Connection, parse_category};
@@ -149,7 +150,7 @@ fn collect_files_inner(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<
 
 /// Summary returned by [`index`].
 pub struct IndexSummary {
-    /// Rust files parsed into slices.
+    /// Source files parsed into slices.
     pub files: usize,
     /// Paths newly added to the view.
     pub added: usize,
@@ -157,6 +158,50 @@ pub struct IndexSummary {
     pub modified: usize,
     /// Paths removed from the view since the last index.
     pub deleted: usize,
+    /// Files skipped because an isolated parse worker crashed or hung on them
+    /// (only possible when parsing through the pool).
+    pub skipped: usize,
+}
+
+/// Locate the `gonzalo-parse-worker` binary for crash-isolated parsing:
+/// `GONZALO_PARSE_WORKER` env override, else a sibling of the current
+/// executable (installed/`cargo build` layout). Returns `None` when no worker is
+/// available, in which case indexing parses in-process.
+fn resolve_parse_worker() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("GONZALO_PARSE_WORKER") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let sibling = std::env::current_exe()
+        .ok()?
+        .with_file_name(if cfg!(windows) {
+            "gonzalo-parse-worker.exe"
+        } else {
+            "gonzalo-parse-worker"
+        });
+    sibling.exists().then_some(sibling)
+}
+
+/// Parse one file's `content` as `language`, through the crash-isolated `pool`
+/// if one is available (a crash/hang yields `None` — skip the file), or
+/// in-process otherwise.
+async fn parse_file(
+    pool: Option<&ParserPool>,
+    language: Language,
+    content: &str,
+) -> Option<CodeGraph> {
+    match pool {
+        Some(pool) => match pool.parse(language, content).await {
+            Ok(graph) => Some(graph),
+            Err(e) => {
+                eprintln!("gonzalo index: skipping a file — parse worker error: {e}");
+                None
+            }
+        },
+        None => Some(build(language, content)),
+    }
 }
 
 /// Index the `.rs` files under `src` into the `(repo, view)` code-graph view:
@@ -169,10 +214,22 @@ pub struct IndexSummary {
 pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<IndexSummary> {
     let store = FsStore::new(root);
 
+    // Parse through a crash-isolated worker pool when a worker binary is
+    // available (so a grammar crash on one file skips that file instead of
+    // aborting the index); otherwise parse in-process.
+    let pool = resolve_parse_worker().map(|bin| {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        ParserPool::new(bin, workers, std::time::Duration::from_secs(30))
+    });
+
     // Build the desired `path -> slice-hash` set by parsing each supported
     // source file (by extension) and storing its slice write-if-absent
     // (identical content dedups).
     let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
+    let mut skipped = 0usize;
     for (path, language) in source_files(src)? {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -181,7 +238,10 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let slice = build(language, &content);
+        let Some(slice) = parse_file(pool.as_ref(), language, &content).await else {
+            skipped += 1;
+            continue;
+        };
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
         desired.insert(rel, hash);
     }
@@ -233,6 +293,7 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
         added: recon.added.len(),
         modified: recon.modified.len(),
         deleted: recon.deleted.len(),
+        skipped,
     })
 }
 

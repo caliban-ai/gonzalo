@@ -219,6 +219,7 @@ async fn main() -> Result<()> {
             println!("added:    {}", summary.added);
             println!("modified: {}", summary.modified);
             println!("deleted:  {}", summary.deleted);
+            println!("skipped:  {}", summary.skipped);
         }
 
         Commands::Sync { a, b } => {

@@ -4,10 +4,11 @@
 //! node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
 /// A source language the graph builder understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Language {
     Rust,
     Python,
