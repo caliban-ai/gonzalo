@@ -145,6 +145,19 @@ impl Service {
     pub async fn graph_impact(&self, repo: &str, view_id: &str, name: &str) -> Result<Vec<String>> {
         Ok(self.view(repo, view_id).await?.impact(name))
     }
+
+    /// Structural diff of two views of `repo` (`view_a` → `view_b`): symbols and
+    /// references added or removed.
+    pub async fn graph_diff(
+        &self,
+        repo: &str,
+        view_a: &str,
+        view_b: &str,
+    ) -> Result<gonzalo_graph::GraphDiff> {
+        let a = self.view(repo, view_a).await?;
+        let b = self.view(repo, view_b).await?;
+        Ok(gonzalo_graph::diff(a.as_ref(), b.as_ref()))
+    }
 }
 
 /// Error from a ticket sync, split so transports can return the right status:
@@ -288,6 +301,19 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn graph_diff_reports_changes_between_two_views() {
+        let fs = fresh_fs();
+        seed_view(&fs, "r", "v1", &[("lib.rs", "fn keep() {}\nfn gone() {}")]).await;
+        seed_view(&fs, "r", "v2", &[("lib.rs", "fn keep() {}\nfn fresh() {}")]).await;
+        let svc = Service::new(fs.clone(), fs);
+
+        let d = svc.graph_diff("r", "v1", "v2").await.unwrap();
+        assert!(d.added_symbols.iter().any(|l| l.item.name == "fresh"));
+        assert!(d.removed_symbols.iter().any(|l| l.item.name == "gone"));
+        assert!(!d.added_symbols.iter().any(|l| l.item.name == "keep"));
     }
 
     #[tokio::test]

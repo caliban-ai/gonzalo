@@ -83,6 +83,12 @@ impl GonzaloMcp {
                 "List references to `name` in a view (with their paths), for navigating outward.",
                 view_query_schema(),
             ),
+            Tool::new(
+                "diff",
+                "Structural diff between two views of a repo: symbols and references added/removed \
+                 going from `view_a` to `view_b`.",
+                diff_schema(),
+            ),
         ]
     }
 
@@ -104,6 +110,15 @@ impl GonzaloMcp {
             return Ok(CallToolResult::success(vec![Content::text(
                 self.status_json().to_string(),
             )]));
+        }
+
+        // `diff` selects two views instead of one view + a name.
+        if name == "diff" {
+            let (repo, view_a, view_b) = match diff_args(&arguments) {
+                Ok(t) => t,
+                Err(msg) => return Ok(tool_error(msg)),
+            };
+            return self.result(self.service.graph_diff(&repo, &view_a, &view_b).await);
         }
 
         // An unknown tool is `method_not_found` regardless of arguments — decided
@@ -191,23 +206,53 @@ fn view_query_schema() -> Arc<Map<String, Value>> {
     Arc::new(schema.as_object().expect("object schema").clone())
 }
 
+/// Input schema for `diff`: `repo`, `view_a`, and `view_b` — all required.
+fn diff_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": { "type": "string", "description": "repository identifier" },
+            "view_a": { "type": "string", "description": "the base view id" },
+            "view_b": { "type": "string", "description": "the view id to compare against the base" }
+        },
+        "required": ["repo", "view_a", "view_b"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
 /// A minimal object schema for the argument-free `status` tool.
 fn status_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({ "type": "object", "additionalProperties": false });
     Arc::new(schema.as_object().expect("object schema").clone())
 }
 
+/// Extract a required string argument by key.
+fn str_arg(arguments: &Option<Map<String, Value>>, key: &str) -> Result<String, String> {
+    arguments
+        .as_ref()
+        .and_then(|m| m.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("missing required string argument '{key}'"))
+}
+
 /// Extract the required `(repo, view_id, name)` view selector from tool args.
 fn view_args(arguments: &Option<Map<String, Value>>) -> Result<(String, String, String), String> {
-    let get = |key: &str| {
-        arguments
-            .as_ref()
-            .and_then(|m| m.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("missing required string argument '{key}'"))
-    };
-    Ok((get("repo")?, get("view_id")?, get("name")?))
+    Ok((
+        str_arg(arguments, "repo")?,
+        str_arg(arguments, "view_id")?,
+        str_arg(arguments, "name")?,
+    ))
+}
+
+/// Extract the required `(repo, view_a, view_b)` selector for `diff`.
+fn diff_args(arguments: &Option<Map<String, Value>>) -> Result<(String, String, String), String> {
+    Ok((
+        str_arg(arguments, "repo")?,
+        str_arg(arguments, "view_a")?,
+        str_arg(arguments, "view_b")?,
+    ))
 }
 
 /// A tool error carrying `msg` as text (`isError = true`).
@@ -326,9 +371,70 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "status", "search", "node", "callers", "callees", "impact", "explore",
+                "status", "search", "node", "callers", "callees", "impact", "explore", "diff",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn diff_tool_reports_changes_between_two_views() {
+        // Seed two views of `r` sharing the store, differing by one symbol.
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        for (view, src) in [
+            ("v1", "fn keep() {}\nfn gone() {}"),
+            ("v2", "fn keep() {}\nfn fresh() {}"),
+        ] {
+            let hash = fs
+                .put_blob(&build_rust(src).to_slice_bytes())
+                .await
+                .unwrap();
+            let mut manifest = Manifest::new();
+            manifest.insert("lib.rs", hash);
+            let body = manifest.to_body();
+            let record = Record {
+                revision: Revision::initial(body.bytes()),
+                parent: None,
+                body,
+                kind: RecordKind::GraphManifest,
+                meta: Meta {
+                    author: Identity::new("t"),
+                    origin_system: "t".into(),
+                    created: 0,
+                    updated: 0,
+                    labels: BTreeMap::new(),
+                },
+                links: Vec::new(),
+                key: Manifest::key("r", view),
+            };
+            assert!(matches!(
+                fs.put(record, None).await.unwrap(),
+                PutResult::Committed(_)
+            ));
+        }
+        let mcp = GonzaloMcp::new(Service::new(fs.clone(), fs), "test-root");
+
+        let diff_args = Some(
+            serde_json::json!({ "repo": "r", "view_a": "v1", "view_b": "v2" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let result = mcp.dispatch("diff", diff_args).await.unwrap();
+        let diff: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        let added: Vec<&str> = diff["added_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["item"]["name"].as_str().unwrap())
+            .collect();
+        assert!(added.contains(&"fresh"));
+        let removed: Vec<&str> = diff["removed_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["item"]["name"].as_str().unwrap())
+            .collect();
+        assert!(removed.contains(&"gone"));
     }
 
     #[test]

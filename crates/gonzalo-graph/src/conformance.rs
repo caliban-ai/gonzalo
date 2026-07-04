@@ -4,6 +4,7 @@
 //! from their tests with a factory that returns a fresh, empty store.
 
 use crate::{GraphStore, build_rust};
+use std::collections::BTreeSet;
 
 /// Run the full suite against stores produced by `make` (a fresh, empty
 /// [`GraphStore`] per call).
@@ -13,6 +14,7 @@ pub fn run_graph_store_conformance<S: GraphStore>(make: impl Fn() -> S) {
     callers_callees_and_impact(&mut seeded(&make));
     references_to_reports_paths(&mut seeded(&make));
     reinsert_replaces_a_path(&mut seeded(&make));
+    enumerates_all_symbols_and_references(&mut seeded(&make));
     empty_store_answers_are_empty(&mut make());
 }
 
@@ -72,6 +74,23 @@ fn reinsert_replaces_a_path<S: GraphStore>(s: &mut S) {
     assert_eq!(s.callers_of("leaf"), vec!["mid".to_string()]);
 }
 
+fn enumerates_all_symbols_and_references<S: GraphStore>(s: &mut S) {
+    let symbol_names: BTreeSet<String> = s.all_symbols().into_iter().map(|l| l.item.name).collect();
+    assert_eq!(
+        symbol_names,
+        BTreeSet::from(["leaf".to_string(), "mid".to_string(), "top".to_string()])
+    );
+    // Every reference to `leaf` and `mid` appears exactly once in the full set.
+    let refs = s.all_references();
+    assert_eq!(refs.iter().filter(|r| r.item.name == "leaf").count(), 1);
+    assert_eq!(refs.iter().filter(|r| r.item.name == "mid").count(), 1);
+    assert!(
+        s.all_symbols()
+            .iter()
+            .any(|l| l.item.name == "top" && l.path == "main.rs")
+    );
+}
+
 fn empty_store_answers_are_empty<S: GraphStore>(s: &mut S) {
     assert!(s.definitions("anything").is_empty());
     assert!(s.callers_of("anything").is_empty());
@@ -79,4 +98,6 @@ fn empty_store_answers_are_empty<S: GraphStore>(s: &mut S) {
     assert!(s.impact("anything").is_empty());
     assert!(s.symbols_in_file("anything").is_empty());
     assert!(s.references_to("anything").is_empty());
+    assert!(s.all_symbols().is_empty());
+    assert!(s.all_references().is_empty());
 }
