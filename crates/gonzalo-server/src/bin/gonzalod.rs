@@ -18,8 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let token = std::env::var("GONZALO_TOKEN").ok();
 
-    let store = Arc::new(FsStore::new(root));
-    let service = Service::new(store);
+    // One FsStore backs both the record store and the content-addressed blob
+    // store (it implements both traits).
+    let fs = Arc::new(FsStore::new(root));
+    let service = Service::new(fs.clone(), fs);
 
     let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
     let grpc_listener = tokio::net::TcpListener::bind(&grpc_addr).await?;

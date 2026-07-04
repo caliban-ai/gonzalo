@@ -15,7 +15,10 @@ use gonzalo_core::{BlobStore, CoreError, Manifest, Result};
 /// present is an honest dangling reference — skipped, not an error — so a view
 /// mid-sync still assembles the slices it does have. A blob that exists but is
 /// not a valid serialized slice *is* an error (corrupt store).
-pub async fn assemble<B: BlobStore>(manifest: &Manifest, blobs: &B) -> Result<InMemoryGraphStore> {
+pub async fn assemble<B: BlobStore + ?Sized>(
+    manifest: &Manifest,
+    blobs: &B,
+) -> Result<InMemoryGraphStore> {
     let mut store = InMemoryGraphStore::new();
     for (path, hash) in &manifest.entries {
         if let Some(bytes) = blobs.get_blob(hash).await? {

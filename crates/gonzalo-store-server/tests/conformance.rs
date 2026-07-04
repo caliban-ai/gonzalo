@@ -11,7 +11,8 @@ use tokio::net::TcpListener;
 
 async fn fresh_service() -> Service {
     let dir = tempfile::tempdir().expect("tempdir").keep();
-    Service::new(Arc::new(FsStore::new(dir)))
+    let fs = Arc::new(FsStore::new(dir));
+    Service::new(fs.clone(), fs)
 }
 
 #[tokio::test(flavor = "multi_thread")]
