@@ -16,6 +16,8 @@ pub enum SymbolKind {
     Const,
     Static,
     TypeAlias,
+    /// A class (Python `class`, and other languages that have classes).
+    Class,
 }
 
 /// A defined symbol with its in-file location (1-based line numbers).

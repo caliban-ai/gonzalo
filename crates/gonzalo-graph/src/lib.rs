@@ -9,7 +9,7 @@ pub mod model;
 pub mod store;
 
 pub use assembly::assemble;
-pub use builder::build_rust;
+pub use builder::{Language, build, build_rust};
 pub use model::{CodeGraph, Located, Reference, Symbol, SymbolKind};
 pub use store::{GraphStore, InMemoryGraphStore};
 
