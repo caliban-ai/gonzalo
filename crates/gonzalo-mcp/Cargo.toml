@@ -14,10 +14,12 @@ gonzalo-server   = { workspace = true }
 gonzalo-store-fs = { workspace = true }
 rmcp             = { workspace = true }
 tokio            = { workspace = true, features = ["rt", "macros", "io-std"] }
+serde            = { workspace = true }
 serde_json       = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+gonzalo-graph = { workspace = true }
+tempfile      = { workspace = true }
 
 [lints]
 workspace = true
