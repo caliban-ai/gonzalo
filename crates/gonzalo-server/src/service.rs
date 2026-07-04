@@ -1,13 +1,18 @@
 //! The transport-agnostic service layer. Both the gRPC and HTTP transports
 //! delegate to this; it forwards record ops to the backing `Store` and answers
-//! code-graph queries by assembling a view from the store + blob store.
+//! code-graph queries. A view is served from its persistent SQLite graph when
+//! one has been indexed (under `graph_root`); otherwise it is assembled from the
+//! content-addressed slices on the fly.
 
 use gonzalo_core::{
-    BlobStore, KeyPrefix, Manifest, PutResult, Record, RecordKey, Result, Revision, Store,
+    BlobStore, CoreError, KeyPrefix, Manifest, PutResult, Record, RecordKey, Result, Revision,
+    Store,
 };
-use gonzalo_graph::{GraphStore, InMemoryGraphStore, Located, Reference, Symbol, assemble};
+use gonzalo_graph::{GraphStore, Located, Reference, Symbol, assemble};
+use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
 use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::Connection;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Wraps a `Store` (records) and a `BlobStore` (content-addressed slices) and
@@ -17,11 +22,27 @@ use std::sync::Arc;
 pub struct Service {
     store: Arc<dyn Store>,
     blobs: Arc<dyn BlobStore>,
+    /// Root under which per-view SQLite graphs live (`gonzalo index` writes
+    /// them). When set and a view's db exists, queries read it instead of
+    /// assembling from slices.
+    graph_root: Option<PathBuf>,
 }
 
 impl Service {
     pub fn new(store: Arc<dyn Store>, blobs: Arc<dyn BlobStore>) -> Self {
-        Self { store, blobs }
+        Self {
+            store,
+            blobs,
+            graph_root: None,
+        }
+    }
+
+    /// Serve code-graph queries from persistent SQLite graphs rooted at
+    /// `graph_root` (matching `gonzalo index`'s `<store_root>/graphs`), falling
+    /// back to slice assembly for views without an indexed db.
+    pub fn with_graph_root(mut self, graph_root: impl Into<PathBuf>) -> Self {
+        self.graph_root = Some(graph_root.into());
+        self
     }
 
     pub async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
@@ -52,9 +73,9 @@ impl Service {
     }
 
     // --- Code graph queries (EPIC C) ---
-    // Each query selects a view by `(repo, view_id)`, loads its manifest,
-    // assembles the view's slices, and answers server-side. Assembly is
-    // per-call for now; a view cache is a follow-on.
+    // Each query selects a view by `(repo, view_id)` and answers server-side,
+    // preferring the view's persistent SQLite graph and falling back to
+    // on-the-fly slice assembly.
 
     /// Load a view's manifest, or an empty manifest if the view has none yet —
     /// an unknown/empty view simply yields empty query results.
@@ -65,10 +86,19 @@ impl Service {
         }
     }
 
-    /// Assemble the `(repo, view_id)` view into a queryable graph.
-    async fn view(&self, repo: &str, view_id: &str) -> Result<InMemoryGraphStore> {
+    /// A queryable graph for `(repo, view_id)`: the persistent SQLite graph if
+    /// one has been indexed under `graph_root`, else assembled from slices.
+    async fn view(&self, repo: &str, view_id: &str) -> Result<Box<dyn GraphStore>> {
+        if let Some(root) = &self.graph_root {
+            let db = view_db_path(root, repo, view_id);
+            if db.exists() {
+                let store =
+                    SqliteGraphStore::open(&db).map_err(|e| CoreError::Backend(e.to_string()))?;
+                return Ok(Box::new(store));
+            }
+        }
         let manifest = self.load_manifest(repo, view_id).await?;
-        assemble(&manifest, self.blobs.as_ref()).await
+        Ok(Box::new(assemble(&manifest, self.blobs.as_ref()).await?))
     }
 
     /// Definitions of `name` in the view, each with its path.
@@ -184,6 +214,40 @@ mod tests {
         };
         let outcome = fs.put(record, None).await.unwrap();
         assert!(matches!(outcome, PutResult::Committed(_)));
+    }
+
+    #[tokio::test]
+    async fn graph_queries_prefer_the_persistent_sqlite_graph() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let fs = Arc::new(FsStore::new(&dir));
+        let graph_root = dir.join("graphs");
+
+        // Write ONLY the SQLite graph — no manifest/slices — so a non-empty
+        // answer proves the query read SQLite rather than assembling.
+        {
+            let mut g = SqliteGraphStore::open(view_db_path(&graph_root, "r", "main")).unwrap();
+            g.insert(
+                "lib.rs",
+                build_rust("fn helper() {}\nfn main() { helper(); }"),
+            );
+        }
+        let svc = Service::new(fs.clone(), fs).with_graph_root(graph_root);
+
+        let defs = svc.graph_definitions("r", "main", "helper").await.unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path, "lib.rs");
+        assert_eq!(
+            svc.graph_callers_of("r", "main", "helper").await.unwrap(),
+            vec!["main".to_string()]
+        );
+
+        // A view without an indexed db falls back to assembly (empty here).
+        assert!(
+            svc.graph_impact("r", "absent", "x")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
