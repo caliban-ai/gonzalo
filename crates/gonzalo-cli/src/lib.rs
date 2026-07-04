@@ -3,14 +3,15 @@
 use anyhow::Context;
 use anyhow::Result;
 use gonzalo_core::{
-    Body, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind, Revision, Store,
-    segment,
+    BlobStore, Body, ContentHash, Identity, KeyPrefix, Manifest, Meta, PutResult, Record,
+    RecordKey, RecordKind, Revision, Store, segment,
 };
+use gonzalo_graph::build_rust;
 use gonzalo_store_fs::FsStore;
 use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::{Config, Connection, parse_category};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─── list ────────────────────────────────────────────────────────────────────
 
@@ -144,6 +145,122 @@ fn collect_files_inner(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<
     Ok(())
 }
 
+// ─── index ───────────────────────────────────────────────────────────────────
+
+/// Summary returned by [`index`].
+pub struct IndexSummary {
+    /// Rust files parsed into slices.
+    pub files: usize,
+    /// Paths newly added to the view.
+    pub added: usize,
+    /// Paths whose slice content changed.
+    pub modified: usize,
+    /// Paths removed from the view since the last index.
+    pub deleted: usize,
+}
+
+/// Index the `.rs` files under `src` into the `(repo, view)` code-graph view:
+/// parse each file into a content-addressed slice, then reconcile the view's
+/// manifest to the tree (ADR 0012). Re-running updates the view incrementally.
+///
+/// This is the full-reconcile ingestion path built on A4's set reconciliation;
+/// a `git diff`-driven incremental driver is a later follow-on. Slices orphaned
+/// by deletions are left for a separate GC pass (which must see all live views).
+pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<IndexSummary> {
+    let store = FsStore::new(root);
+
+    // Build the desired `path -> slice-hash` set by parsing each Rust file and
+    // storing its slice write-if-absent (identical content dedups).
+    let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
+    for path in rust_files(src)? {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let rel = path
+            .strip_prefix(src)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let slice = build_rust(&content);
+        let hash = store.put_blob(&slice.to_slice_bytes()).await?;
+        desired.insert(rel, hash);
+    }
+    let files = desired.len();
+
+    // Reconcile against the view's current manifest (empty if new).
+    let key = Manifest::key(repo, view);
+    let existing = store.get(&key).await?;
+    let current = match &existing {
+        Some(rec) => Manifest::from_body(&rec.body)?,
+        None => Manifest::new(),
+    };
+    let recon = current.reconcile(&desired);
+
+    // Write the manifest record (create-or-update under OCC).
+    let body = recon.manifest.to_body();
+    let (revision, expected, parent) = match &existing {
+        Some(rec) => (
+            rec.revision.next(body.bytes()),
+            Some(rec.revision.clone()),
+            Some(rec.revision.clone()),
+        ),
+        None => (Revision::initial(body.bytes()), None, None),
+    };
+    let record = Record {
+        key,
+        kind: RecordKind::GraphManifest,
+        revision,
+        parent,
+        body,
+        meta: Meta {
+            author: Identity::new("gonzalo-index"),
+            origin_system: "gonzalo-index".into(),
+            created: 0,
+            updated: 0,
+            labels: BTreeMap::new(),
+        },
+        links: Vec::new(),
+    };
+    match store.put(record, expected).await? {
+        PutResult::Committed(_) => {}
+        PutResult::Conflict(_) => {
+            anyhow::bail!("manifest for {repo}/{view} changed concurrently; retry the index")
+        }
+    }
+
+    Ok(IndexSummary {
+        files,
+        added: recon.added.len(),
+        modified: recon.modified.len(),
+        deleted: recon.deleted.len(),
+    })
+}
+
+/// Rust source files under `dir`, sorted, skipping `target`, `.git`, and hidden
+/// directories (build artifacts and VCS internals are not source).
+fn rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    rust_files_inner(dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn rust_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ft.is_dir() {
+            if name == "target" || name == ".git" || name.starts_with('.') {
+                continue;
+            }
+            rust_files_inner(&entry.path(), out)?;
+        } else if ft.is_file() && entry.path().extension().is_some_and(|e| e == "rs") {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
 // ─── sync_stores ─────────────────────────────────────────────────────────────
 
 /// Summary returned by [`sync_stores`].
@@ -244,6 +361,7 @@ fn select_connection<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gonzalo_graph::GraphStore;
     use tempfile::TempDir;
 
     fn write_file(dir: &Path, name: &str, contents: &str) {
@@ -464,5 +582,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("connection"), "got {err}");
+    }
+
+    // ── index: build a queryable view from a source tree ─────────────────────
+
+    #[tokio::test]
+    async fn index_builds_a_queryable_view() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn helper() {}");
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        write_file(src.path(), "sub/b.rs", "fn caller() { helper(); }");
+
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.files, 2);
+        assert_eq!(summary.added, 2);
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.deleted, 0);
+
+        // The indexed view assembles and answers real queries.
+        let store = FsStore::new(root.path());
+        let manifest = Manifest::from_body(
+            &store
+                .get(&Manifest::key("r", "main"))
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        let graph = gonzalo_graph::assemble(&manifest, &store).await.unwrap();
+        let defs = graph.definitions("helper");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path, "a.rs");
+        assert_eq!(graph.callers_of("helper"), vec!["caller".to_string()]);
+        assert!(
+            graph
+                .symbols_in_file("sub/b.rs")
+                .iter()
+                .any(|s| s.name == "caller")
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_reports_modifications_and_deletions() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "keep.rs", "fn keep() {}");
+        write_file(src.path(), "gone.rs", "fn gone() {}");
+        index(root.path(), src.path(), "r", "v").await.unwrap();
+
+        // Change one file, remove another.
+        write_file(src.path(), "keep.rs", "fn keep() { extra(); }");
+        std::fs::remove_file(src.path().join("gone.rs")).unwrap();
+
+        let summary = index(root.path(), src.path(), "r", "v").await.unwrap();
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.added, 0);
+        assert_eq!(summary.modified, 1);
+        assert_eq!(summary.deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn index_skips_non_rust_and_build_dirs() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "real.rs", "fn real() {}");
+        write_file(src.path(), "notes.txt", "not source");
+        std::fs::create_dir(src.path().join("target")).unwrap();
+        write_file(src.path(), "target/gen.rs", "fn generated() {}");
+
+        let summary = index(root.path(), src.path(), "r", "v").await.unwrap();
+        assert_eq!(summary.files, 1, "only real.rs is indexed");
+        assert_eq!(summary.added, 1);
     }
 }

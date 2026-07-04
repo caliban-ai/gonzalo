@@ -1352,6 +1352,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gonzalo-core",
+ "gonzalo-graph",
  "gonzalo-store-fs",
  "gonzalo-ticket",
  "gonzalo-ticket-config",

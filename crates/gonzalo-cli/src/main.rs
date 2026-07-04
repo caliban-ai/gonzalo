@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use gonzalo_cli::{get, list, migrate, status, sync_stores, ticket_move, ticket_sync};
+use gonzalo_cli::{get, index, list, migrate, status, sync_stores, ticket_move, ticket_sync};
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
 
@@ -62,6 +62,21 @@ enum Commands {
         /// Record kind.
         #[arg(long, default_value = "topic")]
         kind: KindArg,
+    },
+    /// Index a source tree into a code-graph view (parse `.rs` files into
+    /// content-addressed slices and reconcile the view's manifest).
+    Index {
+        /// Root directory of the fs store (destination).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Source directory to index.
+        src: PathBuf,
+        /// Repository identifier for the view, e.g. `acme/widgets`.
+        #[arg(long)]
+        repo: String,
+        /// View id, e.g. `main`.
+        #[arg(long, default_value = "main")]
+        view: String,
     },
     /// Sync two filesystem stores.
     Sync {
@@ -191,6 +206,19 @@ async fn main() -> Result<()> {
             let summary = migrate(&root, &src, &namespace, &collection, kind.into()).await?;
             println!("imported: {}", summary.imported);
             println!("skipped:  {}", summary.skipped);
+        }
+
+        Commands::Index {
+            root,
+            src,
+            repo,
+            view,
+        } => {
+            let summary = index(&root, &src, &repo, &view).await?;
+            println!("files:    {}", summary.files);
+            println!("added:    {}", summary.added);
+            println!("modified: {}", summary.modified);
+            println!("deleted:  {}", summary.deleted);
         }
 
         Commands::Sync { a, b } => {
