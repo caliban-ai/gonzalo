@@ -24,6 +24,11 @@ pub fn router(service: Service, auth: Option<String>) -> Router {
         )
         .route("/v1/keys", get(list_keys))
         .route("/v1/tickets/sync", axum::routing::post(ticket_sync))
+        .route("/v1/graph/definitions", get(graph_definitions))
+        .route("/v1/graph/references", get(graph_references_to))
+        .route("/v1/graph/callers", get(graph_callers_of))
+        .route("/v1/graph/callees", get(graph_callees))
+        .route("/v1/graph/impact", get(graph_impact))
         .with_state(Arc::new(service));
     if let Some(token) = auth {
         let token = Arc::new(token);
@@ -109,6 +114,59 @@ async fn ticket_sync(
         Err(crate::service::TicketSyncError::Internal(m)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, m).into_response()
         }
+    }
+}
+
+/// Selects a code-graph view `(repo, view)` and the `name` a query is about,
+/// e.g. `GET /v1/graph/impact?repo=acme/widgets&view=main&name=helper`.
+#[derive(Deserialize)]
+struct GraphQuery {
+    repo: String,
+    view: String,
+    name: String,
+}
+
+async fn graph_definitions(
+    State(svc): State<Arc<Service>>,
+    Query(q): Query<GraphQuery>,
+) -> Response {
+    match svc.graph_definitions(&q.repo, &q.view, &q.name).await {
+        Ok(items) => (StatusCode::OK, Json(items)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+async fn graph_references_to(
+    State(svc): State<Arc<Service>>,
+    Query(q): Query<GraphQuery>,
+) -> Response {
+    match svc.graph_references_to(&q.repo, &q.view, &q.name).await {
+        Ok(items) => (StatusCode::OK, Json(items)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+async fn graph_callers_of(
+    State(svc): State<Arc<Service>>,
+    Query(q): Query<GraphQuery>,
+) -> Response {
+    match svc.graph_callers_of(&q.repo, &q.view, &q.name).await {
+        Ok(names) => (StatusCode::OK, Json(names)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+async fn graph_callees(State(svc): State<Arc<Service>>, Query(q): Query<GraphQuery>) -> Response {
+    match svc.graph_callees(&q.repo, &q.view, &q.name).await {
+        Ok(names) => (StatusCode::OK, Json(names)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+async fn graph_impact(State(svc): State<Arc<Service>>, Query(q): Query<GraphQuery>) -> Response {
+    match svc.graph_impact(&q.repo, &q.view, &q.name).await {
+        Ok(names) => (StatusCode::OK, Json(names)).into_response(),
+        Err(e) => server_error(e),
     }
 }
 

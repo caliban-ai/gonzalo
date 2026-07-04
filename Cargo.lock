@@ -1422,6 +1422,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
+ "gonzalo-graph",
  "gonzalo-proto",
  "gonzalo-server",
  "gonzalo-store-fs",

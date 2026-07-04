@@ -8,7 +8,8 @@ pub mod v1 {
 }
 
 pub use v1::{
-    GetRequest, GetResponse, ListRequest, ListResponse, PutRequest, PutResponse,
+    GetRequest, GetResponse, GraphLocatedResponse, GraphNamesResponse, GraphQueryRequest,
+    ListRequest, ListResponse, PutRequest, PutResponse,
     gonzalo_client::GonzaloClient,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };

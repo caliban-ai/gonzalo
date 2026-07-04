@@ -10,6 +10,12 @@ service Gonzalo {
   rpc Put(PutRequest) returns (PutResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc TicketSync(TicketSyncRequest) returns (TicketSyncResponse);
+  // Code graph queries (EPIC C). Each selects a view by (repo, view_id).
+  rpc GraphDefinitions(GraphQueryRequest) returns (GraphLocatedResponse);
+  rpc GraphReferencesTo(GraphQueryRequest) returns (GraphLocatedResponse);
+  rpc GraphCallersOf(GraphQueryRequest) returns (GraphNamesResponse);
+  rpc GraphCallees(GraphQueryRequest) returns (GraphNamesResponse);
+  rpc GraphImpact(GraphQueryRequest) returns (GraphNamesResponse);
 }
 
 message GetRequest {
