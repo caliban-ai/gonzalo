@@ -104,7 +104,10 @@ run() {
 # its tool logic lives in the library (`gonzalo-mcp/src/lib.rs`), which IS
 # covered. The CLI `main` is intentionally NOT excluded — its subcommand
 # dispatch is testable.
-IGNORE_REGEX='crates/gonzalo-server/src/bin/gonzalod\.rs|crates/gonzalo-mcp/src/main\.rs'
+# The `gonzalo-parse-worker` is likewise a subprocess entrypoint `llvm-cov`
+# cannot instrument (it runs as a child); its behavior is exercised through the
+# `ParserPool` tests.
+IGNORE_REGEX='crates/gonzalo-server/src/bin/gonzalod\.rs|crates/gonzalo-mcp/src/main\.rs|crates/gonzalo-parse/src/bin/gonzalo-parse-worker\.rs'
 
 # Whole-workspace coverage with every substrate/capability feature enabled, so
 # the facade's feature-gated re-exports are instrumented too.

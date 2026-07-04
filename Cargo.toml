@@ -21,6 +21,7 @@ members = [
     "crates/gonzalo-ticket-asana",
     "crates/gonzalo-knowledge",
     "crates/gonzalo-mcp",
+    "crates/gonzalo-parse",
     "crates/gonzalo-cli",
 ]
 
@@ -62,6 +63,7 @@ gonzalo-ticket-gitlab = { path = "crates/gonzalo-ticket-gitlab" }
 gonzalo-ticket-asana = { path = "crates/gonzalo-ticket-asana" }
 gonzalo-knowledge = { path = "crates/gonzalo-knowledge" }
 gonzalo-mcp   = { path = "crates/gonzalo-mcp" }
+gonzalo-parse = { path = "crates/gonzalo-parse" }
 gonzalo-cli   = { path = "crates/gonzalo-cli" }
 rmcp        = { version = "1.7", features = ["server", "transport-io", "macros"] }
 tokio       = { version = "1", features = ["full"] }
