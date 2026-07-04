@@ -1413,9 +1413,11 @@ name = "gonzalo-mcp"
 version = "0.1.0"
 dependencies = [
  "gonzalo-core",
+ "gonzalo-graph",
  "gonzalo-server",
  "gonzalo-store-fs",
  "rmcp",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
