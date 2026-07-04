@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 gonzalo-core     = { workspace = true }
+gonzalo-graph    = { workspace = true }
 gonzalo-store-fs = { workspace = true }
 gonzalo-ticket        = { workspace = true }
 gonzalo-ticket-config = { workspace = true }
