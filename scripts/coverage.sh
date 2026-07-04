@@ -100,9 +100,11 @@ run() {
 # The daemon's `gonzalod` entrypoint (signal handling + blocking serve loop) is
 # excluded from the coverage denominator: `cargo test` never executes a bin
 # `main`, so unit/integration coverage there is low-value and would only depress
-# the ratio. The CLI `main` is intentionally NOT excluded — its subcommand
+# the ratio. The `gonzalo-mcp` entrypoint is the same shape (stdio serve loop);
+# its tool logic lives in the library (`gonzalo-mcp/src/lib.rs`), which IS
+# covered. The CLI `main` is intentionally NOT excluded — its subcommand
 # dispatch is testable.
-IGNORE_REGEX='crates/gonzalo-server/src/bin/gonzalod\.rs'
+IGNORE_REGEX='crates/gonzalo-server/src/bin/gonzalod\.rs|crates/gonzalo-mcp/src/main\.rs'
 
 # Whole-workspace coverage with every substrate/capability feature enabled, so
 # the facade's feature-gated re-exports are instrumented too.
