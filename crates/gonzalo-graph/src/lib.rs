@@ -12,3 +12,6 @@ pub use assembly::assemble;
 pub use builder::build_rust;
 pub use model::{CodeGraph, Located, Reference, Symbol, SymbolKind};
 pub use store::{GraphStore, InMemoryGraphStore};
+
+#[cfg(feature = "conformance")]
+pub mod conformance;

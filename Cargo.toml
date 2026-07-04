@@ -12,6 +12,7 @@ members = [
     "crates/gonzalo",
     "crates/gonzalo-vector",
     "crates/gonzalo-graph",
+    "crates/gonzalo-graph-sqlite",
     "crates/gonzalo-ticket",
     "crates/gonzalo-ticket-github",
     "crates/gonzalo-ticket-config",
@@ -54,6 +55,7 @@ gonzalo-store-server = { path = "crates/gonzalo-store-server" }
 gonzalo-domain = { path = "crates/gonzalo-domain" }
 gonzalo-vector = { path = "crates/gonzalo-vector" }
 gonzalo-graph = { path = "crates/gonzalo-graph" }
+gonzalo-graph-sqlite = { path = "crates/gonzalo-graph-sqlite" }
 gonzalo-ticket = { path = "crates/gonzalo-ticket" }
 gonzalo-ticket-github = { path = "crates/gonzalo-ticket-github" }
 gonzalo-ticket-config = { path = "crates/gonzalo-ticket-config" }
@@ -76,6 +78,7 @@ blake3      = "1"
 rustix      = { version = "1", features = ["fs"] }
 tempfile    = "3"
 wiremock    = "0.6"
+rusqlite    = { version = "0.32", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

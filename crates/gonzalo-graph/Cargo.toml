@@ -20,5 +20,10 @@ gonzalo-store-fs = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = { workspace = true }
 
+[features]
+# Exposes `conformance::run_graph_store_conformance` for backend crates to
+# validate their `GraphStore` impls against the reference semantics.
+conformance = []
+
 [lints]
 workspace = true
