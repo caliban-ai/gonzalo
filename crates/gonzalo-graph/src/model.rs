@@ -18,6 +18,8 @@ pub enum SymbolKind {
     TypeAlias,
     /// A class (Python `class`, and other languages that have classes).
     Class,
+    /// An interface (TypeScript `interface`, and similar constructs).
+    Interface,
 }
 
 /// A defined symbol with its in-file location (1-based line numbers).

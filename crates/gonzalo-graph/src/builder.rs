@@ -1,6 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
-//! language-parameterized ([`Language`]); Rust and Python are supported, and a
-//! new grammar is a matter of adding its node-kind mappings.
+//! language-parameterized ([`Language`]); Rust, Python, JavaScript, and
+//! TypeScript/TSX are supported, and a new grammar is a matter of adding its
+//! node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use tree_sitter::{Node, Parser};
@@ -10,6 +11,10 @@ use tree_sitter::{Node, Parser};
 pub enum Language {
     Rust,
     Python,
+    JavaScript,
+    TypeScript,
+    /// TypeScript with JSX (`.tsx`).
+    Tsx,
 }
 
 impl Language {
@@ -19,6 +24,9 @@ impl Language {
         match ext {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "ts" | "mts" | "cts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
             _ => None,
         }
     }
@@ -27,6 +35,9 @@ impl Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         }
     }
 
@@ -50,6 +61,14 @@ impl Language {
                 "class_definition" => Some(SymbolKind::Class),
                 _ => None,
             },
+            Self::JavaScript => js_item_kind(node_kind),
+            // TypeScript/TSX are a superset of JavaScript's declarations.
+            Self::TypeScript | Self::Tsx => js_item_kind(node_kind).or(match node_kind {
+                "interface_declaration" => Some(SymbolKind::Interface),
+                "type_alias_declaration" => Some(SymbolKind::TypeAlias),
+                "enum_declaration" => Some(SymbolKind::Enum),
+                _ => None,
+            }),
         }
     }
 
@@ -68,7 +87,9 @@ impl Language {
     /// Whether `node_kind` is a call expression for this language.
     fn is_call(self, node_kind: &str) -> bool {
         match self {
-            Self::Rust => node_kind == "call_expression",
+            Self::Rust | Self::JavaScript | Self::TypeScript | Self::Tsx => {
+                node_kind == "call_expression"
+            }
             Self::Python => node_kind == "call",
         }
     }
@@ -99,7 +120,27 @@ impl Language {
                     .map(str::to_string),
                 _ => node_text(func, bytes).map(str::to_string),
             },
+            Self::JavaScript | Self::TypeScript | Self::Tsx => match func.kind() {
+                "identifier" => node_text(func, bytes).map(str::to_string),
+                // obj.method(...) -> the member expression's `property` field
+                "member_expression" => func
+                    .child_by_field_name("property")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string),
+                _ => node_text(func, bytes).map(str::to_string),
+            },
         }
+    }
+}
+
+/// JavaScript declaration node kinds shared by JS and TS/TSX.
+fn js_item_kind(node_kind: &str) -> Option<SymbolKind> {
+    match node_kind {
+        "function_declaration" | "generator_function_declaration" | "method_definition" => {
+            Some(SymbolKind::Function)
+        }
+        "class_declaration" | "abstract_class_declaration" => Some(SymbolKind::Class),
+        _ => None,
     }
 }
 
@@ -269,6 +310,99 @@ def main():
     fn language_from_extension() {
         assert_eq!(Language::from_extension("rs"), Some(Language::Rust));
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("js"), Some(Language::JavaScript));
+        assert_eq!(Language::from_extension("jsx"), Some(Language::JavaScript));
+        assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("tsx"), Some(Language::Tsx));
         assert_eq!(Language::from_extension("txt"), None);
+    }
+
+    const JS_SRC: &str = r#"
+class Widget {
+  area() {
+    return helper(this.n);
+  }
+}
+function helper(x) {
+  return x + 1;
+}
+function main() {
+  const w = new Widget();
+  console.log(w.area());
+}
+"#;
+
+    #[test]
+    fn javascript_extracts_symbols_and_calls() {
+        let g = build(Language::JavaScript, JS_SRC);
+        let names: Vec<(&str, SymbolKind)> = g
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect();
+        assert!(names.contains(&("Widget", SymbolKind::Class)));
+        assert!(names.contains(&("area", SymbolKind::Function)));
+        assert!(names.contains(&("helper", SymbolKind::Function)));
+        assert!(names.contains(&("main", SymbolKind::Function)));
+
+        // `helper(...)` called from inside `area`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("area"))
+        );
+        // Method call `w.area()` -> member-expression property `area`, from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "area" && r.from.as_deref() == Some("main"))
+        );
+    }
+
+    const TS_SRC: &str = r#"
+interface Shape { area(): number; }
+type Id = string;
+enum Color { Red, Green }
+
+class Circle implements Shape {
+  area(): number { return compute(this.r); }
+}
+
+function compute(r: number): number { return r * r; }
+"#;
+
+    #[test]
+    fn typescript_extracts_ts_specific_kinds() {
+        let g = build(Language::TypeScript, TS_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Shape"), Some(SymbolKind::Interface));
+        assert_eq!(named("Id"), Some(SymbolKind::TypeAlias));
+        assert_eq!(named("Color"), Some(SymbolKind::Enum));
+        assert_eq!(named("Circle"), Some(SymbolKind::Class));
+        assert_eq!(named("compute"), Some(SymbolKind::Function));
+
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "compute" && r.from.as_deref() == Some("area"))
+        );
+    }
+
+    #[test]
+    fn tsx_parses_with_jsx() {
+        // The TSX grammar must accept JSX syntax that plain TS would reject.
+        let src = r#"
+function App(): JSX.Element {
+  return greet();
+}
+function greet() { return <div>hi</div>; }
+"#;
+        let g = build(Language::Tsx, src);
+        assert!(g.symbols.iter().any(|s| s.name == "App"));
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "greet" && r.from.as_deref() == Some("App"))
+        );
     }
 }
