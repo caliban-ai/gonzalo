@@ -6,7 +6,7 @@ use gonzalo_core::{
     BlobStore, Body, ContentHash, Identity, KeyPrefix, Manifest, Meta, PutResult, Record,
     RecordKey, RecordKind, Revision, Store, segment,
 };
-use gonzalo_graph::build_rust;
+use gonzalo_graph::{Language, build};
 use gonzalo_store_fs::FsStore;
 use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::{Config, Connection, parse_category};
@@ -169,10 +169,11 @@ pub struct IndexSummary {
 pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<IndexSummary> {
     let store = FsStore::new(root);
 
-    // Build the desired `path -> slice-hash` set by parsing each Rust file and
-    // storing its slice write-if-absent (identical content dedups).
+    // Build the desired `path -> slice-hash` set by parsing each supported
+    // source file (by extension) and storing its slice write-if-absent
+    // (identical content dedups).
     let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
-    for path in rust_files(src)? {
+    for (path, language) in source_files(src)? {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let rel = path
@@ -180,7 +181,7 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let slice = build_rust(&content);
+        let slice = build(language, &content);
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
         desired.insert(rel, hash);
     }
@@ -235,16 +236,18 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
     })
 }
 
-/// Rust source files under `dir`, sorted, skipping `target`, `.git`, and hidden
-/// directories (build artifacts and VCS internals are not source).
-fn rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
+/// Supported source files under `dir` with their [`Language`], sorted by path,
+/// skipping `target`, `.git`, and hidden directories (build artifacts and VCS
+/// internals are not source). Files whose extension maps to no language are
+/// skipped.
+fn source_files(dir: &Path) -> Result<Vec<(PathBuf, Language)>> {
     let mut out = Vec::new();
-    rust_files_inner(dir, &mut out)?;
-    out.sort();
+    source_files_inner(dir, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
-fn rust_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn source_files_inner(dir: &Path, out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let ft = entry.file_type()?;
@@ -253,9 +256,16 @@ fn rust_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             if name == "target" || name == ".git" || name.starts_with('.') {
                 continue;
             }
-            rust_files_inner(&entry.path(), out)?;
-        } else if ft.is_file() && entry.path().extension().is_some_and(|e| e == "rs") {
-            out.push(entry.path());
+            source_files_inner(&entry.path(), out)?;
+        } else if ft.is_file() {
+            let path = entry.path();
+            if let Some(language) = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(Language::from_extension)
+            {
+                out.push((path, language));
+            }
         }
     }
     Ok(())
@@ -655,5 +665,31 @@ mod tests {
         let summary = index(root.path(), src.path(), "r", "v").await.unwrap();
         assert_eq!(summary.files, 1, "only real.rs is indexed");
         assert_eq!(summary.added, 1);
+    }
+
+    #[tokio::test]
+    async fn index_handles_multiple_languages() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "lib.rs", "fn rust_fn() {}");
+        write_file(src.path(), "app.py", "def py_fn():\n    pass\n");
+
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.files, 2, "both the .rs and .py file are indexed");
+
+        // Both languages' symbols are queryable in the assembled view.
+        let store = FsStore::new(root.path());
+        let manifest = Manifest::from_body(
+            &store
+                .get(&Manifest::key("r", "main"))
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        let graph = gonzalo_graph::assemble(&manifest, &store).await.unwrap();
+        assert_eq!(graph.definitions("rust_fn")[0].path, "lib.rs");
+        assert_eq!(graph.definitions("py_fn")[0].path, "app.py");
     }
 }
