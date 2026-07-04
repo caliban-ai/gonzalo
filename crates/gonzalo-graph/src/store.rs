@@ -25,6 +25,11 @@ pub trait GraphStore: Send + Sync {
     /// Distinct names referenced from within `name` (the inverse of
     /// [`callers_of`](Self::callers_of)), sorted.
     fn callees(&self, name: &str) -> Vec<String>;
+    /// Every symbol in the view, each with its path (used for whole-graph
+    /// operations like diffing).
+    fn all_symbols(&self) -> Vec<Located<Symbol>>;
+    /// Every reference in the view, each with its path.
+    fn all_references(&self) -> Vec<Located<Reference>>;
 
     /// The transitive closure of callers: every symbol that could be affected if
     /// `name` changes, reached by walking [`callers_of`](Self::callers_of)
@@ -134,6 +139,30 @@ impl GraphStore for InMemoryGraphStore {
         callees.sort();
         callees.dedup();
         callees
+    }
+
+    fn all_symbols(&self) -> Vec<Located<Symbol>> {
+        self.slices
+            .iter()
+            .flat_map(|(path, g)| {
+                g.symbols.iter().map(move |s| Located {
+                    path: path.clone(),
+                    item: s.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn all_references(&self) -> Vec<Located<Reference>> {
+        self.slices
+            .iter()
+            .flat_map(|(path, g)| {
+                g.references.iter().map(move |r| Located {
+                    path: path.clone(),
+                    item: r.clone(),
+                })
+            })
+            .collect()
     }
 }
 

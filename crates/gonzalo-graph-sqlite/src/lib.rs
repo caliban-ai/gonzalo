@@ -236,4 +236,42 @@ impl GraphStore for SqliteGraphStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect callees")
     }
+
+    fn all_symbols(&self) -> Vec<Located<Symbol>> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare("SELECT path, name, kind, start_line, end_line FROM symbols ORDER BY path")
+            .expect("prepare all_symbols");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Located {
+                    path: row.get(0)?,
+                    item: symbol_from_row(row, 1)?,
+                })
+            })
+            .expect("query all_symbols");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect all_symbols")
+    }
+
+    fn all_references(&self) -> Vec<Located<Reference>> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare("SELECT path, name, from_fn, line FROM refs ORDER BY path, line")
+            .expect("prepare all_references");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Located {
+                    path: row.get(0)?,
+                    item: Reference {
+                        name: row.get(1)?,
+                        from: row.get::<_, Option<String>>(2)?,
+                        line: row.get::<_, i64>(3)? as usize,
+                    },
+                })
+            })
+            .expect("query all_references");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect all_references")
+    }
 }
