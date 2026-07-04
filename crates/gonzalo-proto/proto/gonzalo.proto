@@ -60,3 +60,24 @@ message TicketSyncResponse {
   uint64 updated = 2;
   uint64 unchanged = 3;
 }
+
+// --- Code graph queries (EPIC C) ---
+// Every graph query selects a view by (repo, view_id): the daemon loads that
+// view's manifest, assembles its slices, and answers server-side. `name` is the
+// symbol the query is about. Wired to RPCs + transports in C3.
+message GraphQueryRequest {
+  string repo = 1;
+  string view_id = 2;
+  string name = 3;
+}
+
+// Definitions / ReferencesTo: located results (path + item).
+message GraphLocatedResponse {
+  // JSON of each gonzalo_graph::Located<Symbol> or Located<Reference>.
+  repeated bytes items_json = 1;
+}
+
+// CallersOf / Callees / Impact: plain name lists.
+message GraphNamesResponse {
+  repeated string names = 1;
+}

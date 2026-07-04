@@ -1365,6 +1365,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
  "gonzalo-core",
+ "gonzalo-graph",
  "gonzalo-proto",
  "gonzalo-store-fs",
  "gonzalo-ticket",
