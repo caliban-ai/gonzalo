@@ -76,6 +76,35 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
         }
         Ok(hits)
     }
+
+    /// **Vector⋈graph** (ADR 0011): rank the top-`k` candidates by semantic
+    /// similarity, then keep only those whose record falls in `root`'s
+    /// call-graph neighborhood in `graph` — `root` itself, its callers, and its
+    /// callees. Composition is by shared key: a record is in the neighborhood
+    /// when its [`RecordKey`](gonzalo_core::RecordKey)`.id` equals a symbol name
+    /// in the neighborhood (no new cross-store linkage, ADR 0008/0011).
+    ///
+    /// So "semantically similar to X **and** structurally near `root`" is one
+    /// call. The result is the in-neighborhood subset of the top-`k` (≤ `k`).
+    #[cfg(feature = "graph")]
+    pub async fn query_in_subgraph(
+        &self,
+        text: &str,
+        k: usize,
+        graph: &dyn gonzalo_graph::GraphStore,
+        root: &str,
+    ) -> Result<Vec<Hit>> {
+        use std::collections::BTreeSet;
+        let mut neighborhood: BTreeSet<String> = BTreeSet::from([root.to_string()]);
+        neighborhood.extend(graph.callers_of(root));
+        neighborhood.extend(graph.callees(root));
+
+        let hits = self.query(text, k, &KeyPrefix::default()).await?;
+        Ok(hits
+            .into_iter()
+            .filter(|h| neighborhood.contains(&h.record.key.id))
+            .collect())
+    }
 }
 
 /// The embeddable text for a record, or `None` if its kind is not
@@ -266,5 +295,58 @@ mod tests {
         .await;
         let ks = KnowledgeStore::new(store, MemoryVectorIndex::default(), Bow);
         assert!(!ks.ingest(&key).await.unwrap(), "checkpoint is not indexed");
+    }
+
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn query_in_subgraph_restricts_to_the_neighborhood() {
+        use gonzalo_graph::{GraphStore, InMemoryGraphStore, build_rust};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        // Three topic records keyed by symbol name, all mentioning "database",
+        // so all three are semantically similar to the query.
+        for id in ["root", "helper", "faraway"] {
+            let key = RecordKey::new("code", "symbols", id);
+            let topic = Topic {
+                slug: id.into(),
+                bullets: vec!["touches the database layer".into()],
+            };
+            put(
+                &store,
+                record(&key, RecordKind::Topic, topic.to_body().unwrap()),
+            )
+            .await;
+        }
+        let ks = KnowledgeStore::new(store, MemoryVectorIndex::default(), Bow);
+        for id in ["root", "helper", "faraway"] {
+            assert!(
+                ks.ingest(&RecordKey::new("code", "symbols", id))
+                    .await
+                    .unwrap()
+            );
+        }
+
+        // Call graph: root -> helper; faraway is unrelated. So root's
+        // neighborhood is {root, helper}.
+        let mut graph = InMemoryGraphStore::new();
+        graph.insert(
+            "lib.rs",
+            build_rust("fn root() { helper(); }\nfn helper() {}\nfn faraway() {}"),
+        );
+
+        let hits = ks
+            .query_in_subgraph("database", 10, &graph, "root")
+            .await
+            .unwrap();
+        let ids: BTreeMap<String, ()> =
+            hits.iter().map(|h| (h.record.key.id.clone(), ())).collect();
+        assert!(ids.contains_key("root"));
+        assert!(ids.contains_key("helper"));
+        assert!(
+            !ids.contains_key("faraway"),
+            "faraway is semantically similar but outside root's neighborhood"
+        );
     }
 }
