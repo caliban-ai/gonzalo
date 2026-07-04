@@ -6,7 +6,8 @@ use gonzalo_core::{
     BlobStore, Body, ContentHash, Identity, KeyPrefix, Manifest, Meta, PutResult, Record,
     RecordKey, RecordKind, Revision, Store, segment,
 };
-use gonzalo_graph::{CodeGraph, Language, build};
+use gonzalo_graph::{CodeGraph, GraphStore, Language, build};
+use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
 use gonzalo_parse::ParserPool;
 use gonzalo_store_fs::FsStore;
 use gonzalo_ticket::IngestSummary;
@@ -225,9 +226,13 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
         ParserPool::new(bin, workers, std::time::Duration::from_secs(30))
     });
 
+    // The persistent per-view graph, queried by the daemon without re-assembly.
+    let mut graph = SqliteGraphStore::open(view_db_path(&root.join("graphs"), repo, view))
+        .with_context(|| format!("opening graph db for {repo}/{view}"))?;
+
     // Build the desired `path -> slice-hash` set by parsing each supported
-    // source file (by extension) and storing its slice write-if-absent
-    // (identical content dedups).
+    // source file (by extension), storing its slice write-if-absent (identical
+    // content dedups), and inserting it into the queryable graph.
     let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
     let mut skipped = 0usize;
     for (path, language) in source_files(src)? {
@@ -243,6 +248,7 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
             continue;
         };
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
+        graph.insert(&rel, slice); // insert replaces this path's rows
         desired.insert(rel, hash);
     }
     let files = desired.len();
@@ -255,6 +261,11 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
         None => Manifest::new(),
     };
     let recon = current.reconcile(&desired);
+
+    // Drop paths removed from the view out of the persistent graph too.
+    for path in &recon.deleted {
+        graph.remove_path(path);
+    }
 
     // Write the manifest record (create-or-update under OCC).
     let body = recon.manifest.to_body();
@@ -752,5 +763,44 @@ mod tests {
         let graph = gonzalo_graph::assemble(&manifest, &store).await.unwrap();
         assert_eq!(graph.definitions("rust_fn")[0].path, "lib.rs");
         assert_eq!(graph.definitions("py_fn")[0].path, "app.py");
+    }
+
+    #[tokio::test]
+    async fn index_writes_a_queryable_sqlite_graph() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(
+            src.path(),
+            "lib.rs",
+            "fn helper() {}\nfn main() { helper(); }",
+        );
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        // The persistent per-view graph exists under <root>/graphs and answers
+        // queries without re-assembly.
+        let db = view_db_path(&root.path().join("graphs"), "r", "main");
+        let g = SqliteGraphStore::open(&db).unwrap();
+        assert_eq!(g.definitions("helper")[0].path, "lib.rs");
+        assert_eq!(g.callers_of("helper"), vec!["main".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn reindex_removes_deleted_paths_from_the_sqlite_graph() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "keep.rs", "fn keep() {}");
+        write_file(src.path(), "gone.rs", "fn gone() {}");
+        index(root.path(), src.path(), "r", "v").await.unwrap();
+
+        std::fs::remove_file(src.path().join("gone.rs")).unwrap();
+        index(root.path(), src.path(), "r", "v").await.unwrap();
+
+        let g =
+            SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "v")).unwrap();
+        assert_eq!(g.definitions("keep").len(), 1);
+        assert!(
+            g.definitions("gone").is_empty(),
+            "deleted file's symbols must be gone from the graph"
+        );
     }
 }

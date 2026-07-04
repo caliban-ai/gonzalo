@@ -45,8 +45,14 @@ pub struct SqliteGraphStore {
 }
 
 impl SqliteGraphStore {
-    /// Open (creating if absent) a file-backed store at `path`.
+    /// Open (creating if absent, including parent directories) a file-backed
+    /// store at `path`.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            // Best-effort: if this fails, `Connection::open` reports the real error.
+            let _ = std::fs::create_dir_all(parent);
+        }
         Self::init(Connection::open(path)?)
     }
 
@@ -61,6 +67,41 @@ impl SqliteGraphStore {
             conn: Mutex::new(conn),
         })
     }
+
+    /// Remove all rows for `path` (a file dropped from the view). Complements
+    /// [`GraphStore::insert`], which replaces a path's rows.
+    pub fn remove_path(&mut self, path: &str) {
+        let guard = self.conn.lock().expect("connection poisoned");
+        guard
+            .execute("DELETE FROM symbols WHERE path = ?1", params![path])
+            .expect("delete symbols for path");
+        guard
+            .execute("DELETE FROM refs WHERE path = ?1", params![path])
+            .expect("delete refs for path");
+    }
+}
+
+/// The database file for a view's graph under `graph_root`:
+/// `<graph_root>/<repo>/<view_id>.db`, with `repo`/`view_id` made
+/// filesystem-safe. Writer (indexer) and reader (server) must agree on this.
+pub fn view_db_path(graph_root: &Path, repo: &str, view_id: &str) -> std::path::PathBuf {
+    graph_root
+        .join(fs_safe(repo))
+        .join(format!("{}.db", fs_safe(view_id)))
+}
+
+/// Map an identifier to a single filesystem-safe path segment (non
+/// `[A-Za-z0-9._-]` -> `_`), so `repo`/`view_id` cannot escape `graph_root`.
+fn fs_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// A [`SymbolKind`](gonzalo_graph::SymbolKind) as stored TEXT (its serde form).

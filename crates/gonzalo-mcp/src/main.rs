@@ -17,8 +17,13 @@ async fn main() -> std::io::Result<()> {
     let root = std::env::var("GONZALO_ROOT").unwrap_or_else(|_| "./gonzalo-data".into());
 
     // One FsStore backs both the record store and the blob store.
+    // Per-view SQLite graphs written by `gonzalo index` live under `<root>/graphs`.
+    let graph_root = std::path::Path::new(&root).join("graphs");
     let fs = Arc::new(FsStore::new(&root));
-    let server = GonzaloMcp::new(Service::new(fs.clone(), fs), root);
+    let server = GonzaloMcp::new(
+        Service::new(fs.clone(), fs).with_graph_root(graph_root),
+        root,
+    );
 
     eprintln!("gonzalo-mcp: serving on stdio");
     let (stdin, stdout) = stdio();
