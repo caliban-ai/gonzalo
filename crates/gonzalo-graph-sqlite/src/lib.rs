@@ -1,0 +1,198 @@
+//! A persistent, SQLite-backed [`GraphStore`] (ticket B).
+//!
+//! Resolves the scalable-backend spike in favour of SQLite (`rusqlite`,
+//! bundled): FOSS/local, a natural fit for the sync [`GraphStore`] trait, and
+//! able to persist a view built once at index time rather than re-assembling it
+//! into memory on every query. Symbols and references live in two path-keyed
+//! tables; `insert` replaces a path's rows transactionally, so re-indexing a
+//! file never duplicates its symbols. `callees`/`impact` use the trait defaults.
+//!
+//! The `GraphStore` trait is infallible, so query methods `expect` on the
+//! embedded database — a failure there is corruption/programmer error, not a
+//! recoverable condition. The connection is held behind a `Mutex` (rusqlite's
+//! `Connection` is `Send` but not `Sync`, and `GraphStore` requires `Sync`);
+//! read concurrency via a connection pool is a follow-on.
+
+use gonzalo_graph::{CodeGraph, GraphStore, Located, Reference, Symbol};
+use rusqlite::{Connection, params};
+use std::path::Path;
+use std::sync::Mutex;
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS symbols (
+    path       TEXT    NOT NULL,
+    name       TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refs (
+    path    TEXT    NOT NULL,
+    name    TEXT    NOT NULL,
+    from_fn TEXT,
+    line    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
+CREATE INDEX IF NOT EXISTS idx_refs_name    ON refs(name);
+CREATE INDEX IF NOT EXISTS idx_refs_from    ON refs(from_fn);
+CREATE INDEX IF NOT EXISTS idx_refs_path    ON refs(path);
+";
+
+/// A [`GraphStore`] backed by a SQLite database.
+pub struct SqliteGraphStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteGraphStore {
+    /// Open (creating if absent) a file-backed store at `path`.
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        Self::init(Connection::open(path)?)
+    }
+
+    /// Open an ephemeral in-memory store.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+}
+
+/// A [`SymbolKind`](gonzalo_graph::SymbolKind) as stored TEXT (its serde form).
+fn kind_to_text(sym: &Symbol) -> String {
+    serde_json::to_string(&sym.kind).expect("SymbolKind serializes")
+}
+
+fn symbol_from_row(row: &rusqlite::Row, base: usize) -> rusqlite::Result<Symbol> {
+    let name: String = row.get(base)?;
+    let kind_text: String = row.get(base + 1)?;
+    let start: i64 = row.get(base + 2)?;
+    let end: i64 = row.get(base + 3)?;
+    Ok(Symbol {
+        name,
+        kind: serde_json::from_str(&kind_text).expect("stored SymbolKind is valid"),
+        start_line: start as usize,
+        end_line: end as usize,
+    })
+}
+
+impl GraphStore for SqliteGraphStore {
+    fn insert(&mut self, path: &str, graph: CodeGraph) {
+        let mut guard = self.conn.lock().expect("connection poisoned");
+        let tx = guard.transaction().expect("begin transaction");
+        tx.execute("DELETE FROM symbols WHERE path = ?1", params![path])
+            .expect("clear symbols for path");
+        tx.execute("DELETE FROM refs WHERE path = ?1", params![path])
+            .expect("clear refs for path");
+        for s in &graph.symbols {
+            tx.execute(
+                "INSERT INTO symbols (path, name, kind, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    path,
+                    s.name,
+                    kind_to_text(s),
+                    s.start_line as i64,
+                    s.end_line as i64
+                ],
+            )
+            .expect("insert symbol");
+        }
+        for r in &graph.references {
+            tx.execute(
+                "INSERT INTO refs (path, name, from_fn, line) VALUES (?1, ?2, ?3, ?4)",
+                params![path, r.name, r.from, r.line as i64],
+            )
+            .expect("insert reference");
+        }
+        tx.commit().expect("commit transaction");
+    }
+
+    fn symbols_in_file(&self, path: &str) -> Vec<Symbol> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare("SELECT name, kind, start_line, end_line FROM symbols WHERE path = ?1")
+            .expect("prepare symbols_in_file");
+        let rows = stmt
+            .query_map(params![path], |row| symbol_from_row(row, 0))
+            .expect("query symbols_in_file");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect symbols_in_file")
+    }
+
+    fn definitions(&self, name: &str) -> Vec<Located<Symbol>> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare(
+                "SELECT path, name, kind, start_line, end_line FROM symbols
+                 WHERE name = ?1 ORDER BY path",
+            )
+            .expect("prepare definitions");
+        let rows = stmt
+            .query_map(params![name], |row| {
+                Ok(Located {
+                    path: row.get(0)?,
+                    item: symbol_from_row(row, 1)?,
+                })
+            })
+            .expect("query definitions");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect definitions")
+    }
+
+    fn references_to(&self, name: &str) -> Vec<Located<Reference>> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare(
+                "SELECT path, name, from_fn, line FROM refs
+                 WHERE name = ?1 ORDER BY path, line",
+            )
+            .expect("prepare references_to");
+        let rows = stmt
+            .query_map(params![name], |row| {
+                Ok(Located {
+                    path: row.get(0)?,
+                    item: Reference {
+                        name: row.get(1)?,
+                        from: row.get::<_, Option<String>>(2)?,
+                        line: row.get::<_, i64>(3)? as usize,
+                    },
+                })
+            })
+            .expect("query references_to");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect references_to")
+    }
+
+    fn callers_of(&self, name: &str) -> Vec<String> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare(
+                "SELECT DISTINCT from_fn FROM refs
+                 WHERE name = ?1 AND from_fn IS NOT NULL ORDER BY from_fn",
+            )
+            .expect("prepare callers_of");
+        let rows = stmt
+            .query_map(params![name], |row| row.get::<_, String>(0))
+            .expect("query callers_of");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect callers_of")
+    }
+
+    fn callees(&self, name: &str) -> Vec<String> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare("SELECT DISTINCT name FROM refs WHERE from_fn = ?1 ORDER BY name")
+            .expect("prepare callees");
+        let rows = stmt
+            .query_map(params![name], |row| row.get::<_, String>(0))
+            .expect("query callees");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect callees")
+    }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "gonzalo-graph-sqlite"
+description = "Persistent SQLite-backed GraphStore for the gonzalo code graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-graph = { workspace = true }
+rusqlite      = { workspace = true }
+serde_json    = { workspace = true }
+
+[dev-dependencies]
+gonzalo-graph = { workspace = true, features = ["conformance"] }
+tempfile      = { workspace = true }
+
+[lints]
+workspace = true
