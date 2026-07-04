@@ -12,7 +12,8 @@
 //! per-parse `timeout` is dropped and lazily respawned on next use; a death is
 //! retried once on a fresh worker so an unlucky crash doesn't fail a good parse.
 
-use gonzalo_graph::CodeGraph;
+use gonzalo_graph::{CodeGraph, Language};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +21,15 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+
+/// One parse request sent to a worker: the source and the language to parse it
+/// as. Serialized as one JSON line (JSON escapes newlines, so a whole file is a
+/// single line).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParseRequest {
+    pub language: Language,
+    pub source: String,
+}
 
 /// Why a parse did not return a graph. All variants are recoverable — the pool
 /// has already dropped the offending worker.
@@ -72,10 +82,10 @@ impl ParserPool {
         self.slots.len()
     }
 
-    /// Parse `source` into a [`CodeGraph`] on an isolated worker. A worker crash
-    /// is retried once on a fresh worker; a hang past the timeout is not retried
-    /// (it may be pathological input that always hangs).
-    pub async fn parse(&self, source: &str) -> Result<CodeGraph, ParseError> {
+    /// Parse `source` as `language` into a [`CodeGraph`] on an isolated worker.
+    /// A worker crash is retried once on a fresh worker; a hang past the timeout
+    /// is not retried (it may be pathological input that always hangs).
+    pub async fn parse(&self, language: Language, source: &str) -> Result<CodeGraph, ParseError> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
         let mut slot = self.slots[idx].lock().await;
 
@@ -87,7 +97,7 @@ impl ParserPool {
                 );
             }
             let worker = slot.as_mut().expect("worker present");
-            match tokio::time::timeout(self.timeout, worker.roundtrip(source)).await {
+            match tokio::time::timeout(self.timeout, worker.roundtrip(language, source)).await {
                 Ok(Ok(graph)) => return Ok(graph),
                 Ok(Err(e)) => {
                     // Dead worker: drop it (kill_on_drop) and retry on a fresh one.
@@ -133,8 +143,16 @@ impl Worker {
 
     /// Send one request and read one response. A broken pipe or EOF means the
     /// worker died.
-    async fn roundtrip(&mut self, source: &str) -> Result<CodeGraph, ParseError> {
-        let mut req = serde_json::to_string(source).expect("string serializes");
+    async fn roundtrip(
+        &mut self,
+        language: Language,
+        source: &str,
+    ) -> Result<CodeGraph, ParseError> {
+        let request = ParseRequest {
+            language,
+            source: source.to_string(),
+        };
+        let mut req = serde_json::to_string(&request).expect("ParseRequest serializes");
         req.push('\n');
         self.stdin
             .write_all(req.as_bytes())

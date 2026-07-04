@@ -1377,6 +1377,7 @@ dependencies = [
  "clap",
  "gonzalo-core",
  "gonzalo-graph",
+ "gonzalo-parse",
  "gonzalo-store-fs",
  "gonzalo-ticket",
  "gonzalo-ticket-config",
@@ -1466,6 +1467,7 @@ name = "gonzalo-parse"
 version = "0.1.0"
 dependencies = [
  "gonzalo-graph",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
