@@ -1375,11 +1375,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "git2",
  "gonzalo-core",
  "gonzalo-graph",
  "gonzalo-graph-sqlite",
  "gonzalo-parse",
  "gonzalo-store-fs",
+ "gonzalo-store-git",
  "gonzalo-ticket",
  "gonzalo-ticket-config",
  "serde_json",

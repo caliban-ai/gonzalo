@@ -215,6 +215,14 @@ async fn main() -> Result<()> {
             view,
         } => {
             let summary = index(&root, &src, &repo, &view).await?;
+            println!(
+                "driver:   {}",
+                if summary.incremental {
+                    "incremental (git diff)"
+                } else {
+                    "full walk"
+                }
+            );
             println!("files:    {}", summary.files);
             println!("added:    {}", summary.added);
             println!("modified: {}", summary.modified);

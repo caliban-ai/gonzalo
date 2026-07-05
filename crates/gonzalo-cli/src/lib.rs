@@ -162,6 +162,9 @@ pub struct IndexSummary {
     /// Files skipped because an isolated parse worker crashed or hung on them
     /// (only possible when parsing through the pool).
     pub skipped: usize,
+    /// Whether this run used the git-diff-driven incremental driver (only the
+    /// changed set re-parsed) rather than the full tree walk.
+    pub incremental: bool,
 }
 
 /// Locate the `gonzalo-parse-worker` binary for crash-isolated parsing:
@@ -205,13 +208,17 @@ async fn parse_file(
     }
 }
 
-/// Index the `.rs` files under `src` into the `(repo, view)` code-graph view:
+/// Index the source files under `src` into the `(repo, view)` code-graph view:
 /// parse each file into a content-addressed slice, then reconcile the view's
-/// manifest to the tree (ADR 0012). Re-running updates the view incrementally.
+/// manifest to the tree (ADR 0012). Re-running updates the view.
 ///
-/// This is the full-reconcile ingestion path built on A4's set reconciliation;
-/// a `git diff`-driven incremental driver is a later follow-on. Slices orphaned
-/// by deletions are left for a separate GC pass (which must see all live views).
+/// When `src` is the root of a git repo and a base commit was recorded on a
+/// prior run, the changed set is sourced directly from `git diff` (only the
+/// added/modified files are re-parsed and deleted files dropped) — the
+/// incremental driver of gonzalo#93. Otherwise the full tree is walked. Either
+/// way the manifest is reconciled as a set, so a full walk always converges the
+/// view even if an incremental run ever missed a change. Slices orphaned by
+/// deletions are left for a separate GC pass (which must see all live views).
 pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<IndexSummary> {
     let store = FsStore::new(root);
 
@@ -227,42 +234,40 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
     });
 
     // The persistent per-view graph, queried by the daemon without re-assembly.
-    let mut graph = SqliteGraphStore::open(view_db_path(&root.join("graphs"), repo, view))
+    let db_path = view_db_path(&root.join("graphs"), repo, view);
+    let mut graph = SqliteGraphStore::open(&db_path)
         .with_context(|| format!("opening graph db for {repo}/{view}"))?;
 
-    // Build the desired `path -> slice-hash` set by parsing each supported
-    // source file (by extension), storing its slice write-if-absent (identical
-    // content dedups), and inserting it into the queryable graph.
-    let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
-    let mut skipped = 0usize;
-    for (path, language) in source_files(src)? {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let rel = path
-            .strip_prefix(src)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let Some(slice) = parse_file(pool.as_ref(), language, &content).await else {
-            skipped += 1;
-            continue;
-        };
-        let hash = store.put_blob(&slice.to_slice_bytes()).await?;
-        graph.insert(&rel, slice); // insert replaces this path's rows
-        desired.insert(rel, hash);
-    }
-    let files = desired.len();
-
-    // Reconcile against the view's current manifest (empty if new).
+    // Load the view's current manifest (empty if new).
     let key = Manifest::key(repo, view);
     let existing = store.get(&key).await?;
     let current = match &existing {
         Some(rec) => Manifest::from_body(&rec.body)?,
         None => Manifest::new(),
     };
-    let recon = current.reconcile(&desired);
 
-    // Drop paths removed from the view out of the persistent graph too.
+    // Choose the driver: incremental when `src` is a git repo root, a base was
+    // recorded, and the diff against it is readable; otherwise a full walk.
+    let base_path = db_path.with_extension("base");
+    let recorded_base = std::fs::read_to_string(&base_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let incremental_changed = recorded_base
+        .as_deref()
+        .and_then(|base| gonzalo_store_git::changed_paths(src, base).ok());
+
+    let (desired, files, skipped, incremental) = match incremental_changed {
+        Some(changed) => {
+            build_desired_incremental(&store, &mut graph, pool.as_ref(), src, &current, &changed)
+                .await?
+        }
+        None => build_desired_full(&store, &mut graph, pool.as_ref(), src).await?,
+    };
+
+    // Reconcile against the current manifest and drop removed paths from the
+    // persistent graph.
+    let recon = current.reconcile(&desired);
     for path in &recon.deleted {
         graph.remove_path(path);
     }
@@ -299,13 +304,117 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
         }
     }
 
+    // Record the current HEAD as the base for the next run's incremental diff.
+    // Only succeeds when `src` is a git repo root with at least one commit.
+    if let Ok(sha) = gonzalo_store_git::head_commit(src) {
+        if let Some(parent) = base_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&base_path, sha).ok();
+    }
+
     Ok(IndexSummary {
         files,
         added: recon.added.len(),
         modified: recon.modified.len(),
         deleted: recon.deleted.len(),
         skipped,
+        incremental,
     })
+}
+
+/// Full-walk desired set: parse every supported source file under `src`.
+async fn build_desired_full(
+    store: &FsStore,
+    graph: &mut SqliteGraphStore,
+    pool: Option<&ParserPool>,
+    src: &Path,
+) -> Result<(BTreeMap<String, ContentHash>, usize, usize, bool)> {
+    let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
+    let mut skipped = 0usize;
+    for (path, language) in source_files(src)? {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let rel = path
+            .strip_prefix(src)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Some(slice) = parse_file(pool, language, &content).await else {
+            skipped += 1;
+            continue;
+        };
+        let hash = store.put_blob(&slice.to_slice_bytes()).await?;
+        graph.insert(&rel, slice); // insert replaces this path's rows
+        desired.insert(rel, hash);
+    }
+    let files = desired.len();
+    Ok((desired, files, skipped, false))
+}
+
+/// Incremental desired set: start from the current manifest and apply only the
+/// git-reported changes — re-parse added/modified source files, drop deleted
+/// ones, and carry every unchanged path forward untouched. `files` counts the
+/// files re-parsed this run.
+async fn build_desired_incremental(
+    store: &FsStore,
+    graph: &mut SqliteGraphStore,
+    pool: Option<&ParserPool>,
+    src: &Path,
+    current: &Manifest,
+    changed: &gonzalo_store_git::ChangedPaths,
+) -> Result<(BTreeMap<String, ContentHash>, usize, usize, bool)> {
+    let mut desired = current.entries.clone();
+    let mut files = 0usize;
+    let mut skipped = 0usize;
+
+    for rel in changed.added.iter().chain(changed.modified.iter()) {
+        if !is_indexable(rel) {
+            continue;
+        }
+        let Some(language) = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(Language::from_extension)
+        else {
+            continue; // not a source file
+        };
+        // A file git reports as changed but that we can no longer read (e.g.
+        // it vanished between diff and read) is treated as a removal.
+        let content = match std::fs::read_to_string(src.join(rel)) {
+            Ok(c) => c,
+            Err(_) => {
+                if desired.remove(rel).is_some() {
+                    graph.remove_path(rel);
+                }
+                continue;
+            }
+        };
+        let Some(slice) = parse_file(pool, language, &content).await else {
+            skipped += 1;
+            continue;
+        };
+        let hash = store.put_blob(&slice.to_slice_bytes()).await?;
+        graph.insert(rel, slice);
+        desired.insert(rel.clone(), hash);
+        files += 1;
+    }
+
+    for rel in &changed.deleted {
+        if desired.remove(rel).is_some() {
+            graph.remove_path(rel);
+        }
+    }
+
+    Ok((desired, files, skipped, true))
+}
+
+/// Whether a repo-relative path is eligible for indexing — mirrors the
+/// full-walk skip of `target`, `.git`, and hidden directories so the git driver
+/// and the full walk agree on which paths belong to a view.
+fn is_indexable(rel: &str) -> bool {
+    !rel.split('/')
+        .any(|part| part == "target" || part == ".git" || part.starts_with('.'))
 }
 
 /// Supported source files under `dir` with their [`Language`], sorted by path,
@@ -802,5 +911,82 @@ mod tests {
             g.definitions("gone").is_empty(),
             "deleted file's symbols must be gone from the graph"
         );
+    }
+
+    // ── index: git-driven incremental sync (gonzalo#93) ──────────────────────
+
+    /// Init a git repo at `dir` and commit every current file.
+    fn git_init_commit(dir: &Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@localhost").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_index_of_git_repo_is_full_then_reindex_is_incremental() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        write_file(src.path(), "b.rs", "fn b() {}");
+        git_init_commit(src.path());
+
+        // First run: no recorded base yet → full walk, records the base.
+        let first = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert!(!first.incremental, "first index is a full walk");
+        assert_eq!(first.files, 2);
+        assert_eq!(first.added, 2);
+
+        // Change the working tree: modify a.rs, add untracked c.rs, leave b.rs.
+        write_file(src.path(), "a.rs", "fn a() { helper(); }");
+        write_file(src.path(), "c.rs", "fn c() {}");
+
+        let second = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert!(second.incremental, "second index uses the git diff driver");
+        assert_eq!(second.files, 2, "only a.rs and c.rs are re-parsed");
+        assert_eq!(second.added, 1, "c.rs added");
+        assert_eq!(second.modified, 1, "a.rs modified");
+        assert_eq!(second.deleted, 0);
+
+        // b.rs was carried forward unchanged and is still queryable.
+        let g =
+            SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
+        assert_eq!(g.definitions("b")[0].path, "b.rs");
+        assert_eq!(g.definitions("c")[0].path, "c.rs");
+    }
+
+    #[tokio::test]
+    async fn incremental_index_drops_deleted_files() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "keep.rs", "fn keep() {}");
+        write_file(src.path(), "gone.rs", "fn gone() {}");
+        git_init_commit(src.path());
+        index(root.path(), src.path(), "r", "v").await.unwrap();
+
+        std::fs::remove_file(src.path().join("gone.rs")).unwrap();
+        let summary = index(root.path(), src.path(), "r", "v").await.unwrap();
+        assert!(summary.incremental);
+        assert_eq!(summary.deleted, 1);
+
+        let g =
+            SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "v")).unwrap();
+        assert_eq!(g.definitions("keep").len(), 1);
+        assert!(g.definitions("gone").is_empty(), "deleted file is gone");
+    }
+
+    #[tokio::test]
+    async fn non_git_src_stays_full_walk() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert!(!summary.incremental, "a non-git tree cannot go incremental");
     }
 }
