@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use gonzalo_cli::{gc, get, index, list, migrate, status, sync_stores, ticket_move, ticket_sync};
+use gonzalo_cli::{
+    gc, get, index_with_gc, list, migrate, status, sync_stores, ticket_move, ticket_sync,
+};
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
 
@@ -77,6 +79,10 @@ enum Commands {
         /// View id, e.g. `main`.
         #[arg(long, default_value = "main")]
         view: String,
+        /// After indexing, sweep orphaned slices across all live views (opt-in;
+        /// always a whole-store GC, never a per-view subset).
+        #[arg(long)]
+        gc: bool,
     },
     /// Garbage-collect orphaned code-graph slices, marking against every live
     /// view's manifest across all repos.
@@ -220,8 +226,9 @@ async fn main() -> Result<()> {
             src,
             repo,
             view,
+            gc,
         } => {
-            let summary = index(&root, &src, &repo, &view).await?;
+            let (summary, swept) = index_with_gc(&root, &src, &repo, &view, gc).await?;
             println!(
                 "driver:   {}",
                 if summary.incremental {
@@ -235,6 +242,10 @@ async fn main() -> Result<()> {
             println!("modified: {}", summary.modified);
             println!("deleted:  {}", summary.deleted);
             println!("skipped:  {}", summary.skipped);
+            if let Some(swept) = swept {
+                println!("gc.freed:    {}", swept.freed);
+                println!("gc.retained: {}", swept.retained);
+            }
         }
 
         Commands::Gc { root } => {

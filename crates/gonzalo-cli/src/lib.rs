@@ -495,6 +495,27 @@ pub async fn gc(root: &Path) -> Result<GcSummary> {
     })
 }
 
+/// [`index`] the `(repo, view)` view, then — when `gc_after` — sweep orphaned
+/// slices. The opt-in post-index trigger of gonzalo#104: the sweep runs only
+/// after a successful index and always goes through [`gc`], which marks against
+/// *every* live view's manifest (never a per-view subset), so a slice the just-
+/// indexed view dropped but another view still references is preserved.
+pub async fn index_with_gc(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    gc_after: bool,
+) -> Result<(IndexSummary, Option<GcSummary>)> {
+    let summary = index(root, src, repo, view).await?;
+    let swept = if gc_after {
+        Some(gc(root).await?)
+    } else {
+        None
+    };
+    Ok((summary, swept))
+}
+
 // ─── sync_stores ─────────────────────────────────────────────────────────────
 
 /// Summary returned by [`sync_stores`].
@@ -1064,6 +1085,43 @@ mod tests {
         let g =
             SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
         assert_eq!(g.definitions("a")[0].path, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn index_with_gc_sweeps_orphans_when_enabled() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        // Reindex changed content with the post-index sweep on: the pre-edit
+        // slice is orphaned and should be freed in the same call.
+        write_file(src.path(), "a.rs", "fn a() { b(); }");
+        let (_summary, swept) = index_with_gc(root.path(), src.path(), "r", "main", true)
+            .await
+            .unwrap();
+        let swept = swept.expect("gc runs when enabled");
+        assert_eq!(swept.freed, 1, "orphaned slice swept during the index");
+
+        // A follow-up gc finds nothing left to free.
+        assert_eq!(gc(root.path()).await.unwrap().freed, 0);
+    }
+
+    #[tokio::test]
+    async fn index_with_gc_skips_sweep_when_disabled() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        write_file(src.path(), "a.rs", "fn a() { b(); }");
+        let (_summary, swept) = index_with_gc(root.path(), src.path(), "r", "main", false)
+            .await
+            .unwrap();
+        assert!(swept.is_none(), "no gc when disabled");
+
+        // The orphan survived: an explicit gc still has one to free.
+        assert_eq!(gc(root.path()).await.unwrap().freed, 1);
     }
 
     #[tokio::test]
