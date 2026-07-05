@@ -14,6 +14,10 @@ use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::{Config, Connection, parse_category};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+mod watch;
+pub use watch::{WatchConfig, watch};
 
 // ─── list ────────────────────────────────────────────────────────────────────
 
@@ -514,6 +518,51 @@ pub async fn index_with_gc(
         None
     };
     Ok((summary, swept))
+}
+
+// ─── watch (debounce core) ──────────────────────────────────────────────────
+
+/// Coalesces a burst of filesystem change notifications so a rapid series of
+/// edits triggers a single re-index rather than one per event. The clock is
+/// injected (`now`), so the logic is deterministic and unit-testable without
+/// real sleeps — the seam the watcher loop drives with `Instant::now()`.
+#[derive(Debug)]
+pub struct Debouncer {
+    window: Duration,
+    /// When the most recent unhandled change was observed.
+    last_event: Option<Instant>,
+}
+
+impl Debouncer {
+    /// A debouncer that fires once the tree has been quiet for `window`.
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_event: None,
+        }
+    }
+
+    /// Record that a change was observed at `now`.
+    pub fn on_event(&mut self, now: Instant) {
+        self.last_event = Some(now);
+    }
+
+    /// Whether a change is waiting to be handled.
+    pub fn is_pending(&self) -> bool {
+        self.last_event.is_some()
+    }
+
+    /// Whether a re-index is due at `now`: a change is pending and the tree has
+    /// been quiet for at least `window` since the last event. False when nothing
+    /// is pending.
+    pub fn is_due(&self, now: Instant) -> bool {
+        matches!(self.last_event, Some(t) if now.duration_since(t) >= self.window)
+    }
+
+    /// Clear the pending change after a re-index has run.
+    pub fn clear(&mut self) {
+        self.last_event = None;
+    }
 }
 
 // ─── sync_stores ─────────────────────────────────────────────────────────────
@@ -1122,6 +1171,49 @@ mod tests {
 
         // The orphan survived: an explicit gc still has one to free.
         assert_eq!(gc(root.path()).await.unwrap().freed, 1);
+    }
+
+    // ── watch: debounce core (gonzalo#100) ──────────────────────────────────
+
+    #[test]
+    fn debouncer_not_due_without_events() {
+        let d = Debouncer::new(Duration::from_millis(500));
+        assert!(!d.is_pending());
+        assert!(!d.is_due(Instant::now()));
+    }
+
+    #[test]
+    fn debouncer_due_only_after_quiet_window() {
+        let t0 = Instant::now();
+        let mut d = Debouncer::new(Duration::from_millis(500));
+        d.on_event(t0);
+        assert!(d.is_pending());
+        // Still inside the window → not due.
+        assert!(!d.is_due(t0 + Duration::from_millis(499)));
+        // Window elapsed → due.
+        assert!(d.is_due(t0 + Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn debouncer_coalesces_a_burst() {
+        let t0 = Instant::now();
+        let mut d = Debouncer::new(Duration::from_millis(500));
+        d.on_event(t0);
+        d.on_event(t0 + Duration::from_millis(200)); // second edit resets the clock
+        // 500ms after the *first* event is not enough — the burst is still hot.
+        assert!(!d.is_due(t0 + Duration::from_millis(500)));
+        // 500ms after the *last* event → due, and only once for the whole burst.
+        assert!(d.is_due(t0 + Duration::from_millis(700)));
+    }
+
+    #[test]
+    fn debouncer_clear_resets_pending() {
+        let t0 = Instant::now();
+        let mut d = Debouncer::new(Duration::from_millis(500));
+        d.on_event(t0);
+        d.clear();
+        assert!(!d.is_pending());
+        assert!(!d.is_due(t0 + Duration::from_secs(10)));
     }
 
     #[tokio::test]

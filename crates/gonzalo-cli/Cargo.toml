@@ -19,8 +19,9 @@ gonzalo-ticket        = { workspace = true }
 gonzalo-ticket-config = { workspace = true }
 clap   = { version = "4", features = ["derive"] }
 anyhow = "1"
-tokio  = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio  = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 serde_json = { workspace = true }
+notify = "8"
 
 [dev-dependencies]
 tempfile = { workspace = true }

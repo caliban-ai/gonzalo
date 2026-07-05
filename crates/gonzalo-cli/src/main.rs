@@ -3,10 +3,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
-    gc, get, index_with_gc, list, migrate, status, sync_stores, ticket_move, ticket_sync,
+    WatchConfig, gc, get, index_with_gc, list, migrate, status, sync_stores, ticket_move,
+    ticket_sync, watch,
 };
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Admin/ops CLI for the gonzalo persistence layer.
 #[derive(Parser)]
@@ -83,6 +85,16 @@ enum Commands {
         /// always a whole-store GC, never a per-view subset).
         #[arg(long)]
         gc: bool,
+        /// Keep running: re-index on filesystem changes (debounced) with a
+        /// periodic full reconcile, until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// In `--watch`, quiet period after the last change before re-indexing.
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
+        /// In `--watch`, seconds between self-healing full reconciles.
+        #[arg(long, default_value_t = 300)]
+        reconcile_secs: u64,
     },
     /// Garbage-collect orphaned code-graph slices, marking against every live
     /// view's manifest across all repos.
@@ -227,7 +239,18 @@ async fn main() -> Result<()> {
             repo,
             view,
             gc,
+            watch: watch_mode,
+            debounce_ms,
+            reconcile_secs,
         } => {
+            if watch_mode {
+                let config = WatchConfig {
+                    debounce: Duration::from_millis(debounce_ms),
+                    full_reconcile: Duration::from_secs(reconcile_secs),
+                };
+                watch(&root, &src, &repo, &view, config).await?;
+                return Ok(());
+            }
             let (summary, swept) = index_with_gc(&root, &src, &repo, &view, gc).await?;
             println!(
                 "driver:   {}",
