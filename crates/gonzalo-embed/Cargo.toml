@@ -1,0 +1,27 @@
+[package]
+name = "gonzalo-embed"
+description = "Local CPU sentence-embedding Embedder for gonzalo (Candle + all-MiniLM)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+gonzalo-core = { workspace = true }
+gonzalo-vector = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
