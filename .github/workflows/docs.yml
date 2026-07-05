@@ -60,6 +60,9 @@ jobs:
       - name: Ingest ADRs
         run: ./docs/guide/sync-adrs.sh
 
+      - name: Ingest changelog
+        run: ./docs/guide/sync-changelog.sh
+
       - name: Build the guide
         run: mdbook build docs/guide
 
