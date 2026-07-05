@@ -27,6 +27,12 @@ members = [
     "crates/gonzalo-cli",
 ]
 
+# The ANN head-to-head benchmark (hnsw_rs vs usearch, #9/ADR 0014) is excluded
+# from the workspace: usearch bundles a C++ library, and keeping the bench out of
+# `--workspace` means CI's `--all-features --all-targets` never compiles it. Run
+# it manually: `cd crates/gonzalo-vector-bench && cargo run --release`.
+exclude = ["crates/gonzalo-vector-bench"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
