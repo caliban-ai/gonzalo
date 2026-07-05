@@ -1503,6 +1503,7 @@ dependencies = [
 name = "gonzalo-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "gonzalo-core",
  "gonzalo-graph",
@@ -1520,6 +1521,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower 0.5.3",
 ]
 
 [[package]]

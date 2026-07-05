@@ -18,6 +18,8 @@ use std::sync::Arc;
 /// `Authorization: Bearer <token>`.
 pub fn router(service: Service, auth: Option<String>) -> Router {
     let mut app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route(
             "/v1/records/{ns}/{col}/{id}",
             get(get_record).put(put_record),
@@ -35,6 +37,12 @@ pub fn router(service: Service, auth: Option<String>) -> Router {
         app = app.layer(from_fn(move |req: Request, next: Next| {
             let token = token.clone();
             async move {
+                // Health/readiness probes are unauthenticated: k8s liveness and
+                // readiness checks carry no bearer token, and a probe gated
+                // behind auth would fail closed and get the pod killed.
+                if is_probe_path(req.uri().path()) {
+                    return next.run(req).await;
+                }
                 let ok = bearer(req.headers())
                     .map(|t| t == token.as_str())
                     .unwrap_or(false);
@@ -47,6 +55,28 @@ pub fn router(service: Service, auth: Option<String>) -> Router {
         }));
     }
     app
+}
+
+/// Paths served without authentication (k8s probes).
+fn is_probe_path(path: &str) -> bool {
+    path == "/healthz" || path == "/readyz"
+}
+
+/// Liveness: the process is up and serving. No store access — a `/healthz` that
+/// touched the store would conflate liveness with readiness and kill a pod that
+/// is merely waiting on its backend.
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// Readiness: `200` when the backing store is reachable, `503` otherwise, so a
+/// load balancer only routes to replicas that can actually serve.
+async fn readyz(State(svc): State<Arc<Service>>) -> Response {
+    if svc.ready().await {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
+    }
 }
 
 fn bearer(h: &HeaderMap) -> Option<&str> {
@@ -177,4 +207,98 @@ pub async fn serve_http(
     auth: Option<String>,
 ) -> std::io::Result<()> {
     axum::serve(listener, router(service, auth)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use gonzalo_core::{CoreError, Record, Result as CoreResult, Revision, Store};
+    use gonzalo_store_fs::FsStore;
+    use tempfile::TempDir;
+    use tower::ServiceExt; // oneshot
+
+    /// A Service backed by a fresh filesystem store (reachable → ready).
+    fn fs_service() -> (Service, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let fs = Arc::new(FsStore::new(dir.path()));
+        (Service::new(fs.clone(), fs), dir)
+    }
+
+    async fn status_of(service: Service, auth: Option<String>, path: &str) -> StatusCode {
+        router(service, auth)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn healthz_is_ok() {
+        let (svc, _dir) = fs_service();
+        assert_eq!(status_of(svc, None, "/healthz").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_ok_when_store_reachable() {
+        let (svc, _dir) = fs_service();
+        assert_eq!(status_of(svc, None, "/readyz").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn probes_bypass_auth_but_other_routes_do_not() {
+        let auth = Some("secret".to_string());
+        let (svc, _d1) = fs_service();
+        assert_eq!(
+            status_of(svc, auth.clone(), "/healthz").await,
+            StatusCode::OK,
+            "healthz must not require a token"
+        );
+        let (svc, _d2) = fs_service();
+        assert_eq!(
+            status_of(svc, auth.clone(), "/readyz").await,
+            StatusCode::OK,
+            "readyz must not require a token"
+        );
+        // A normal route without the token is still rejected.
+        let (svc, _d3) = fs_service();
+        assert_eq!(
+            status_of(svc, auth, "/v1/keys").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// A store whose every operation fails — models an unreachable backend.
+    struct DownStore;
+
+    #[async_trait::async_trait]
+    impl Store for DownStore {
+        async fn get(&self, _key: &RecordKey) -> CoreResult<Option<Record>> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn put(&self, _record: Record, _expected: Option<Revision>) -> CoreResult<PutResult> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn list(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn readyz_is_503_when_store_unreachable() {
+        let dir = TempDir::new().unwrap();
+        // Records via the down store; blobs via fs (readiness only probes records).
+        let blobs = Arc::new(FsStore::new(dir.path()));
+        let svc = Service::new(Arc::new(DownStore), blobs);
+        assert_eq!(
+            status_of(svc, None, "/readyz").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
