@@ -1,0 +1,18 @@
+# Standalone workspace: this crate is `exclude`d from the parent workspace, so it
+# declares its own empty workspace to detach from it.
+[workspace]
+
+[package]
+name = "gonzalo-vector-bench"
+description = "ANN head-to-head benchmark for gonzalo-vector (hnsw_rs vs usearch, #9/ADR 0014)"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# Intentionally NOT a workspace member (see the root Cargo.toml `exclude`): it
+# pulls usearch's bundled C++, which we keep out of the workspace/CI build.
+
+[dependencies]
+hnsw_rs = "0.3"
+usearch = "2"

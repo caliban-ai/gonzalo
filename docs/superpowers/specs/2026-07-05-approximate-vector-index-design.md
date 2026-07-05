@@ -103,10 +103,16 @@ C++ never reaches CI. It depends on `gonzalo-vector` (`hnsw`), `hnsw_rs`,
 - **Recall@10** vs brute-force ground truth (per backend),
 - **Insert throughput** and **single-query latency** (per backend).
 
-Run manually: `cargo bench` from inside the crate. Results are recorded in the
-crate README and summarized here after the run. If `usearch` will not build
-locally, the fallback is hnsw_rs-only numbers plus the documented rationale
-above.
+Run manually: `cargo run --release` from inside the crate. Results are recorded
+in the crate README.
+
+**Outcome (N=10k, dim=384, k=10):** hnsw_rs and usearch are close — usearch
+builds/queries somewhat faster, hnsw_rs had marginally higher recall on the test
+data; both are easily fast enough for gonzalo's scale. So choosing hnsw_rs for
+the pure-Rust build costs little performance, and the one real tradeoff
+(deletion) is handled by the tombstone/rebuild layer. (Absolute recall reads low
+only because uniform-random high-dim vectors are near-equidistant; real clustered
+embeddings recall far higher — see the README.)
 
 ## Testing
 

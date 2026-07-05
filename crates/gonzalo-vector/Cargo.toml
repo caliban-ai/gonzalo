@@ -11,9 +11,15 @@ repository.workspace = true
 [dependencies]
 gonzalo-core = { workspace = true }
 async-trait  = { workspace = true }
+hnsw_rs = { version = "0.3.4", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Approximate ANN backend (`HnswVectorIndex`), off by default so the exact
+# `MemoryVectorIndex` stays the zero-dependency default (ADR 0014).
+hnsw = ["dep:hnsw_rs"]

@@ -10,6 +10,11 @@
 pub mod index;
 pub use index::MemoryVectorIndex;
 
+#[cfg(feature = "hnsw")]
+pub mod hnsw;
+#[cfg(feature = "hnsw")]
+pub use hnsw::HnswVectorIndex;
+
 use async_trait::async_trait;
 use gonzalo_core::{KeyPrefix, RecordKey, Result};
 
