@@ -37,6 +37,7 @@ where
     get_absent_returns_none(&factory().await).await;
     put_then_get_roundtrips(&factory().await).await;
     stale_expected_returns_conflict(&factory().await).await;
+    update_commits_then_stale_update_conflicts(&factory().await).await;
     list_filters_by_prefix(&factory().await).await;
 }
 
@@ -72,6 +73,45 @@ async fn stale_expected_returns_conflict<S: Store>(store: &S) {
         }
         PutResult::Committed(_) => panic!("expected conflict for stale write"),
     }
+}
+
+async fn update_commits_then_stale_update_conflicts<S: Store>(store: &S) {
+    let key = RecordKey::new("ns", "col", "upd");
+
+    // Create v1.
+    let v1 = sample(key.clone(), b"v1");
+    let rev1 = match store.put(v1, None).await.unwrap() {
+        PutResult::Committed(rev) => rev,
+        PutResult::Conflict(_) => panic!("unexpected conflict on create"),
+    };
+
+    // Update with the correct `expected` revision commits.
+    let mut v2 = sample(key.clone(), b"v2");
+    v2.parent = Some(rev1.clone());
+    v2.revision = rev1.next(b"v2");
+    let rev2 = match store.put(v2, Some(rev1.clone())).await.unwrap() {
+        PutResult::Committed(rev) => rev,
+        PutResult::Conflict(_) => panic!("update with correct expected must commit"),
+    };
+    assert_ne!(rev2, rev1, "an update produces a new revision");
+
+    // A writer who still holds `rev1` tries to update again: conflict against
+    // the now-current `rev2`. On a store with native conditional writes this is
+    // enforced atomically at the object level (`If-Match`), not just by the
+    // pre-read — closing the read-then-write TOCTOU.
+    let mut stale = sample(key.clone(), b"v3-from-stale-writer");
+    stale.parent = Some(rev1.clone());
+    stale.revision = rev1.next(b"v3");
+    match store.put(stale, Some(rev1)).await.unwrap() {
+        PutResult::Conflict(c) => {
+            assert_eq!(c.key, key);
+            assert_eq!(c.current.revision, rev2);
+        }
+        PutResult::Committed(_) => panic!("stale update must conflict"),
+    }
+
+    // The winning value is still readable and is v2.
+    assert_eq!(store.get(&key).await.unwrap().unwrap().revision, rev2);
 }
 
 /// Run the full blob-store suite against a store produced by `factory`
