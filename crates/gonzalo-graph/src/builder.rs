@@ -1,7 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
-//! language-parameterized ([`Language`]); Rust, Python, JavaScript, and
-//! TypeScript/TSX are supported, and a new grammar is a matter of adding its
-//! node-kind mappings.
+//! language-parameterized ([`Language`]); Rust, Python, JavaScript,
+//! TypeScript/TSX, and Go are supported, and a new grammar is a matter of adding
+//! its node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ pub enum Language {
     TypeScript,
     /// TypeScript with JSX (`.tsx`).
     Tsx,
+    Go,
 }
 
 impl Language {
@@ -28,6 +29,7 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
+            "go" => Some(Self::Go),
             _ => None,
         }
     }
@@ -39,6 +41,7 @@ impl Language {
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
         }
     }
 
@@ -70,6 +73,19 @@ impl Language {
                 "enum_declaration" => Some(SymbolKind::Enum),
                 _ => None,
             }),
+            // Go names a type on the `type_spec`, but struct vs interface is
+            // determined by its inner `type` node — so the symbol is defined at
+            // the `struct_type`/`interface_type` node, and `item_name` reaches
+            // back to the enclosing `type_spec` for the name. `const`/`var` specs
+            // are best-effort (first name of a possibly multi-name spec).
+            Self::Go => match node_kind {
+                "function_declaration" | "method_declaration" => Some(SymbolKind::Function),
+                "struct_type" => Some(SymbolKind::Struct),
+                "interface_type" => Some(SymbolKind::Interface),
+                "const_spec" => Some(SymbolKind::Const),
+                "var_spec" => Some(SymbolKind::Static),
+                _ => None,
+            },
         }
     }
 
@@ -81,6 +97,14 @@ impl Language {
                 .child_by_field_name("type")
                 .and_then(|n| node_text(n, bytes))
                 .map(str::to_string),
+            // Go `struct_type`/`interface_type` carry no name; the name lives on
+            // the enclosing `type_spec`. Anonymous types (no `type_spec` parent
+            // with a name) yield `None` and are skipped.
+            (Self::Go, SymbolKind::Struct | SymbolKind::Interface) => node
+                .parent()
+                .and_then(|p| p.child_by_field_name("name"))
+                .and_then(|n| node_text(n, bytes))
+                .map(str::to_string),
             _ => name_field(node, bytes),
         }
     }
@@ -88,7 +112,7 @@ impl Language {
     /// Whether `node_kind` is a call expression for this language.
     fn is_call(self, node_kind: &str) -> bool {
         match self {
-            Self::Rust | Self::JavaScript | Self::TypeScript | Self::Tsx => {
+            Self::Rust | Self::JavaScript | Self::TypeScript | Self::Tsx | Self::Go => {
                 node_kind == "call_expression"
             }
             Self::Python => node_kind == "call",
@@ -126,6 +150,15 @@ impl Language {
                 // obj.method(...) -> the member expression's `property` field
                 "member_expression" => func
                     .child_by_field_name("property")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string),
+                _ => node_text(func, bytes).map(str::to_string),
+            },
+            Self::Go => match func.kind() {
+                "identifier" => node_text(func, bytes).map(str::to_string),
+                // pkg.Func(...) / x.Method(...) -> the selector's `field`.
+                "selector_expression" => func
+                    .child_by_field_name("field")
                     .and_then(|n| node_text(n, bytes))
                     .map(str::to_string),
                 _ => node_text(func, bytes).map(str::to_string),
@@ -315,6 +348,7 @@ def main():
         assert_eq!(Language::from_extension("jsx"), Some(Language::JavaScript));
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("tsx"), Some(Language::Tsx));
+        assert_eq!(Language::from_extension("go"), Some(Language::Go));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -386,6 +420,64 @@ function compute(r: number): number { return r * r; }
             g.references
                 .iter()
                 .any(|r| r.name == "compute" && r.from.as_deref() == Some("area"))
+        );
+    }
+
+    const GO_SRC: &str = r#"
+package main
+
+type Widget struct { n int }
+
+type Shape interface { Area() int }
+
+const Limit = 10
+
+var counter = 0
+
+func helper(x int) int { return x + 1 }
+
+func (w Widget) Area() int { return helper(w.n) }
+
+func main() {
+	w := Widget{n: 1}
+	_ = w.Area()
+	_ = helper(2)
+}
+"#;
+
+    #[test]
+    fn go_extracts_definitions() {
+        let g = build(Language::Go, GO_SRC);
+        let names: Vec<(&str, SymbolKind)> = g
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect();
+        assert!(names.contains(&("Widget", SymbolKind::Struct)));
+        assert!(names.contains(&("Shape", SymbolKind::Interface)));
+        assert!(names.contains(&("helper", SymbolKind::Function)));
+        assert!(names.contains(&("Area", SymbolKind::Function)));
+        assert!(names.contains(&("main", SymbolKind::Function)));
+        assert!(names.contains(&("Limit", SymbolKind::Const)));
+        assert!(names.contains(&("counter", SymbolKind::Static)));
+    }
+
+    #[test]
+    fn go_records_calls_including_methods() {
+        let g = build(Language::Go, GO_SRC);
+        // Plain call `helper(...)` from inside the `Area` method.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("Area")),
+            "helper call from Area"
+        );
+        // Method call `w.Area()` -> selector-expression field `Area`, from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "Area" && r.from.as_deref() == Some("main")),
+            "w.Area() call from main"
         );
     }
 

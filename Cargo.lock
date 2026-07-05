@@ -1431,6 +1431,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tree-sitter",
+ "tree-sitter-go",
  "tree-sitter-javascript",
  "tree-sitter-python",
  "tree-sitter-rust",
@@ -2763,7 +2764,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3814,6 +3815,16 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 
