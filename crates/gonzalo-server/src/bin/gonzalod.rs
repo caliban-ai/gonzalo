@@ -8,12 +8,13 @@
 //! - `GONZALO_S3_REGION` — s3 region override (optional)
 //! - `GONZALO_HTTP_ADDR` — HTTP/JSON bind address (default `127.0.0.1:8080`)
 //! - `GONZALO_GRPC_ADDR` — gRPC bind address (default `127.0.0.1:50051`)
-//! - `GONZALO_TOKEN`     — if set, require `Authorization: Bearer <token>`
+//! - `GONZALO_AUTH_FILE` — TOML principals file for namespace-scoped auth
+//! - `GONZALO_TOKEN`     — single admin token (used when no auth file is set)
 //!
 //! Credentials for s3 come from the standard `AWS_*` environment.
 
 use gonzalo_core::{BlobStore, Store};
-use gonzalo_server::{Service, StoreConfig, serve_grpc, serve_http};
+use gonzalo_server::{Auth, Service, StoreConfig, serve_grpc, serve_http};
 use gonzalo_store_fs::FsStore;
 use gonzalo_store_s3::S3Store;
 use std::sync::Arc;
@@ -23,7 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_addr = std::env::var("GONZALO_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let grpc_addr = std::env::var("GONZALO_GRPC_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".into());
 
-    let token = std::env::var("GONZALO_TOKEN").ok();
+    // GONZALO_AUTH_FILE (scoped principals) > GONZALO_TOKEN (single admin) > open.
+    let auth = Arc::new(Auth::from_env(
+        |k| std::env::var(k).ok(),
+        |path| std::fs::read_to_string(path).map_err(|e| e.to_string()),
+    )?);
+    let auth_on = !matches!(*auth, Auth::Disabled);
 
     // Select the storage substrate from the environment. One store backs both
     // the record store and the content-addressed blob store (each backend
@@ -66,11 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_listener = tokio::net::TcpListener::bind(&grpc_addr).await?;
     eprintln!(
         "gonzalod: store {substrate}, HTTP on {http_addr}, gRPC on {grpc_addr}, auth {}",
-        if token.is_some() { "on" } else { "off" }
+        if auth_on { "on" } else { "off" }
     );
 
-    let http = tokio::spawn(serve_http(http_listener, service.clone(), token.clone()));
-    let grpc = tokio::spawn(serve_grpc(grpc_listener, service, token));
+    let http = tokio::spawn(serve_http(http_listener, service.clone(), auth.clone()));
+    let grpc = tokio::spawn(serve_grpc(grpc_listener, service, auth));
 
     tokio::select! {
         r = http => { r??; }

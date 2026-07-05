@@ -2,24 +2,67 @@
 //! `Service`, carrying `gonzalo-core` types as JSON payloads.
 
 use crate::Service;
-use gonzalo_core::{KeyPrefix, PutResult, Record, RecordKey, Revision};
+use crate::auth::{Access, Auth, Principal};
+use gonzalo_core::{Identity, KeyPrefix, PutResult, Record, RecordKey, Revision};
 use gonzalo_proto::v1::{
     GetRequest, GetResponse, GraphLocatedResponse, GraphNamesResponse, GraphQueryRequest,
     ListRequest, ListResponse, PutRequest, PutResponse, TicketSyncRequest, TicketSyncResponse,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };
 use serde::Serialize;
+use std::sync::Arc;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
-/// Adapts [`Service`] to the generated gRPC trait.
+/// Adapts [`Service`] to the generated gRPC trait, enforcing namespace-scoped
+/// auth (ADR 0015) per call from the request's bearer metadata.
 pub struct GrpcAdapter {
     service: Service,
+    auth: Arc<Auth>,
 }
 
 impl GrpcAdapter {
+    /// Adapter with auth disabled (open) — used by tests and open deployments.
     pub fn new(service: Service) -> Self {
-        Self { service }
+        Self::with_auth(service, Arc::new(Auth::Disabled))
     }
+
+    /// Adapter enforcing `auth`.
+    pub fn with_auth(service: Service, auth: Arc<Auth>) -> Self {
+        Self { service, auth }
+    }
+
+    /// Authenticate the call's bearer token and authorize `access` on
+    /// `namespace`. Returns the [`Principal`] (for author stamping on writes).
+    #[allow(clippy::result_large_err)]
+    fn authorize(
+        &self,
+        metadata: &MetadataMap,
+        access: Access,
+        namespace: &str,
+    ) -> Result<Principal, Status> {
+        let principal = self
+            .auth
+            .authenticate(bearer(metadata))
+            .ok_or_else(|| Status::unauthenticated("invalid or missing token"))?;
+        if principal.allows(access, namespace) {
+            Ok(principal)
+        } else {
+            Err(Status::permission_denied(format!(
+                "principal {:?} lacks {access:?} on namespace {namespace:?}",
+                principal.name()
+            )))
+        }
+    }
+}
+
+/// The bearer token from gRPC `authorization: Bearer <token>` metadata.
+fn bearer(metadata: &MetadataMap) -> Option<&str> {
+    metadata
+        .get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> Status {
@@ -29,7 +72,8 @@ fn internal<E: std::fmt::Display>(e: E) -> Status {
 #[tonic::async_trait]
 impl Gonzalo for GrpcAdapter {
     async fn get(&self, req: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.namespace)?;
         let key = RecordKey::new(r.namespace, r.collection, r.id);
         let rec = self.service.get(&key).await.map_err(internal)?;
         let resp = match rec {
@@ -46,10 +90,16 @@ impl Gonzalo for GrpcAdapter {
     }
 
     async fn put(&self, req: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-        let r = req.into_inner();
-        let record: Record = serde_json::from_slice(&r.record_json).map_err(internal)?;
+        let (metadata, _ext, r) = req.into_parts();
+        let mut record: Record = serde_json::from_slice(&r.record_json).map_err(internal)?;
         let expected: Option<Revision> =
             serde_json::from_slice(&r.expected_json).map_err(internal)?;
+        let principal = self.authorize(&metadata, Access::Write, &record.key.namespace)?;
+        // Stamp the author from the authenticated principal — unforgeable (ADR
+        // 0015). Open mode (no auth) leaves the record's author untouched.
+        if principal.is_authenticated() {
+            record.meta.author = Identity::new(principal.name());
+        }
         let outcome = self.service.put(record, expected).await.map_err(internal)?;
         let resp = match outcome {
             PutResult::Committed(rev) => PutResponse {
@@ -65,7 +115,14 @@ impl Gonzalo for GrpcAdapter {
     }
 
     async fn list(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        // Listing without a namespace spans all namespaces → requires admin
+        // (`read` on `"*"`); a namespaced list needs read on that namespace.
+        self.authorize(
+            &metadata,
+            Access::Read,
+            r.namespace.as_deref().unwrap_or("*"),
+        )?;
         let prefix = KeyPrefix {
             namespace: r.namespace,
             collection: r.collection,
@@ -83,7 +140,9 @@ impl Gonzalo for GrpcAdapter {
         &self,
         req: Request<TicketSyncRequest>,
     ) -> Result<Response<TicketSyncResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        // Ticket sync writes records in the `tickets` namespace.
+        self.authorize(&metadata, Access::Write, "tickets")?;
         let conn: gonzalo_ticket_config::Connection = serde_json::from_slice(&r.connection_json)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let summary = self
@@ -105,7 +164,8 @@ impl Gonzalo for GrpcAdapter {
         &self,
         req: Request<GraphQueryRequest>,
     ) -> Result<Response<GraphLocatedResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.repo)?;
         let items = self
             .service
             .graph_definitions(&r.repo, &r.view_id, &r.name)
@@ -118,7 +178,8 @@ impl Gonzalo for GrpcAdapter {
         &self,
         req: Request<GraphQueryRequest>,
     ) -> Result<Response<GraphLocatedResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.repo)?;
         let items = self
             .service
             .graph_references_to(&r.repo, &r.view_id, &r.name)
@@ -131,7 +192,8 @@ impl Gonzalo for GrpcAdapter {
         &self,
         req: Request<GraphQueryRequest>,
     ) -> Result<Response<GraphNamesResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.repo)?;
         let names = self
             .service
             .graph_callers_of(&r.repo, &r.view_id, &r.name)
@@ -144,7 +206,8 @@ impl Gonzalo for GrpcAdapter {
         &self,
         req: Request<GraphQueryRequest>,
     ) -> Result<Response<GraphNamesResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.repo)?;
         let names = self
             .service
             .graph_callees(&r.repo, &r.view_id, &r.name)
@@ -157,7 +220,8 @@ impl Gonzalo for GrpcAdapter {
         &self,
         req: Request<GraphQueryRequest>,
     ) -> Result<Response<GraphNamesResponse>, Status> {
-        let r = req.into_inner();
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.repo)?;
         let names = self
             .service
             .graph_impact(&r.repo, &r.view_id, &r.name)
@@ -181,49 +245,20 @@ fn located_response<T: Serialize>(items: &[T]) -> Result<GraphLocatedResponse, S
     Ok(GraphLocatedResponse { items_json })
 }
 
-/// Serve gRPC on an already-bound listener until the process ends. When
-/// `auth` is `Some`, every call must carry `authorization: Bearer <token>`.
-// The interceptor must return `Result<_, tonic::Status>`; `Status` is large
-// but its type is fixed by tonic's API, so the large-err lint can't be acted on.
-#[allow(clippy::result_large_err)]
+/// Serve gRPC on an already-bound listener until the process ends. `auth`
+/// governs per-call namespace authorization (ADR 0015); `Auth::Disabled` serves
+/// open.
 pub async fn serve_grpc(
     listener: tokio::net::TcpListener,
     service: Service,
-    auth: Option<String>,
+    auth: Arc<Auth>,
 ) -> Result<(), tonic::transport::Error> {
-    let adapter = GrpcAdapter::new(service);
+    let adapter = GrpcAdapter::with_auth(service, auth);
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    match auth {
-        Some(token) => {
-            let intercepted = GonzaloServer::with_interceptor(
-                adapter,
-                move |req: Request<()>| -> Result<Request<()>, Status> {
-                    let ok = req
-                        .metadata()
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.strip_prefix("Bearer "))
-                        .map(|t| t == token)
-                        .unwrap_or(false);
-                    if ok {
-                        Ok(req)
-                    } else {
-                        Err(Status::unauthenticated("invalid or missing token"))
-                    }
-                },
-            );
-            tonic::transport::Server::builder()
-                .add_service(intercepted)
-                .serve_with_incoming(incoming)
-                .await
-        }
-        None => {
-            tonic::transport::Server::builder()
-                .add_service(GonzaloServer::new(adapter))
-                .serve_with_incoming(incoming)
-                .await
-        }
-    }
+    tonic::transport::Server::builder()
+        .add_service(GonzaloServer::new(adapter))
+        .serve_with_incoming(incoming)
+        .await
 }
 
 #[cfg(test)]
@@ -290,6 +325,133 @@ mod tests {
         let located: Located<Symbol> = serde_json::from_slice(&resp.items_json[0]).unwrap();
         assert_eq!(located.path, "lib.rs");
         assert_eq!(located.item.name, "helper");
+    }
+
+    // --- namespace-scoped auth (ADR 0015) ---
+
+    use std::collections::HashMap;
+
+    /// A `writer` principal scoped to the `memory` namespace, plus an `admin`.
+    fn scoped_auth() -> Arc<Auth> {
+        Arc::new(Auth::Enabled(HashMap::from([
+            (
+                "wtok".to_string(),
+                Principal::new("writer", vec!["memory".into()], vec!["memory".into()]),
+            ),
+            ("atok".to_string(), Principal::admin("admin")),
+        ])))
+    }
+
+    fn with_token<T>(msg: T, token: &str) -> Request<T> {
+        let mut req = Request::new(msg);
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        req
+    }
+
+    fn fs_adapter(auth: Arc<Auth>) -> GrpcAdapter {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        GrpcAdapter::with_auth(Service::new(fs.clone(), fs), auth)
+    }
+
+    fn get_req(namespace: &str) -> GetRequest {
+        GetRequest {
+            namespace: namespace.into(),
+            collection: "col".into(),
+            id: "x".into(),
+        }
+    }
+
+    fn put_req(namespace: &str, author: &str) -> PutRequest {
+        let record = Record {
+            revision: Revision::initial(b"{}"),
+            parent: None,
+            body: gonzalo_core::Body::Inline(b"{}".to_vec()),
+            kind: RecordKind::MemoryTier,
+            meta: Meta {
+                author: Identity::new(author),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            key: RecordKey::new(namespace, "col", "x"),
+        };
+        PutRequest {
+            record_json: serde_json::to_vec(&record).unwrap(),
+            expected_json: serde_json::to_vec(&Option::<Revision>::None).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_token_is_unauthenticated() {
+        let adapter = fs_adapter(scoped_auth());
+        let err = adapter
+            .get(Request::new(get_req("memory")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn read_is_allowed_in_scope_denied_out_of_scope() {
+        let adapter = fs_adapter(scoped_auth());
+        // In-scope read succeeds (record absent → found:false, but authorized).
+        assert!(
+            adapter
+                .get(with_token(get_req("memory"), "wtok"))
+                .await
+                .is_ok()
+        );
+        // Out-of-scope read is denied.
+        let err = adapter
+            .get(with_token(get_req("secrets"), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn write_is_scoped_and_author_is_stamped() {
+        let adapter = fs_adapter(scoped_auth());
+        // Write outside scope is denied.
+        let err = adapter
+            .put(with_token(put_req("secrets", "writer"), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // In-scope write commits — even though the client claimed author
+        // "forged", the daemon stamps the authenticated principal.
+        adapter
+            .put(with_token(put_req("memory", "forged"), "wtok"))
+            .await
+            .unwrap();
+        let resp = adapter
+            .get(with_token(get_req("memory"), "wtok"))
+            .await
+            .unwrap()
+            .into_inner();
+        let record: Record = serde_json::from_slice(&resp.record_json).unwrap();
+        assert_eq!(record.meta.author, Identity::new("writer"));
+    }
+
+    #[tokio::test]
+    async fn list_without_namespace_requires_admin() {
+        let adapter = fs_adapter(scoped_auth());
+        let scoped = adapter
+            .list(with_token(ListRequest::default(), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(scoped.code(), tonic::Code::PermissionDenied);
+        // Admin (wildcard) may list across all namespaces.
+        assert!(
+            adapter
+                .list(with_token(ListRequest::default(), "atok"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

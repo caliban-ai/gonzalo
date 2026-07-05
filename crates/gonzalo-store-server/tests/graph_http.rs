@@ -55,7 +55,11 @@ async fn http_serves_graph_queries() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http(listener, service, None));
+    tokio::spawn(serve_http(
+        listener,
+        service,
+        std::sync::Arc::new(gonzalo_server::Auth::Disabled),
+    ));
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 

@@ -2127,6 +2127,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower 0.5.3",
 ]

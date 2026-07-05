@@ -96,9 +96,12 @@ exempt.
 Denied access → `403` (HTTP) / `Status::permission_denied` (gRPC). Missing/unknown
 token under `Enabled` → `401` / `Status::unauthenticated`.
 
-**Author stamping.** On every write the daemon overwrites `record.meta.author`
-with `Identity::new(principal.name())`, so a client cannot forge authorship — the
-recorded author is exactly the authenticated principal.
+**Author stamping.** On every **authenticated** write the daemon overwrites
+`record.meta.author` with `Identity::new(principal.name())`, so a client cannot
+forge authorship — the recorded author is exactly the authenticated principal.
+Under `Disabled` (open) mode there is no authenticated identity, so the daemon
+stays a transparent store and leaves `meta.author` untouched (this keeps the
+`Store` conformance round-trip intact).
 
 ### Why authorize in handlers, not a blanket middleware
 

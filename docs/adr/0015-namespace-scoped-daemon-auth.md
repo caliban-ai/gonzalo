@@ -36,8 +36,10 @@ We will replace the single-token check with a **principal model** in a pure
   403/permission_denied.
 - **Non-CRUD ops are scoped, not just authenticated** — graph queries map to the
   repo namespace and ticket sync to the `tickets` namespace, both natural keys.
-- **Author is stamped** — every write overwrites `Meta.author` with the
-  authenticated principal, so authorship cannot be forged by a client.
+- **Author is stamped** — every authenticated write overwrites `Meta.author`
+  with the authenticated principal, so authorship cannot be forged by a client.
+  Open (disabled-auth) mode has no identity to stamp and stays a transparent
+  store.
 
 Scope is namespace-level read/write only; RBAC roles and a policy engine remain
 future work.
