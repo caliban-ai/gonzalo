@@ -20,6 +20,14 @@ on:
 permissions:
   contents: read
 
+# Serialize Pages deployments: a burst of merges to main (e.g. a sprint landing
+# several PRs) would otherwise create colliding deployments, and GitHub cancels
+# the older in-flight one — surfacing as "Deployment failed, try again later."
+# `cancel-in-progress: false` lets an in-flight deploy finish; later runs queue.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 env:
   MDBOOK_VERSION: "0.4.52"
   MDBOOK_ADMONISH_VERSION: "1.20.0"
