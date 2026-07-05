@@ -28,6 +28,9 @@ thiserror     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+gonzalo-store-fs = { workspace = true }
+async-trait = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 
 # The ticket_sync test must mutate process env (unsafe in edition 2024), so this
 # crate uses a local `deny` instead of the workspace-wide `forbid`, which cannot

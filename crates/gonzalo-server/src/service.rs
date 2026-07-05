@@ -49,6 +49,18 @@ impl Service {
         self.store.get(key).await
     }
 
+    /// Readiness probe: whether the backing store is reachable. Does a cheap
+    /// point lookup of a sentinel key — `Ok` (even `Ok(None)`) means the store
+    /// answered, `Err` means it is unreachable (bad endpoint/bucket, down
+    /// backend), so a load balancer should route around this replica. Backs
+    /// `GET /readyz`; liveness (`/healthz`) needs no store access.
+    pub async fn ready(&self) -> bool {
+        self.store
+            .get(&RecordKey::new("_gonzalo", "_health", "_probe"))
+            .await
+            .is_ok()
+    }
+
     pub async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
         self.store.put(record, expected).await
     }
