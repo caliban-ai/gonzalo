@@ -14,6 +14,7 @@ gonzalo-graph        = { workspace = true }
 gonzalo-graph-sqlite = { workspace = true }
 gonzalo-parse        = { workspace = true }
 gonzalo-store-fs     = { workspace = true }
+gonzalo-store-git    = { workspace = true }
 gonzalo-ticket        = { workspace = true }
 gonzalo-ticket-config = { workspace = true }
 clap   = { version = "4", features = ["derive"] }
@@ -24,6 +25,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
+git2     = { workspace = true }
 
 [[bin]]
 name = "gonzalo"

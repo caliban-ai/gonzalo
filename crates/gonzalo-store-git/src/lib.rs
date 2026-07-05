@@ -10,6 +10,9 @@ use gonzalo_core::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod diff;
+pub use diff::{ChangedPaths, changed_paths, head_commit, is_git_repo};
+
 pub struct GitStore {
     root: PathBuf,
 }
