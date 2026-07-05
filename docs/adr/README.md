@@ -39,6 +39,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted |
 | [0013](0013-local-candle-embedder.md) | Local Candle embedder for real semantic embeddings | accepted |
 | [0014](0014-approximate-vector-index-backend.md) | Approximate vector index backend (hnsw_rs) | accepted |
+| [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted |
 
 ## Adding a new ADR
 
