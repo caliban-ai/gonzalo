@@ -37,6 +37,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0010](0010-ticket-system-capability-layer.md) | Ticket systems as a normalized work-item capability layer | accepted |
 | [0011](0011-knowledge-store-capability.md) | Knowledge store over the capability layers | accepted |
 | [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted |
+| [0013](0013-local-candle-embedder.md) | Local Candle embedder for real semantic embeddings | accepted |
 
 ## Adding a new ADR
 
