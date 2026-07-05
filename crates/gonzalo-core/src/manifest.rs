@@ -39,6 +39,14 @@ impl Manifest {
         RecordKey::new(repo, MANIFEST_COLLECTION, view_id)
     }
 
+    /// The collection segment every manifest is addressed under. A
+    /// [`KeyPrefix`](crate::KeyPrefix) with this collection and no namespace
+    /// lists every view's manifest across all repos — the set GC must union to
+    /// mark live slices.
+    pub fn collection() -> &'static str {
+        MANIFEST_COLLECTION
+    }
+
     /// Record that `path` is populated by the slice with content hash `hash`.
     pub fn insert(&mut self, path: impl Into<String>, hash: ContentHash) {
         self.entries.insert(path.into(), hash);
