@@ -1,6 +1,7 @@
 use gonzalo_core::conformance::run_store_conformance;
 use gonzalo_core::{
-    Body, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Revision, Store,
+    BlobStore, Body, ContentHash, Identity, Meta, PutResult, Record, RecordKey, RecordKind,
+    Revision, Store,
 };
 use gonzalo_store_s3::S3Store;
 use std::collections::BTreeMap;
@@ -44,9 +45,50 @@ async fn s3_store_passes_conformance_when_endpoint_configured() {
         return;
     };
     run_store_conformance(|| async {
-        S3Store::connect(bucket.clone(), Some(endpoint.clone())).await
+        S3Store::connect(bucket.clone(), Some(endpoint.clone()), None).await
     })
     .await;
+}
+
+/// Live coverage of the S3 `BlobStore` impl (gonzalo#62): put/get/list/delete
+/// against MinIO. Self-cleaning and asserts on membership rather than a global
+/// empty set, so it doesn't depend on a pristine bucket (which the shared
+/// `run_blob_store_conformance` — designed for fresh-per-call stores — assumes).
+#[tokio::test]
+async fn s3_blob_store_put_get_list_delete() {
+    let Some((endpoint, bucket)) = test_target() else {
+        return;
+    };
+    let store = S3Store::connect(bucket, Some(endpoint), None).await;
+
+    let content = b"content-addressed slice for #62";
+    let hash = store.put_blob(content).await.unwrap();
+    assert_eq!(hash, ContentHash::of(content), "hash is content-addressed");
+
+    // Round-trips.
+    assert_eq!(
+        store.get_blob(&hash).await.unwrap().as_deref(),
+        Some(&content[..])
+    );
+
+    // Idempotent re-put yields the same hash and leaves content intact.
+    assert_eq!(store.put_blob(content).await.unwrap(), hash);
+    assert_eq!(
+        store.get_blob(&hash).await.unwrap().as_deref(),
+        Some(&content[..])
+    );
+
+    // Listed among the stored blobs.
+    assert!(
+        store.list_blobs().await.unwrap().contains(&hash),
+        "put blob must appear in list_blobs"
+    );
+
+    // Delete removes it and is idempotent.
+    store.delete_blob(&hash).await.unwrap();
+    assert_eq!(store.get_blob(&hash).await.unwrap(), None);
+    store.delete_blob(&hash).await.unwrap();
+    assert!(!store.list_blobs().await.unwrap().contains(&hash));
 }
 
 /// The TOCTOU acceptance test for gonzalo#5: many writers that all read the
@@ -62,7 +104,7 @@ async fn concurrent_updates_with_same_expected_let_exactly_one_win() {
     let key = RecordKey::new("race", "col", "one");
 
     // Seed the object and capture the revision every racer will hold.
-    let store = S3Store::connect(bucket.clone(), Some(endpoint.clone())).await;
+    let store = S3Store::connect(bucket.clone(), Some(endpoint.clone()), None).await;
     let v1 = sample(key.clone(), b"v1", Revision::initial(b"v1"), None);
     // Best-effort clean slate if a prior run left the key behind.
     let base_rev = loop {
@@ -96,7 +138,7 @@ async fn concurrent_updates_with_same_expected_let_exactly_one_win() {
             base_rev.clone(),
         );
         handles.push(tokio::spawn(async move {
-            let store = S3Store::connect(bucket, Some(endpoint)).await;
+            let store = S3Store::connect(bucket, Some(endpoint), None).await;
             let payload = format!("racer-{i}");
             let rec = sample(
                 key,

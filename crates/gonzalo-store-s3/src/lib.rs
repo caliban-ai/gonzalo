@@ -5,9 +5,13 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use gonzalo_core::{
-    CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, object_key,
-    store::Conflict,
+    BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
+    object_key, store::Conflict,
 };
+
+/// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
+/// separate from record objects (`namespace/collection/id.json`).
+const BLOB_PREFIX: &str = "blobs/";
 
 pub struct S3Store {
     client: Client,
@@ -25,13 +29,21 @@ impl S3Store {
     }
 
     /// Connect using the ambient AWS config (env, profile, IRSA, etc.). If
-    /// `endpoint` is `Some`, target an S3-compatible server (MinIO, etc.)
-    /// with path-style addressing.
-    pub async fn connect(bucket: impl Into<String>, endpoint: Option<String>) -> Self {
+    /// `endpoint` is `Some`, target an S3-compatible server (MinIO/Garage, etc.)
+    /// with path-style addressing; if `region` is `Some`, override the ambient
+    /// region (else the AWS env/profile region applies).
+    pub async fn connect(
+        bucket: impl Into<String>,
+        endpoint: Option<String>,
+        region: Option<String>,
+    ) -> Self {
         let base = aws_config::load_from_env().await;
         let mut builder = aws_sdk_s3::config::Builder::from(&base);
         if let Some(ep) = endpoint {
             builder = builder.endpoint_url(ep).force_path_style(true);
+        }
+        if let Some(r) = region {
+            builder = builder.region(aws_sdk_s3::config::Region::new(r));
         }
         let client = Client::from_conf(builder.build());
         Self::new(client, bucket)
@@ -210,6 +222,123 @@ impl gonzalo_core::Store for S3Store {
     }
 }
 
+#[async_trait]
+impl BlobStore for S3Store {
+    async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+        let hash = ContentHash::of(content);
+        let key = format!("{BLOB_PREFIX}{}", hash.0);
+        // Content-addressed + write-if-absent: an existing blob at this key is
+        // byte-identical, so `If-None-Match: *` turns a re-upload into a no-op
+        // (a 412 just means it's already stored). Idempotent and bandwidth-cheap.
+        match self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .if_none_match("*")
+            .body(content.to_vec().into())
+            .send()
+            .await
+        {
+            Ok(_) => Ok(hash),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if is_precondition_failed(svc.code()) {
+                    Ok(hash) // already present — no-op
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
+    }
+
+    async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+        let key = format!("{BLOB_PREFIX}{}", hash.0);
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let data = resp
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| CoreError::Backend(e.to_string()))?
+                    .into_bytes();
+                Ok(Some(data.to_vec()))
+            }
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_no_such_key() {
+                    Ok(None)
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
+    }
+
+    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(BLOB_PREFIX);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
+            for obj in resp.contents() {
+                if let Some(k) = obj.key()
+                    && let Some(hash) = blob_hash_from_key(k)
+                {
+                    out.push(hash);
+                }
+            }
+            if resp.is_truncated().unwrap_or(false) {
+                continuation = resp.next_continuation_token().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+        let key = format!("{BLOB_PREFIX}{}", hash.0);
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
+        Ok(()) // S3 delete of an absent key succeeds — idempotent
+    }
+}
+
+/// Parse a blob object key `blobs/<hash>` back into a [`ContentHash`]. Returns
+/// `None` for anything that isn't exactly one segment under `blobs/` — so a
+/// record object that happens to live in a `blobs` namespace
+/// (`blobs/<col>/<id>.json`, which still has a `/`) is never mistaken for a blob.
+fn blob_hash_from_key(key: &str) -> Option<ContentHash> {
+    let rest = key.strip_prefix(BLOB_PREFIX)?;
+    if rest.is_empty() || rest.contains('/') || rest.contains('.') {
+        return None;
+    }
+    Some(ContentHash(rest.to_string()))
+}
+
 /// Parse `namespace/collection/id.json` back into a `RecordKey`. Returns
 /// `None` for objects that don't match the expected three-part `.json` shape.
 fn parse_object_key(s: &str) -> Option<RecordKey> {
@@ -266,5 +395,17 @@ mod tests {
         assert!(is_precondition_failed(Some("PreconditionFailed")));
         assert!(!is_precondition_failed(Some("AccessDenied")));
         assert!(!is_precondition_failed(None));
+    }
+
+    #[test]
+    fn blob_key_roundtrips_and_rejects_records() {
+        let h = ContentHash::of(b"slice bytes");
+        let key = format!("{BLOB_PREFIX}{}", h.0);
+        assert_eq!(blob_hash_from_key(&key), Some(h));
+        // A record object under a `blobs` namespace has a nested path + `.json`
+        // and must never be read back as a blob hash.
+        assert_eq!(blob_hash_from_key("blobs/col/id.json"), None);
+        assert_eq!(blob_hash_from_key("ns/col/id.json"), None);
+        assert_eq!(blob_hash_from_key("blobs/"), None);
     }
 }

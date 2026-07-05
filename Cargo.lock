@@ -1509,6 +1509,7 @@ dependencies = [
  "gonzalo-graph-sqlite",
  "gonzalo-proto",
  "gonzalo-store-fs",
+ "gonzalo-store-s3",
  "gonzalo-ticket",
  "gonzalo-ticket-config",
  "prost",
