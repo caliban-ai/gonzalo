@@ -452,6 +452,49 @@ fn source_files_inner(dir: &Path, out: &mut Vec<(PathBuf, Language)>) -> Result<
     Ok(())
 }
 
+// ─── gc ────────────────────────────────────────────────────────────────────
+
+/// Summary returned by [`gc`].
+pub struct GcSummary {
+    /// Live manifests scanned to build the mark set.
+    pub manifests: usize,
+    /// Orphaned slice blobs deleted.
+    pub freed: usize,
+    /// Slice blobs kept because some live view still references them.
+    pub retained: usize,
+}
+
+/// Sweep orphaned code-graph slices from the store at `root`.
+///
+/// Slices are content-addressed and **shared across views** (identical content
+/// dedups), so GC must mark against *every* live view's manifest — deleting a
+/// slice still referenced by another view would corrupt it. This enumerates all
+/// `graph-manifest` records across every repo/view, unions their referenced
+/// hashes, and mark-sweeps the blob store via [`gonzalo_core::gc_blobs`] (A6).
+pub async fn gc(root: &Path) -> Result<GcSummary> {
+    let store = FsStore::new(root);
+
+    // Every view's manifest, across all repos (namespace unset = all repos).
+    let prefix = KeyPrefix {
+        namespace: None,
+        collection: Some(Manifest::collection().to_string()),
+    };
+    let keys = store.list(&prefix).await?;
+    let mut manifests = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if let Some(rec) = store.get(key).await? {
+            manifests.push(Manifest::from_body(&rec.body)?);
+        }
+    }
+
+    let report = gonzalo_core::gc_blobs(&store, &manifests).await?;
+    Ok(GcSummary {
+        manifests: manifests.len(),
+        freed: report.freed.len(),
+        retained: report.retained,
+    })
+}
+
 // ─── sync_stores ─────────────────────────────────────────────────────────────
 
 /// Summary returned by [`sync_stores`].
@@ -988,5 +1031,77 @@ mod tests {
         write_file(src.path(), "a.rs", "fn a() {}");
         let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
         assert!(!summary.incremental, "a non-git tree cannot go incremental");
+    }
+
+    // ── gc: sweep orphaned slices across all live views (gonzalo#94) ─────────
+
+    #[tokio::test]
+    async fn gc_on_empty_store_frees_nothing() {
+        let root = TempDir::new().unwrap();
+        let summary = gc(root.path()).await.unwrap();
+        assert_eq!(summary.manifests, 0);
+        assert_eq!(summary.freed, 0);
+        assert_eq!(summary.retained, 0);
+    }
+
+    #[tokio::test]
+    async fn gc_frees_slices_orphaned_by_a_reindex() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        // Reindex with different content: the original slice is now orphaned.
+        write_file(src.path(), "a.rs", "fn a() { b(); }");
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        let summary = gc(root.path()).await.unwrap();
+        assert_eq!(summary.manifests, 1);
+        assert_eq!(summary.freed, 1, "the pre-edit slice is unreferenced");
+        assert_eq!(summary.retained, 1, "the current slice stays");
+
+        // GC did not corrupt the live view.
+        let g =
+            SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
+        assert_eq!(g.definitions("a")[0].path, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn gc_retains_slice_still_referenced_by_another_view() {
+        let root = TempDir::new().unwrap();
+
+        // Two views index the *same* file content → one shared, deduped slice.
+        let src_a = TempDir::new().unwrap();
+        write_file(src_a.path(), "shared.rs", "fn shared() {}");
+        index(root.path(), src_a.path(), "r", "a").await.unwrap();
+
+        let src_b = TempDir::new().unwrap();
+        write_file(src_b.path(), "shared.rs", "fn shared() {}");
+        index(root.path(), src_b.path(), "r", "b").await.unwrap();
+
+        // Remove the file from view A only; view B still references the slice.
+        std::fs::remove_file(src_a.path().join("shared.rs")).unwrap();
+        index(root.path(), src_a.path(), "r", "a").await.unwrap();
+
+        let summary = gc(root.path()).await.unwrap();
+        assert_eq!(summary.manifests, 2);
+        assert_eq!(
+            summary.freed, 0,
+            "the shared slice is live via view B and must not be swept"
+        );
+
+        // View B still assembles and answers with the shared symbol.
+        let store = FsStore::new(root.path());
+        let manifest = Manifest::from_body(
+            &store
+                .get(&Manifest::key("r", "b"))
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        let graph = gonzalo_graph::assemble(&manifest, &store).await.unwrap();
+        assert_eq!(graph.definitions("shared")[0].path, "shared.rs");
     }
 }

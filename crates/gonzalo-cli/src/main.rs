@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use gonzalo_cli::{get, index, list, migrate, status, sync_stores, ticket_move, ticket_sync};
+use gonzalo_cli::{gc, get, index, list, migrate, status, sync_stores, ticket_move, ticket_sync};
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
 
@@ -77,6 +77,13 @@ enum Commands {
         /// View id, e.g. `main`.
         #[arg(long, default_value = "main")]
         view: String,
+    },
+    /// Garbage-collect orphaned code-graph slices, marking against every live
+    /// view's manifest across all repos.
+    Gc {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
     },
     /// Sync two filesystem stores.
     Sync {
@@ -228,6 +235,13 @@ async fn main() -> Result<()> {
             println!("modified: {}", summary.modified);
             println!("deleted:  {}", summary.deleted);
             println!("skipped:  {}", summary.skipped);
+        }
+
+        Commands::Gc { root } => {
+            let summary = gc(&root).await?;
+            println!("manifests: {}", summary.manifests);
+            println!("freed:     {}", summary.freed);
+            println!("retained:  {}", summary.retained);
         }
 
         Commands::Sync { a, b } => {
