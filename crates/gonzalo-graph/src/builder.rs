@@ -1,7 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
-//! TypeScript/TSX, and Go are supported, and a new grammar is a matter of adding
-//! its node-kind mappings.
+//! TypeScript/TSX, Go, Java, C#, C, and C++ are supported, and a new grammar is
+//! a matter of adding its node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,10 @@ pub enum Language {
     /// TypeScript with JSX (`.tsx`).
     Tsx,
     Go,
+    Java,
+    CSharp,
+    C,
+    Cpp,
 }
 
 impl Language {
@@ -30,6 +34,10 @@ impl Language {
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "cs" => Some(Self::CSharp),
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -42,6 +50,10 @@ impl Language {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 
@@ -86,6 +98,28 @@ impl Language {
                 "var_spec" => Some(SymbolKind::Static),
                 _ => None,
             },
+            Self::Java => match node_kind {
+                "class_declaration" => Some(SymbolKind::Class),
+                "interface_declaration" => Some(SymbolKind::Interface),
+                "enum_declaration" => Some(SymbolKind::Enum),
+                "method_declaration" | "constructor_declaration" => Some(SymbolKind::Function),
+                _ => None,
+            },
+            Self::CSharp => match node_kind {
+                "class_declaration" => Some(SymbolKind::Class),
+                "interface_declaration" => Some(SymbolKind::Interface),
+                "struct_declaration" => Some(SymbolKind::Struct),
+                "enum_declaration" => Some(SymbolKind::Enum),
+                "method_declaration" | "constructor_declaration" => Some(SymbolKind::Function),
+                _ => None,
+            },
+            Self::C => c_item_kind(node_kind),
+            // C++ is a superset of C's declarations.
+            Self::Cpp => c_item_kind(node_kind).or(match node_kind {
+                "class_specifier" => Some(SymbolKind::Class),
+                "namespace_definition" => Some(SymbolKind::Module),
+                _ => None,
+            }),
         }
     }
 
@@ -105,6 +139,11 @@ impl Language {
                 .and_then(|p| p.child_by_field_name("name"))
                 .and_then(|n| node_text(n, bytes))
                 .map(str::to_string),
+            // C/C++ name a function or typedef through nested `declarator` nodes,
+            // not a flat `name` field. Struct/enum/class/namespace do use `name`.
+            (Self::C | Self::Cpp, SymbolKind::Function | SymbolKind::TypeAlias) => {
+                c_declarator_name(node, bytes)
+            }
             _ => name_field(node, bytes),
         }
     }
@@ -112,10 +151,16 @@ impl Language {
     /// Whether `node_kind` is a call expression for this language.
     fn is_call(self, node_kind: &str) -> bool {
         match self {
-            Self::Rust | Self::JavaScript | Self::TypeScript | Self::Tsx | Self::Go => {
-                node_kind == "call_expression"
-            }
+            Self::Rust
+            | Self::JavaScript
+            | Self::TypeScript
+            | Self::Tsx
+            | Self::Go
+            | Self::C
+            | Self::Cpp => node_kind == "call_expression",
             Self::Python => node_kind == "call",
+            Self::Java => node_kind == "method_invocation",
+            Self::CSharp => node_kind == "invocation_expression",
         }
     }
 
@@ -163,6 +208,47 @@ impl Language {
                     .map(str::to_string),
                 _ => node_text(func, bytes).map(str::to_string),
             },
+            Self::CSharp => match func.kind() {
+                "identifier" => node_text(func, bytes).map(str::to_string),
+                // obj.Method(...) -> the member access's `name` field.
+                "member_access_expression" => func
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string),
+                _ => node_text(func, bytes).map(str::to_string),
+            },
+            Self::C | Self::Cpp => match func.kind() {
+                "identifier" => node_text(func, bytes).map(str::to_string),
+                // x.m(...) / x->m(...) -> the field expression's `field`.
+                "field_expression" => func
+                    .child_by_field_name("field")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string),
+                // C++ `Ns::func(...)` -> the qualified id's `name` (last segment).
+                "qualified_identifier" => func
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string),
+                _ => node_text(func, bytes).map(str::to_string),
+            },
+            // Java routes through `callee_name` (its callee is a `name` field on
+            // the invocation node, not a nested `function` node).
+            Self::Java => node_text(func, bytes).map(str::to_string),
+        }
+    }
+
+    /// The called name from a call node. Most languages hold the callee in a
+    /// `function` field (dispatched by [`call_name`]); Java's `method_invocation`
+    /// instead carries the method name directly in its `name` field.
+    fn callee_name(self, call: Node<'_>, bytes: &[u8]) -> Option<String> {
+        match self {
+            Self::Java => call
+                .child_by_field_name("name")
+                .and_then(|n| node_text(n, bytes))
+                .map(str::to_string),
+            _ => call
+                .child_by_field_name("function")
+                .and_then(|func| self.call_name(func, bytes)),
         }
     }
 }
@@ -175,6 +261,33 @@ fn js_item_kind(node_kind: &str) -> Option<SymbolKind> {
         }
         "class_declaration" | "abstract_class_declaration" => Some(SymbolKind::Class),
         _ => None,
+    }
+}
+
+/// C declaration node kinds shared by C and C++ (C++ adds classes/namespaces).
+fn c_item_kind(node_kind: &str) -> Option<SymbolKind> {
+    match node_kind {
+        "function_definition" => Some(SymbolKind::Function),
+        "struct_specifier" => Some(SymbolKind::Struct),
+        "enum_specifier" => Some(SymbolKind::Enum),
+        "type_definition" => Some(SymbolKind::TypeAlias),
+        _ => None,
+    }
+}
+
+/// Extract the identifier from a C/C++ `declarator` chain: descend the nested
+/// `declarator` field (through pointer/function/parenthesized declarators) until
+/// an identifier-like leaf is reached. Anonymous declarators yield `None`.
+fn c_declarator_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let mut n = node;
+    loop {
+        if matches!(
+            n.kind(),
+            "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier"
+        ) {
+            return node_text(n, bytes).map(str::to_string);
+        }
+        n = n.child_by_field_name("declarator")?;
     }
 }
 
@@ -233,8 +346,7 @@ fn walk(
     }
 
     if language.is_call(node.kind())
-        && let Some(func) = node.child_by_field_name("function")
-        && let Some(name) = language.call_name(func, bytes)
+        && let Some(name) = language.callee_name(node, bytes)
     {
         graph.references.push(Reference {
             name,
@@ -349,6 +461,15 @@ def main():
         assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("tsx"), Some(Language::Tsx));
         assert_eq!(Language::from_extension("go"), Some(Language::Go));
+        assert_eq!(Language::from_extension("java"), Some(Language::Java));
+        assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
+        assert_eq!(Language::from_extension("c"), Some(Language::C));
+        assert_eq!(Language::from_extension("h"), Some(Language::C));
+        assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cc"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("hpp"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("hh"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -496,6 +617,195 @@ function greet() { return <div>hi</div>; }
             g.references
                 .iter()
                 .any(|r| r.name == "greet" && r.from.as_deref() == Some("App"))
+        );
+    }
+
+    const JAVA_SRC: &str = r#"
+interface Shape { int area(); }
+
+enum Color { RED, GREEN }
+
+class Widget {
+    int n;
+    Widget(int n) { this.n = n; }
+    int area() { return helper(this.n); }
+}
+
+class Main {
+    static int helper(int x) { return x + 1; }
+    static void main(String[] args) {
+        Widget w = new Widget(1);
+        w.area();
+    }
+}
+"#;
+
+    #[test]
+    fn java_extracts_definitions() {
+        let g = build(Language::Java, JAVA_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Shape"), Some(SymbolKind::Interface));
+        assert_eq!(named("Color"), Some(SymbolKind::Enum));
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        // Constructor is recorded as a Function named for its class.
+        assert!(
+            g.symbols
+                .iter()
+                .any(|s| s.name == "Widget" && s.kind == SymbolKind::Function)
+        );
+    }
+
+    #[test]
+    fn java_records_calls_with_enclosing_fn() {
+        let g = build(Language::Java, JAVA_SRC);
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("area")),
+            "helper() call from area"
+        );
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "area" && r.from.as_deref() == Some("main")),
+            "w.area() call from main"
+        );
+    }
+
+    const CS_SRC: &str = r#"
+interface IShape { int Area(); }
+enum Color { Red, Green }
+struct Point { public int X; }
+
+class Widget {
+    int n;
+    public Widget(int n) { this.n = n; }
+    public int Area() { return Helper(this.n); }
+}
+
+class Program {
+    static int Helper(int x) { return x + 1; }
+    static void Main() {
+        var w = new Widget(1);
+        w.Area();
+    }
+}
+"#;
+
+    #[test]
+    fn csharp_extracts_definitions() {
+        let g = build(Language::CSharp, CS_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("IShape"), Some(SymbolKind::Interface));
+        assert_eq!(named("Color"), Some(SymbolKind::Enum));
+        assert_eq!(named("Point"), Some(SymbolKind::Struct));
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Area"), Some(SymbolKind::Function));
+        assert_eq!(named("Helper"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn csharp_records_calls_with_enclosing_fn() {
+        let g = build(Language::CSharp, CS_SRC);
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "Helper" && r.from.as_deref() == Some("Area")),
+            "Helper() call from Area"
+        );
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "Area" && r.from.as_deref() == Some("Main")),
+            "w.Area() call from Main"
+        );
+    }
+
+    const C_SRC: &str = r#"
+struct Widget { int n; };
+
+typedef int Id;
+
+enum Color { RED, GREEN };
+
+int helper(int x) { return x + 1; }
+
+int main(void) {
+    int y = helper(2);
+    return y;
+}
+"#;
+
+    #[test]
+    fn c_extracts_definitions() {
+        let g = build(Language::C, C_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Widget"), Some(SymbolKind::Struct));
+        assert_eq!(named("Id"), Some(SymbolKind::TypeAlias));
+        assert_eq!(named("Color"), Some(SymbolKind::Enum));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn c_records_call_with_enclosing_fn() {
+        let g = build(Language::C, C_SRC);
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper() call from main"
+        );
+    }
+
+    const CPP_SRC: &str = r#"
+namespace geo {
+
+class Widget {
+public:
+    int n;
+    int area() { return helper(this->n); }
+};
+
+int helper(int x) { return x + 1; }
+
+}
+
+int main() {
+    geo::Widget w;
+    return w.area();
+}
+"#;
+
+    #[test]
+    fn cpp_extracts_definitions() {
+        let g = build(Language::Cpp, CPP_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("geo"), Some(SymbolKind::Module));
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn cpp_records_calls_including_methods() {
+        let g = build(Language::Cpp, CPP_SRC);
+        // this->helper(...) -> field_expression `field`, from `area`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("area")),
+            "helper() call from area"
+        );
+        // w.area() -> field_expression `field`, from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "area" && r.from.as_deref() == Some("main")),
+            "w.area() call from main"
         );
     }
 }
