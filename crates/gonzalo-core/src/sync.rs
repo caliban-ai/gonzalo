@@ -1,11 +1,13 @@
 //! Reconcile two `Store`s. Any store can be a sync peer. Append-only kinds
 //! auto-merge by union; structured/opaque divergences are surfaced as
-//! conflicts. No stored ancestry yet (M2): the merge uses an empty base,
-//! which is correct for append-only union.
+//! conflicts. [`sync_with_ancestry`] 3-way-merges structured bodies against
+//! their real common ancestor when an [`AncestryStore`](crate::AncestryStore)
+//! retains it; [`sync`] uses an empty base (correct for append-only union, safe
+//! otherwise) — see ADR 0016.
 
 use crate::{
-    Body, Identity, KeyPrefix, MergeOutcome, Meta, PutResult, Record, RecordKey, Result, Revision,
-    Store, merge,
+    BlobStore, Body, Identity, KeyPrefix, MergeOutcome, Meta, PutResult, Record, RecordKey, Result,
+    Revision, Store, merge,
 };
 use std::collections::BTreeSet;
 
@@ -47,9 +49,23 @@ const MAX_SYNC_PASSES: usize = 16;
 /// the pass until one completes without any such race (a fixpoint), bounded by
 /// [`MAX_SYNC_PASSES`] so continuous concurrent writes can't livelock it.
 pub async fn sync(a: &dyn Store, b: &dyn Store) -> Result<SyncReport> {
+    sync_with_ancestry(a, b, None).await
+}
+
+/// As [`sync`], but 3-way-merges divergent `Structured` bodies against their
+/// real common ancestor when one is available. `ancestry` is a content-addressed
+/// store of past bodies keyed by revision hash (see
+/// [`AncestryStore`](crate::AncestryStore)): when two records diverge from a
+/// shared parent revision whose body it holds, that body is the merge base;
+/// otherwise sync falls back to the empty base (ADR 0016).
+pub async fn sync_with_ancestry(
+    a: &dyn Store,
+    b: &dyn Store,
+    ancestry: Option<&dyn BlobStore>,
+) -> Result<SyncReport> {
     let mut report = SyncReport::default();
     for _ in 0..MAX_SYNC_PASSES {
-        let (pass, raced) = sync_pass(a, b).await?;
+        let (pass, raced) = sync_pass(a, b, ancestry).await?;
         report = pass;
         if !raced {
             break; // quiescent: this pass landed cleanly, stores have converged.
@@ -58,12 +74,30 @@ pub async fn sync(a: &dyn Store, b: &dyn Store) -> Result<SyncReport> {
     Ok(report)
 }
 
+/// The merge base for a divergence: the body of `a`/`b`'s shared parent revision
+/// when `ancestry` retains it, else an empty base (the base-agnostic fallback,
+/// correct for `AppendOnly` and safe for the rest).
+async fn ancestry_base(ancestry: Option<&dyn BlobStore>, rec_a: &Record, rec_b: &Record) -> Body {
+    if let Some(anc) = ancestry
+        && let (Some(pa), Some(pb)) = (&rec_a.parent, &rec_b.parent)
+        && pa == pb
+        && let Ok(Some(bytes)) = anc.get_blob(&pa.hash).await
+    {
+        return Body::Inline(bytes);
+    }
+    Body::Inline(Vec::new())
+}
+
 /// One reconciliation pass over the union of keys. Returns the pass's report
 /// and whether any write lost an OCC race (`true` ⇒ a store changed mid-pass,
 /// so the caller should re-loop). A `NeedsResolution` merge conflict is a
 /// terminal divergence (surfaced in the report), not a race, and does not
 /// trigger a re-loop.
-async fn sync_pass(a: &dyn Store, b: &dyn Store) -> Result<(SyncReport, bool)> {
+async fn sync_pass(
+    a: &dyn Store,
+    b: &dyn Store,
+    ancestry: Option<&dyn BlobStore>,
+) -> Result<(SyncReport, bool)> {
     let mut report = SyncReport::default();
     let mut raced = false;
 
@@ -93,12 +127,8 @@ async fn sync_pass(a: &dyn Store, b: &dyn Store) -> Result<(SyncReport, bool)> {
                 if rec_a.revision == rec_b.revision {
                     continue; // already in sync
                 }
-                match merge(
-                    rec_a.kind.merge_class(),
-                    &Body::Inline(Vec::new()),
-                    &rec_a.body,
-                    &rec_b.body,
-                ) {
+                let base = ancestry_base(ancestry, &rec_a, &rec_b).await;
+                match merge(rec_a.kind.merge_class(), &base, &rec_a.body, &rec_b.body) {
                     MergeOutcome::Merged(body) => {
                         let merged = build_merged(&key, &rec_a, &rec_b, body);
                         let la = overwrite(a, &merged, &rec_a.revision).await?;
@@ -492,6 +522,57 @@ mod tests {
         let text = String::from_utf8(rb.body.bytes().to_vec()).unwrap();
         assert!(text.contains("from_a") && text.contains("from_b"));
         assert_eq!(report.merged, vec![key]);
+    }
+
+    /// Build ours/theirs Structured records diverging from a shared base
+    /// revision (disjoint field edits), plus the base body to retain.
+    fn structured_divergence() -> (Record, Record, &'static str) {
+        let base = rec("m", RecordKind::MemoryTier, r#"{"name":"a","content":"x"}"#);
+        let base_rev = base.revision.clone();
+        let mut ours = rec("m", RecordKind::MemoryTier, r#"{"name":"b","content":"x"}"#);
+        ours.parent = Some(base_rev.clone());
+        let mut theirs = rec("m", RecordKind::MemoryTier, r#"{"name":"a","content":"y"}"#);
+        theirs.parent = Some(base_rev);
+        (ours, theirs, r#"{"name":"a","content":"x"}"#)
+    }
+
+    #[tokio::test]
+    async fn structured_divergence_merges_with_ancestry() {
+        use crate::ancestry::tests::Mem;
+        let a = Mem::default();
+        let b = Mem::default();
+        let ancestry = Mem::default();
+        let (ours, theirs, base_body) = structured_divergence();
+        // Retain the shared base body under its revision hash.
+        ancestry.put_blob(base_body.as_bytes()).await.unwrap();
+        let _ = a.put(ours, None).await.unwrap();
+        let _ = b.put(theirs, None).await.unwrap();
+
+        let report = sync_with_ancestry(&a, &b, Some(&ancestry)).await.unwrap();
+
+        let key = RecordKey::new("ns", "col", "m");
+        assert_eq!(report.merged, vec![key.clone()], "3-way merged");
+        assert!(report.conflicts.is_empty());
+        // Disjoint field edits both applied against the real base.
+        let merged = a.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(merged.body.bytes()).unwrap();
+        assert_eq!(v, serde_json::json!({"name": "b", "content": "y"}));
+    }
+
+    #[tokio::test]
+    async fn structured_divergence_conflicts_without_ancestry() {
+        use crate::ancestry::tests::Mem;
+        let a = Mem::default();
+        let b = Mem::default();
+        let (ours, theirs, _) = structured_divergence();
+        let _ = a.put(ours, None).await.unwrap();
+        let _ = b.put(theirs, None).await.unwrap();
+
+        // No ancestry → empty base → the Structured merge cannot tell a one-sided
+        // edit from a real conflict, so it surfaces a conflict.
+        let report = sync(&a, &b).await.unwrap();
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(report.merged.is_empty());
     }
 
     #[tokio::test]
