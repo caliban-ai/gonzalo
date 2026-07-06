@@ -1,5 +1,9 @@
 # gonzalo
 
+[![crates.io](https://img.shields.io/crates/v/gonzalo.svg)](https://crates.io/crates/gonzalo)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+[![CI](https://github.com/caliban-ai/gonzalo/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caliban-ai/gonzalo/actions/workflows/ci.yml)
+
 A robust, shareable persistence layer for [caliban](https://github.com/caliban-ai/caliban).
 
 Gonzalo lifts caliban's local-first state — memory tiers, auto-memory topics,
