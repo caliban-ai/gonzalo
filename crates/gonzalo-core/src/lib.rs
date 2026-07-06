@@ -30,8 +30,11 @@ pub use merge::{MergeOutcome, merge};
 pub mod paths;
 pub use paths::{object_key, record_components, segment};
 
+pub mod ancestry;
+pub use ancestry::AncestryStore;
+
 pub mod sync;
-pub use sync::{SyncConflict, SyncReport, sync};
+pub use sync::{SyncConflict, SyncReport, sync, sync_with_ancestry};
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
