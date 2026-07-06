@@ -1,6 +1,7 @@
 # gonzalo
 
-[![crates.io](https://img.shields.io/crates/v/gonzalo.svg)](https://crates.io/crates/gonzalo)
+[![Release](https://img.shields.io/github/v/release/caliban-ai/gonzalo?sort=semver)](https://github.com/caliban-ai/gonzalo/releases)
+[![Container](https://img.shields.io/badge/ghcr.io-gonzalod-2496ED?logo=docker&logoColor=white)](https://github.com/caliban-ai/gonzalo/pkgs/container/gonzalo)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![CI](https://github.com/caliban-ai/gonzalo/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caliban-ai/gonzalo/actions/workflows/ci.yml)
 
