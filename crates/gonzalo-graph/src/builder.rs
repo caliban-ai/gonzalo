@@ -1,6 +1,6 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
-//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, and Kotlin are
+//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, Kotlin, and Swift are
 //! supported, and a new grammar is a matter of adding its node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
@@ -25,6 +25,7 @@ pub enum Language {
     Php,
     Bash,
     Kotlin,
+    Swift,
 }
 
 impl Language {
@@ -46,6 +47,7 @@ impl Language {
             "php" => Some(Self::Php),
             "sh" | "bash" => Some(Self::Bash),
             "kt" | "kts" => Some(Self::Kotlin),
+            "swift" => Some(Self::Swift),
             _ => None,
         }
     }
@@ -66,6 +68,7 @@ impl Language {
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
         }
     }
 
@@ -159,6 +162,15 @@ impl Language {
                 "class_declaration" | "object_declaration" => Some(SymbolKind::Class),
                 _ => None,
             },
+            // Swift `class_declaration` covers class/struct/enum/actor
+            // (distinguished by a `declaration_kind` field we don't split on);
+            // `protocol` maps to Interface.
+            Self::Swift => match node_kind {
+                "function_declaration" => Some(SymbolKind::Function),
+                "class_declaration" => Some(SymbolKind::Class),
+                "protocol_declaration" => Some(SymbolKind::Interface),
+                _ => None,
+            },
         }
     }
 
@@ -204,7 +216,7 @@ impl Language {
             Self::Php => node_kind == "function_call_expression",
             // Bash "calls" are commands (`helper arg`).
             Self::Bash => node_kind == "command",
-            Self::Kotlin => node_kind == "call_expression",
+            Self::Kotlin | Self::Swift => node_kind == "call_expression",
         }
     }
 
@@ -278,10 +290,10 @@ impl Language {
             // PHP `function_call_expression` holds the callee in a `function`
             // field — a `name` (or `qualified_name`) node; take its text.
             Self::Php => node_text(func, bytes).map(str::to_string),
-            // Java, Ruby, Bash, and Kotlin route through `callee_name` (their
-            // callee is a dedicated field/child on the call node, not a nested
-            // `function` node); these arms exist only to keep the match exhaustive.
-            Self::Java | Self::Ruby | Self::Bash | Self::Kotlin => {
+            // Java, Ruby, Bash, Kotlin, and Swift route through `callee_name`
+            // (their callee is a dedicated field/child on the call node, not a
+            // nested `function` node); these arms only keep the match exhaustive.
+            Self::Java | Self::Ruby | Self::Bash | Self::Kotlin | Self::Swift => {
                 node_text(func, bytes).map(str::to_string)
             }
         }
@@ -303,10 +315,11 @@ impl Language {
                 .child_by_field_name("method")
                 .and_then(|n| node_text(n, bytes))
                 .map(str::to_string),
-            // Kotlin `call_expression` has no field; the callee is its first named
-            // child — an `identifier` (`helper(..)`) or a `navigation_expression`
-            // (`a.b.method(..)`), whose trailing identifier is the invoked member.
-            Self::Kotlin => call
+            // Kotlin and Swift `call_expression` have no field; the callee is the
+            // first named child — an `identifier`/`simple_identifier`
+            // (`helper(..)`) or a navigation/member expression (`a.b.method(..)`),
+            // whose trailing identifier is the invoked member.
+            Self::Kotlin | Self::Swift => call
                 .named_child(0)
                 .and_then(|callee| last_identifier(callee, bytes)),
             _ => call
@@ -316,9 +329,9 @@ impl Language {
     }
 }
 
-/// The last `identifier` in `node`'s subtree (depth-first). For a Kotlin callee
-/// that is a bare `identifier` this is the node itself; for a
-/// `navigation_expression` (`a.b.method`) it is the trailing member name.
+/// The last `identifier`/`simple_identifier` in `node`'s subtree (depth-first).
+/// For a Kotlin/Swift callee that is a bare identifier this is the node itself;
+/// for a navigation/member expression (`a.b.method`) it is the trailing member.
 fn last_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     let mut result = if matches!(node.kind(), "identifier" | "simple_identifier") {
         node_text(node, bytes).map(str::to_string)
@@ -557,6 +570,7 @@ def main():
         assert_eq!(Language::from_extension("bash"), Some(Language::Bash));
         assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
+        assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -1045,6 +1059,48 @@ fun main() {
     fn kotlin_records_call_with_enclosing_fn() {
         let g = build(Language::Kotlin, KOTLIN_SRC);
         // `helper(2)` -> call_expression whose first child is an `identifier`,
+        // from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper() call from main"
+        );
+    }
+
+    const SWIFT_SRC: &str = r#"
+class Widget {
+    func area() -> Int {
+        return helper(1)
+    }
+}
+
+protocol Shape {}
+
+func helper(x: Int) -> Int {
+    return x + 1
+}
+
+func main() {
+    helper(2)
+}
+"#;
+
+    #[test]
+    fn swift_extracts_definitions() {
+        let g = build(Language::Swift, SWIFT_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Shape"), Some(SymbolKind::Interface)); // `protocol`
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn swift_records_call_with_enclosing_fn() {
+        let g = build(Language::Swift, SWIFT_SRC);
+        // `helper(2)` -> call_expression whose first child is a `simple_identifier`,
         // from `main`.
         assert!(
             g.references
