@@ -1,7 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
-//! TypeScript/TSX, Go, Java, C#, C, and C++ are supported, and a new grammar is
-//! a matter of adding its node-kind mappings.
+//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, and Bash are supported, and
+//! a new grammar is a matter of adding its node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,9 @@ pub enum Language {
     CSharp,
     C,
     Cpp,
+    Ruby,
+    Php,
+    Bash,
 }
 
 impl Language {
@@ -38,6 +41,9 @@ impl Language {
             "cs" => Some(Self::CSharp),
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some(Self::Cpp),
+            "rb" => Some(Self::Ruby),
+            "php" => Some(Self::Php),
+            "sh" | "bash" => Some(Self::Bash),
             _ => None,
         }
     }
@@ -54,6 +60,9 @@ impl Language {
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
         }
     }
 
@@ -120,6 +129,25 @@ impl Language {
                 "namespace_definition" => Some(SymbolKind::Module),
                 _ => None,
             }),
+            Self::Ruby => match node_kind {
+                "method" | "singleton_method" => Some(SymbolKind::Function),
+                "class" => Some(SymbolKind::Class),
+                "module" => Some(SymbolKind::Module),
+                _ => None,
+            },
+            Self::Php => match node_kind {
+                "function_definition" | "method_declaration" => Some(SymbolKind::Function),
+                "class_declaration" => Some(SymbolKind::Class),
+                "interface_declaration" => Some(SymbolKind::Interface),
+                "trait_declaration" => Some(SymbolKind::Trait),
+                "enum_declaration" => Some(SymbolKind::Enum),
+                _ => None,
+            },
+            // Bash has only functions.
+            Self::Bash => match node_kind {
+                "function_definition" => Some(SymbolKind::Function),
+                _ => None,
+            },
         }
     }
 
@@ -161,6 +189,10 @@ impl Language {
             Self::Python => node_kind == "call",
             Self::Java => node_kind == "method_invocation",
             Self::CSharp => node_kind == "invocation_expression",
+            Self::Ruby => node_kind == "call",
+            Self::Php => node_kind == "function_call_expression",
+            // Bash "calls" are commands (`helper arg`).
+            Self::Bash => node_kind == "command",
         }
     }
 
@@ -231,9 +263,13 @@ impl Language {
                     .map(str::to_string),
                 _ => node_text(func, bytes).map(str::to_string),
             },
-            // Java routes through `callee_name` (its callee is a `name` field on
-            // the invocation node, not a nested `function` node).
-            Self::Java => node_text(func, bytes).map(str::to_string),
+            // PHP `function_call_expression` holds the callee in a `function`
+            // field — a `name` (or `qualified_name`) node; take its text.
+            Self::Php => node_text(func, bytes).map(str::to_string),
+            // Java, Ruby, and Bash route through `callee_name` (their callee is a
+            // dedicated field on the call node, not a nested `function` node);
+            // these arms exist only to keep the match exhaustive.
+            Self::Java | Self::Ruby | Self::Bash => node_text(func, bytes).map(str::to_string),
         }
     }
 
@@ -242,8 +278,15 @@ impl Language {
     /// instead carries the method name directly in its `name` field.
     fn callee_name(self, call: Node<'_>, bytes: &[u8]) -> Option<String> {
         match self {
-            Self::Java => call
+            // Java's `method_invocation` and Bash's `command` carry the callee in
+            // a `name` field (an identifier / a `command_name` node).
+            Self::Java | Self::Bash => call
                 .child_by_field_name("name")
+                .and_then(|n| node_text(n, bytes))
+                .map(str::to_string),
+            // Ruby's `call` names the callee in a `method` field.
+            Self::Ruby => call
+                .child_by_field_name("method")
                 .and_then(|n| node_text(n, bytes))
                 .map(str::to_string),
             _ => call
@@ -470,6 +513,10 @@ def main():
         assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("hpp"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("hh"), Some(Language::Cpp));
+        assert_eq!(Language::from_extension("rb"), Some(Language::Ruby));
+        assert_eq!(Language::from_extension("php"), Some(Language::Php));
+        assert_eq!(Language::from_extension("sh"), Some(Language::Bash));
+        assert_eq!(Language::from_extension("bash"), Some(Language::Bash));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -806,6 +853,122 @@ int main() {
                 .iter()
                 .any(|r| r.name == "area" && r.from.as_deref() == Some("main")),
             "w.area() call from main"
+        );
+    }
+
+    const RUBY_SRC: &str = r#"
+class Widget
+  def area
+    helper(1)
+  end
+end
+
+module Util
+end
+
+def helper(x)
+  x + 1
+end
+
+def main
+  helper(2)
+end
+"#;
+
+    #[test]
+    fn ruby_extracts_definitions() {
+        let g = build(Language::Ruby, RUBY_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Util"), Some(SymbolKind::Module));
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn ruby_records_call_with_enclosing_fn() {
+        let g = build(Language::Ruby, RUBY_SRC);
+        // `helper(2)` is called from the `main` method (callee is the `method` field).
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper call from main"
+        );
+    }
+
+    const PHP_SRC: &str = r#"<?php
+class Widget {
+    function area() {
+        return helper(1);
+    }
+}
+
+interface Shape {}
+
+trait Named {}
+
+function helper($x) {
+    return $x + 1;
+}
+
+function main() {
+    return helper(2);
+}
+"#;
+
+    #[test]
+    fn php_extracts_definitions() {
+        let g = build(Language::Php, PHP_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Shape"), Some(SymbolKind::Interface));
+        assert_eq!(named("Named"), Some(SymbolKind::Trait));
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn php_records_call_with_enclosing_fn() {
+        let g = build(Language::Php, PHP_SRC);
+        // `helper(2)` -> function_call_expression `function` field, from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper() call from main"
+        );
+    }
+
+    const BASH_SRC: &str = r#"
+helper() {
+  echo "$1"
+}
+
+main() {
+  helper hello
+}
+"#;
+
+    #[test]
+    fn bash_extracts_definitions() {
+        let g = build(Language::Bash, BASH_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn bash_records_call_with_enclosing_fn() {
+        let g = build(Language::Bash, BASH_SRC);
+        // `helper hello` is a command whose `name` field is the callee, from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper command from main"
         );
     }
 }
