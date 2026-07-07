@@ -1,7 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
-//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, Kotlin, and Swift are
-//! supported, and a new grammar is a matter of adding its node-kind mappings.
+//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, Kotlin, Swift, and Lua
+//! are supported, and a new grammar is a matter of adding its node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ pub enum Language {
     Bash,
     Kotlin,
     Swift,
+    Lua,
 }
 
 impl Language {
@@ -48,6 +49,7 @@ impl Language {
             "sh" | "bash" => Some(Self::Bash),
             "kt" | "kts" => Some(Self::Kotlin),
             "swift" => Some(Self::Swift),
+            "lua" => Some(Self::Lua),
             _ => None,
         }
     }
@@ -69,6 +71,7 @@ impl Language {
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
         }
     }
 
@@ -171,6 +174,12 @@ impl Language {
                 "protocol_declaration" => Some(SymbolKind::Interface),
                 _ => None,
             },
+            // Lua has only functions (named `function_declaration`; anonymous
+            // `function_definition` carries no name and is skipped).
+            Self::Lua => match node_kind {
+                "function_declaration" => Some(SymbolKind::Function),
+                _ => None,
+            },
         }
     }
 
@@ -217,6 +226,7 @@ impl Language {
             // Bash "calls" are commands (`helper arg`).
             Self::Bash => node_kind == "command",
             Self::Kotlin | Self::Swift => node_kind == "call_expression",
+            Self::Lua => node_kind == "function_call",
         }
     }
 
@@ -290,10 +300,10 @@ impl Language {
             // PHP `function_call_expression` holds the callee in a `function`
             // field — a `name` (or `qualified_name`) node; take its text.
             Self::Php => node_text(func, bytes).map(str::to_string),
-            // Java, Ruby, Bash, Kotlin, and Swift route through `callee_name`
+            // Java, Ruby, Bash, Kotlin, Swift, and Lua route through `callee_name`
             // (their callee is a dedicated field/child on the call node, not a
             // nested `function` node); these arms only keep the match exhaustive.
-            Self::Java | Self::Ruby | Self::Bash | Self::Kotlin | Self::Swift => {
+            Self::Java | Self::Ruby | Self::Bash | Self::Kotlin | Self::Swift | Self::Lua => {
                 node_text(func, bytes).map(str::to_string)
             }
         }
@@ -322,6 +332,12 @@ impl Language {
             Self::Kotlin | Self::Swift => call
                 .named_child(0)
                 .and_then(|callee| last_identifier(callee, bytes)),
+            // Lua's `function_call` names the callee in a `name` field — an
+            // `identifier` (`helper(..)`) or a dotted/method index (`m.f`/`o:m`),
+            // whose trailing identifier is the invoked function.
+            Self::Lua => call
+                .child_by_field_name("name")
+                .and_then(|n| last_identifier(n, bytes)),
             _ => call
                 .child_by_field_name("function")
                 .and_then(|func| self.call_name(func, bytes)),
@@ -571,6 +587,7 @@ def main():
         assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
+        assert_eq!(Language::from_extension("lua"), Some(Language::Lua));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -1102,6 +1119,36 @@ func main() {
         let g = build(Language::Swift, SWIFT_SRC);
         // `helper(2)` -> call_expression whose first child is a `simple_identifier`,
         // from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper() call from main"
+        );
+    }
+
+    const LUA_SRC: &str = r#"
+function helper(x)
+  return x + 1
+end
+
+function main()
+  return helper(2)
+end
+"#;
+
+    #[test]
+    fn lua_extracts_definitions() {
+        let g = build(Language::Lua, LUA_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn lua_records_call_with_enclosing_fn() {
+        let g = build(Language::Lua, LUA_SRC);
+        // `helper(2)` -> function_call whose `name` field is the callee, from `main`.
         assert!(
             g.references
                 .iter()
