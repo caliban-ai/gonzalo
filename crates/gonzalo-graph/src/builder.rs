@@ -1,7 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
-//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, and Bash are supported, and
-//! a new grammar is a matter of adding its node-kind mappings.
+//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, and Kotlin are
+//! supported, and a new grammar is a matter of adding its node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ pub enum Language {
     Ruby,
     Php,
     Bash,
+    Kotlin,
 }
 
 impl Language {
@@ -44,6 +45,7 @@ impl Language {
             "rb" => Some(Self::Ruby),
             "php" => Some(Self::Php),
             "sh" | "bash" => Some(Self::Bash),
+            "kt" | "kts" => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -63,6 +65,7 @@ impl Language {
             Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         }
     }
 
@@ -148,6 +151,14 @@ impl Language {
                 "function_definition" => Some(SymbolKind::Function),
                 _ => None,
             },
+            // Kotlin `object` (a named singleton) and `interface` both surface as
+            // class-like type declarations; interfaces are `class_declaration`
+            // with an `interface` keyword, so they read as Class here.
+            Self::Kotlin => match node_kind {
+                "function_declaration" => Some(SymbolKind::Function),
+                "class_declaration" | "object_declaration" => Some(SymbolKind::Class),
+                _ => None,
+            },
         }
     }
 
@@ -193,6 +204,7 @@ impl Language {
             Self::Php => node_kind == "function_call_expression",
             // Bash "calls" are commands (`helper arg`).
             Self::Bash => node_kind == "command",
+            Self::Kotlin => node_kind == "call_expression",
         }
     }
 
@@ -266,10 +278,12 @@ impl Language {
             // PHP `function_call_expression` holds the callee in a `function`
             // field — a `name` (or `qualified_name`) node; take its text.
             Self::Php => node_text(func, bytes).map(str::to_string),
-            // Java, Ruby, and Bash route through `callee_name` (their callee is a
-            // dedicated field on the call node, not a nested `function` node);
-            // these arms exist only to keep the match exhaustive.
-            Self::Java | Self::Ruby | Self::Bash => node_text(func, bytes).map(str::to_string),
+            // Java, Ruby, Bash, and Kotlin route through `callee_name` (their
+            // callee is a dedicated field/child on the call node, not a nested
+            // `function` node); these arms exist only to keep the match exhaustive.
+            Self::Java | Self::Ruby | Self::Bash | Self::Kotlin => {
+                node_text(func, bytes).map(str::to_string)
+            }
         }
     }
 
@@ -289,11 +303,35 @@ impl Language {
                 .child_by_field_name("method")
                 .and_then(|n| node_text(n, bytes))
                 .map(str::to_string),
+            // Kotlin `call_expression` has no field; the callee is its first named
+            // child — an `identifier` (`helper(..)`) or a `navigation_expression`
+            // (`a.b.method(..)`), whose trailing identifier is the invoked member.
+            Self::Kotlin => call
+                .named_child(0)
+                .and_then(|callee| last_identifier(callee, bytes)),
             _ => call
                 .child_by_field_name("function")
                 .and_then(|func| self.call_name(func, bytes)),
         }
     }
+}
+
+/// The last `identifier` in `node`'s subtree (depth-first). For a Kotlin callee
+/// that is a bare `identifier` this is the node itself; for a
+/// `navigation_expression` (`a.b.method`) it is the trailing member name.
+fn last_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let mut result = if matches!(node.kind(), "identifier" | "simple_identifier") {
+        node_text(node, bytes).map(str::to_string)
+    } else {
+        None
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(name) = last_identifier(child, bytes) {
+            result = Some(name);
+        }
+    }
+    result
 }
 
 /// JavaScript declaration node kinds shared by JS and TS/TSX.
@@ -517,6 +555,8 @@ def main():
         assert_eq!(Language::from_extension("php"), Some(Language::Php));
         assert_eq!(Language::from_extension("sh"), Some(Language::Bash));
         assert_eq!(Language::from_extension("bash"), Some(Language::Bash));
+        assert_eq!(Language::from_extension("kt"), Some(Language::Kotlin));
+        assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -969,6 +1009,48 @@ main() {
                 .iter()
                 .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
             "helper command from main"
+        );
+    }
+
+    const KOTLIN_SRC: &str = r#"
+class Widget {
+    fun area(): Int {
+        return helper(1)
+    }
+}
+
+object Config
+
+fun helper(x: Int): Int {
+    return x + 1
+}
+
+fun main() {
+    helper(2)
+}
+"#;
+
+    #[test]
+    fn kotlin_extracts_definitions() {
+        let g = build(Language::Kotlin, KOTLIN_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Config"), Some(SymbolKind::Class)); // `object` singleton
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn kotlin_records_call_with_enclosing_fn() {
+        let g = build(Language::Kotlin, KOTLIN_SRC);
+        // `helper(2)` -> call_expression whose first child is an `identifier`,
+        // from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper() call from main"
         );
     }
 }
