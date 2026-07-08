@@ -4,7 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use gonzalo_core::{
     BlobStore, Body, ContentHash, Identity, KeyPrefix, Manifest, Meta, PutResult, Record,
-    RecordKey, RecordKind, Revision, Store, segment,
+    RecordKey, RecordKind, Revision, Store,
 };
 use gonzalo_graph::{CodeGraph, GraphStore, Language, build};
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
@@ -94,8 +94,12 @@ pub async fn migrate(
             .collect::<Vec<_>>()
             .join("/");
 
-        let id = segment(&rel_str);
-        let key = RecordKey::new(namespace, collection, id);
+        // Use the relative path verbatim as the record id. The store now
+        // encodes arbitrary key characters reversibly and injectively, so two
+        // distinct source files can never collide onto one record (the old
+        // `segment()` collapse silently dropped one of `docs/api.md` and
+        // `docs_api.md`). Ids stay human-readable (`docs/api.md`).
+        let key = RecordKey::new(namespace, collection, rel_str);
 
         // Idempotency: skip if already present.
         if store.get(&key).await?.is_some() {
@@ -776,8 +780,8 @@ mod tests {
         .await
         .unwrap();
 
-        // The id is segment("alpha.md") = "alpha_md"
-        let record = get(root.path(), "testns", "testcol", "alpha_md")
+        // The id is the source-relative path verbatim.
+        let record = get(root.path(), "testns", "testcol", "alpha.md")
             .await
             .unwrap();
 

@@ -6,7 +6,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use gonzalo_core::{
     BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
-    object_key, store::Conflict,
+    decode_segment, object_key, store::Conflict,
 };
 
 /// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
@@ -339,13 +339,20 @@ fn blob_hash_from_key(key: &str) -> Option<ContentHash> {
     Some(ContentHash(rest.to_string()))
 }
 
-/// Parse `namespace/collection/id.json` back into a `RecordKey`. Returns
-/// `None` for objects that don't match the expected three-part `.json` shape.
+/// Parse `namespace/collection/id.json` back into a `RecordKey`, decoding each
+/// component (the exact inverse of `object_key`). Returns `None` for objects
+/// that don't match the expected three-part `.json` shape. Since every literal
+/// `/` in a component is escaped, splitting on `/` always yields exactly the
+/// three separators' worth of parts.
 fn parse_object_key(s: &str) -> Option<RecordKey> {
     let rest = s.strip_suffix(".json")?;
     let parts: Vec<&str> = rest.split('/').collect();
     if parts.len() == 3 {
-        Some(RecordKey::new(parts[0], parts[1], parts[2]))
+        Some(RecordKey::new(
+            decode_segment(parts[0]),
+            decode_segment(parts[1]),
+            decode_segment(parts[2]),
+        ))
     } else {
         None
     }
@@ -359,6 +366,24 @@ mod tests {
     fn parse_roundtrips_object_key() {
         let k = RecordKey::new("ns", "col", "id");
         assert_eq!(parse_object_key(&object_key(&k)), Some(k));
+    }
+
+    #[test]
+    fn parse_roundtrips_special_char_keys() {
+        // Keys with `.`, `/`, spaces, and `%` must survive the object-key
+        // round-trip and stay distinct (no collision onto one object).
+        for k in [
+            RecordKey::new("a/b", "c.d", "e/f"),
+            RecordKey::new("ns", "col", "v1.0"),
+            RecordKey::new("ns", "col", "v1_0"),
+            RecordKey::new("50% off", "café", "🚀"),
+        ] {
+            assert_eq!(parse_object_key(&object_key(&k)), Some(k));
+        }
+        assert_ne!(
+            object_key(&RecordKey::new("ns", "col", "v1.0")),
+            object_key(&RecordKey::new("ns", "col", "v1_0")),
+        );
     }
 
     #[test]

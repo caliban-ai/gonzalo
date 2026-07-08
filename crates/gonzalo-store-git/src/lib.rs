@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use gonzalo_core::{
     Body, ContentHash, CoreError, Identity, KeyPrefix, MergeOutcome, Meta, PutResult, Record,
-    RecordKey, Result, Revision, merge, record_components, store::Conflict,
+    RecordKey, Result, Revision, decode_segment, merge, record_components, store::Conflict,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -338,9 +338,9 @@ fn key_from_path(path: &Path) -> Option<RecordKey> {
     }
     let id = comps[2].strip_suffix(".json")?;
     Some(RecordKey::new(
-        comps[0].clone(),
-        comps[1].clone(),
-        id.to_string(),
+        decode_segment(&comps[0]),
+        decode_segment(&comps[1]),
+        decode_segment(id),
     ))
 }
 
@@ -500,7 +500,13 @@ fn collect_keys(root: &Path, prefix: &KeyPrefix, out: &mut Vec<RecordKey>) -> Re
                 let f = f.map_err(|e| CoreError::Backend(e.to_string()))?;
                 let fname = f.file_name().to_string_lossy().to_string();
                 if let Some(id) = fname.strip_suffix(".json") {
-                    let key = RecordKey::new(ns_name.clone(), col_name.clone(), id.to_string());
+                    // Path components are `segment`-encoded; decode to recover
+                    // the original key so `list()` round-trips.
+                    let key = RecordKey::new(
+                        decode_segment(&ns_name),
+                        decode_segment(&col_name),
+                        decode_segment(id),
+                    );
                     if prefix.matches(&key) {
                         out.push(key);
                     }

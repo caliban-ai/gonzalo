@@ -39,6 +39,46 @@ where
     stale_expected_returns_conflict(&factory().await).await;
     update_commits_then_stale_update_conflicts(&factory().await).await;
     list_filters_by_prefix(&factory().await).await;
+    special_char_keys_dont_collide(&factory().await).await;
+}
+
+/// Distinct keys that mapped to the *same* physical path under the old lossy
+/// `_`-collapse (`.` and `/` both became `_`) must now be independent records:
+/// no cross-key overwrite, no spurious OCC conflict, and `list()` must return
+/// each original key verbatim (encode/decode round-trip).
+async fn special_char_keys_dont_collide<S: Store>(store: &S) {
+    let dotted = RecordKey::new("ns", "col", "v1.0");
+    let under = RecordKey::new("ns", "col", "v1_0");
+    let slashy = RecordKey::new("a/b", "c.d", "e/f");
+
+    // Creating all three with `expected = None` must each Commit — under the
+    // old collision, `under` would see `dotted` already present and Conflict.
+    for (k, payload) in [
+        (&dotted, b"dotted".as_slice()),
+        (&under, b"under".as_slice()),
+        (&slashy, b"slashy".as_slice()),
+    ] {
+        match store.put(sample(k.clone(), payload), None).await.unwrap() {
+            PutResult::Committed(_) => {}
+            PutResult::Conflict(_) => panic!("distinct key {k:?} collided onto an existing record"),
+        }
+    }
+
+    // Each retrievable independently with its own body — no clobber.
+    for (k, payload) in [
+        (&dotted, b"dotted".as_slice()),
+        (&under, b"under".as_slice()),
+        (&slashy, b"slashy".as_slice()),
+    ] {
+        let got = store.get(k).await.unwrap().expect("record present");
+        assert_eq!(got.body.bytes(), payload, "wrong body for {k:?}");
+    }
+
+    // `list()` round-trips the exact keys (decode is the inverse of encode).
+    let keys = store.list(&KeyPrefix::default()).await.unwrap();
+    for k in [&dotted, &under, &slashy] {
+        assert!(keys.contains(k), "list() missing {k:?}; got {keys:?}");
+    }
 }
 
 async fn get_absent_returns_none<S: Store>(store: &S) {
