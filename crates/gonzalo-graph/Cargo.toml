@@ -28,6 +28,7 @@ tree-sitter-bash = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-swift = "0.7"
 tree-sitter-lua = "0.5"
+tree-sitter-scala = "0.26"
 
 [dev-dependencies]
 gonzalo-store-fs = { workspace = true }
