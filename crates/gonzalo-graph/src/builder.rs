@@ -1,7 +1,8 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
-//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, Kotlin, Swift, and Lua
-//! are supported, and a new grammar is a matter of adding its node-kind mappings.
+//! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, Kotlin, Swift, Lua,
+//! and Scala are supported, and a new grammar is a matter of adding its
+//! node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ pub enum Language {
     Kotlin,
     Swift,
     Lua,
+    Scala,
 }
 
 impl Language {
@@ -50,6 +52,7 @@ impl Language {
             "kt" | "kts" => Some(Self::Kotlin),
             "swift" => Some(Self::Swift),
             "lua" => Some(Self::Lua),
+            "scala" | "sc" => Some(Self::Scala),
             _ => None,
         }
     }
@@ -72,6 +75,7 @@ impl Language {
             Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Self::Scala => tree_sitter_scala::LANGUAGE.into(),
         }
     }
 
@@ -180,6 +184,14 @@ impl Language {
                 "function_declaration" => Some(SymbolKind::Function),
                 _ => None,
             },
+            // Scala `object` (a named singleton) surfaces as a class-like type.
+            Self::Scala => match node_kind {
+                "function_definition" | "function_declaration" => Some(SymbolKind::Function),
+                "class_definition" | "object_definition" => Some(SymbolKind::Class),
+                "trait_definition" => Some(SymbolKind::Trait),
+                "enum_definition" => Some(SymbolKind::Enum),
+                _ => None,
+            },
         }
     }
 
@@ -225,7 +237,7 @@ impl Language {
             Self::Php => node_kind == "function_call_expression",
             // Bash "calls" are commands (`helper arg`).
             Self::Bash => node_kind == "command",
-            Self::Kotlin | Self::Swift => node_kind == "call_expression",
+            Self::Kotlin | Self::Swift | Self::Scala => node_kind == "call_expression",
             Self::Lua => node_kind == "function_call",
         }
     }
@@ -297,6 +309,10 @@ impl Language {
                     .map(str::to_string),
                 _ => node_text(func, bytes).map(str::to_string),
             },
+            // Scala `call_expression` holds the callee in a `function` field — a
+            // bare `identifier` (`helper(..)`) or a `field_expression`
+            // (`obj.method(..)`); take the trailing identifier.
+            Self::Scala => last_identifier(func, bytes),
             // PHP `function_call_expression` holds the callee in a `function`
             // field — a `name` (or `qualified_name`) node; take its text.
             Self::Php => node_text(func, bytes).map(str::to_string),
@@ -588,6 +604,7 @@ def main():
         assert_eq!(Language::from_extension("kts"), Some(Language::Kotlin));
         assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
         assert_eq!(Language::from_extension("lua"), Some(Language::Lua));
+        assert_eq!(Language::from_extension("scala"), Some(Language::Scala));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -1149,6 +1166,44 @@ end
     fn lua_records_call_with_enclosing_fn() {
         let g = build(Language::Lua, LUA_SRC);
         // `helper(2)` -> function_call whose `name` field is the callee, from `main`.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
+            "helper() call from main"
+        );
+    }
+
+    const SCALA_SRC: &str = r#"
+class Widget {
+  def area(): Int = { helper(1) }
+}
+
+object Config
+
+trait Shape
+
+def helper(x: Int): Int = x + 1
+
+def main(): Unit = { helper(2) }
+"#;
+
+    #[test]
+    fn scala_extracts_definitions() {
+        let g = build(Language::Scala, SCALA_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Config"), Some(SymbolKind::Class)); // `object` singleton
+        assert_eq!(named("Shape"), Some(SymbolKind::Trait));
+        assert_eq!(named("area"), Some(SymbolKind::Function));
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        assert_eq!(named("main"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn scala_records_call_with_enclosing_fn() {
+        let g = build(Language::Scala, SCALA_SRC);
+        // `helper(2)` -> call_expression `function` field, from `main`.
         assert!(
             g.references
                 .iter()
