@@ -1,8 +1,6 @@
 //! Merge strategies keyed by `MergeClass`. Used by `Sync` (M2) and by
 //! callers resolving a `PutResult::Conflict`.
 
-use std::collections::HashSet;
-
 use crate::record::{Body, MergeClass};
 
 /// The result of attempting an automatic merge of two divergent bodies.
@@ -18,17 +16,20 @@ pub enum MergeOutcome {
 /// Attempt to merge `ours` and `theirs` given their common `base`,
 /// according to `class`.
 ///
-/// - `AppendOnly`: union of lines from base→ours and base→theirs, in a
-///   stable order (base lines, then new ours lines, then new theirs lines),
-///   de-duplicated. Suits append-only topics and transcripts.
+/// - `AppendOnly`: `ours` verbatim, followed by the tail of `theirs` past the
+///   shared line-prefix of the two sides. A strict append-only union that
+///   preserves committed content byte-exact — it never drops blank lines and
+///   never dedups repeated lines (doing so is silent data loss, ADR 0005).
+///   Suits append-only topics and session transcripts.
 /// - `Structured`: field-level 3-way merge of JSON object bodies (see
 ///   [`structured_merge`]). Disjoint field edits auto-merge; the same field
 ///   changed differently on both sides is a genuine conflict.
 /// - `Opaque`: always `NeedsResolution`.
 /// - `Derived`: never `NeedsResolution`. The body is regenerable and views are
-///   single-writer (ADR 0012), so a divergence is a rare race resolved by
-///   last-writer-wins — deterministically keeping `ours`; the discarded side
-///   can be re-derived from source.
+///   single-writer (ADR 0012), so a divergence is a rare race. `merge` receives
+///   only bodies (no `Meta`), so it cannot compare `updated` timestamps; it
+///   resolves the race deterministically in favor of side A (`ours`) — the
+///   discarded side can be re-derived from source.
 pub fn merge(class: MergeClass, base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
     match class {
         MergeClass::AppendOnly => append_only_merge(base, ours, theirs),
@@ -142,49 +143,65 @@ fn merge_field(
     }
 }
 
-fn append_only_merge(base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
-    let base_lines: Vec<&[u8]> = split_lines(base.bytes());
-    let ours_new = new_lines(&base_lines, ours.bytes());
-    // Pass base_lines + ours_new as already-seen so theirs deduplicates against both
-    let mut seen_for_theirs = Vec::with_capacity(base_lines.len() + ours_new.len());
-    seen_for_theirs.extend_from_slice(&base_lines);
-    seen_for_theirs.extend_from_slice(&ours_new);
-    let theirs_new = new_lines(&seen_for_theirs, theirs.bytes());
+/// Append-only 3-way merge that never loses committed content.
+///
+/// By the append-only invariant, `base` is a line-prefix of both sides, so the
+/// shared committed content is exactly the longest common line-prefix of `ours`
+/// and `theirs` (computing it from the two sides rather than `base` also makes
+/// the merge correct under the empty base that [`crate::sync`] passes). The
+/// result is `ours` byte-for-byte, followed by the lines of `theirs` beyond that
+/// shared prefix — its divergent appended tail.
+///
+/// Crucially this does NOT split-and-filter or dedup: blank lines and legitimate
+/// repeated lines inside committed content survive verbatim on both sides. `base`
+/// is unused because emitting `ours` verbatim already preserves it.
+fn append_only_merge(_base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
+    let ours_lines = split_lines(ours.bytes());
+    let theirs_lines = split_lines(theirs.bytes());
+    // Compare by line *content* (ignoring a trailing `\n`) so a non-newline-
+    // terminated final line still counts as shared with a newline-terminated
+    // peer — otherwise `"a\nb"` vs `"a\nb\nc\n"` would treat `b` as divergent
+    // and fuse it with `theirs`' `b` into `bb`.
+    let shared = ours_lines
+        .iter()
+        .zip(theirs_lines.iter())
+        .take_while(|(o, t)| strip_nl(o) == strip_nl(t))
+        .count();
 
-    let mut out: Vec<u8> = Vec::new();
-    for line in &base_lines {
-        out.extend_from_slice(line);
+    let mut out: Vec<u8> = ours.bytes().to_vec();
+    let tail = &theirs_lines[shared..];
+    // If `ours` didn't end in a newline, separate its final line from `theirs`'
+    // appended tail so the two distinct lines don't fuse into one.
+    if !tail.is_empty() && out.last().is_some_and(|&b| b != b'\n') {
         out.push(b'\n');
     }
-    for line in ours_new.iter().chain(theirs_new.iter()) {
+    for line in tail {
         out.extend_from_slice(line);
-        out.push(b'\n');
     }
     MergeOutcome::Merged(Body::Inline(out))
 }
 
-fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
-    bytes
-        .split(|&b| b == b'\n')
-        .filter(|l| !l.is_empty())
-        .collect()
+/// A line slice without its trailing `\n`, for newline-insensitive comparison.
+fn strip_nl(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
 }
 
-/// Lines present in `bytes` but not in `base_lines`, preserving order and
-/// dropping duplicates.
-fn new_lines<'a>(base_lines: &[&'a [u8]], bytes: &'a [u8]) -> Vec<&'a [u8]> {
-    // HashSet membership keeps this O(n) for large bodies (externalized
-    // sessions). `insert` returns false for a line already in `base_lines` or
-    // seen earlier in `bytes`, so the first occurrence wins and order is
-    // preserved via `out`.
-    let mut seen: HashSet<&[u8]> = base_lines.iter().copied().collect();
-    let mut out = Vec::new();
-    for line in split_lines(bytes) {
-        if seen.insert(line) {
-            out.push(line);
+/// Split `bytes` into lines, each slice keeping its trailing `\n` (the final
+/// line has none iff `bytes` doesn't end in `\n`). Concatenating the result
+/// reproduces `bytes` exactly, so blank and repeated lines round-trip verbatim.
+fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(&bytes[start..=i]);
+            start = i + 1;
         }
     }
-    out
+    if start < bytes.len() {
+        lines.push(&bytes[start..]);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -207,7 +224,9 @@ mod tests {
     }
 
     #[test]
-    fn append_only_dedups_same_addition() {
+    fn append_only_identical_sides_yield_ours() {
+        // When both sides hold the same content, the divergent tail of `theirs`
+        // is empty, so the merge is exactly `ours` — no duplication.
         let base = body("a\n");
         let ours = body("a\nb\n");
         let theirs = body("a\nb\n");
@@ -218,22 +237,61 @@ mod tests {
     }
 
     #[test]
-    fn append_only_dedups_new_lines_across_sides_and_within_a_side() {
-        // ours re-adds base lines plus new lines, one of which it repeats;
-        // theirs re-adds an ours-new line plus its own new ones. The base is
-        // emitted verbatim (assumed already-canonical), then only the genuinely
-        // new ours lines, then the genuinely new theirs lines — each new line
-        // appearing exactly once, in first-occurrence order. This pins the
-        // membership-and-order semantics the HashSet refactor must preserve.
-        let base = body("a\nb\na\n");
+    fn append_only_appends_theirs_tail_and_preserves_repeats() {
+        // Corrected semantics (was `append_only_dedups_new_lines_...`): the merge
+        // is `ours` verbatim followed by the tail of `theirs` past the shared
+        // line-prefix. Repeated lines that are genuinely part of committed
+        // content are NOT deduped — losing them would be silent data loss.
+        // Shared prefix here is "a\nb\n"; ours keeps its "c\nc\n" repeat and
+        // theirs contributes only its divergent tail "e\nf\n".
+        let base = body("a\nb\n");
         let ours = body("a\nb\nc\nc\nd\n");
-        let theirs = body("b\nd\ne\nf\n");
+        let theirs = body("a\nb\ne\nf\n");
         let MergeOutcome::Merged(m) = merge(MergeClass::AppendOnly, &base, &ours, &theirs) else {
             panic!("expected merge");
         };
-        // base verbatim: a,b,a | ours-new (deduped vs base + within): c,d
-        // | theirs-new (deduped vs base + ours-new): e,f
-        assert_eq!(m, body("a\nb\na\nc\nd\ne\nf\n"));
+        assert_eq!(m, body("a\nb\nc\nc\nd\ne\nf\n"));
+    }
+
+    #[test]
+    fn append_only_preserves_blank_and_duplicate_lines() {
+        // Regression for #133: with an empty base (what `sync` passes), a body
+        // whose committed content legitimately contains a blank line and a
+        // repeated line must round-trip WITHOUT losing the blank line or
+        // collapsing the repeat — on both the shared prefix and the appended
+        // tails. Shared prefix: "a\n\nyes\nyes\n"; ours appends "from_a\n",
+        // theirs appends "from_b\n".
+        let base = body("");
+        let ours = body("a\n\nyes\nyes\nfrom_a\n");
+        let theirs = body("a\n\nyes\nyes\nfrom_b\n");
+        let MergeOutcome::Merged(m) = merge(MergeClass::AppendOnly, &base, &ours, &theirs) else {
+            panic!("expected merge");
+        };
+        assert_eq!(m, body("a\n\nyes\nyes\nfrom_a\nfrom_b\n"));
+    }
+
+    #[test]
+    fn append_only_handles_non_newline_terminated_ours() {
+        // `ours` has no trailing newline on its final line `b`. The last line
+        // must be recognized as shared with `theirs`' `b\n` (not fused into
+        // `bb`), and `theirs`' divergent tail appended cleanly on its own line.
+        let base = body("");
+        let ours = body("a\nb");
+        let theirs = body("a\nb\nc\n");
+        let MergeOutcome::Merged(m) = merge(MergeClass::AppendOnly, &base, &ours, &theirs) else {
+            panic!("expected merge");
+        };
+        assert_eq!(m, body("a\nb\nc\n"));
+
+        // And when the final line genuinely diverges, it is preserved (not
+        // fused) with a separating newline before theirs' tail.
+        let ours2 = body("a\nx");
+        let theirs2 = body("a\ny\nz\n");
+        let MergeOutcome::Merged(m2) = merge(MergeClass::AppendOnly, &base, &ours2, &theirs2)
+        else {
+            panic!("expected merge");
+        };
+        assert_eq!(m2, body("a\nx\ny\nz\n"));
     }
 
     #[test]
@@ -246,11 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn derived_takes_ours_deterministically() {
+    fn derived_takes_side_a_deterministically() {
         // Derived bodies are regenerable (e.g. per-view code-graph manifests),
-        // so reconciliation never surfaces a conflict — it deterministically
-        // keeps `ours` (last-writer-wins). Divergence is rare by construction
-        // (single-writer-per-view) and the discarded side can be re-derived.
+        // so reconciliation never surfaces a conflict. `merge` has no access to
+        // `Meta`, so it cannot honor last-writer-wins by timestamp; it resolves
+        // deterministically in favor of side A (`ours`). The choice is purely
+        // positional — swapping the arguments picks the other side — and the
+        // discarded side can be re-derived from source.
         let base = body("base");
         let ours = body("ours-version");
         let theirs = body("theirs-version");
@@ -258,6 +318,12 @@ mod tests {
             panic!("Derived must merge, never NeedsResolution");
         };
         assert_eq!(m, ours);
+        // Purely positional: whichever body is side A wins.
+        let MergeOutcome::Merged(swapped) = merge(MergeClass::Derived, &base, &theirs, &ours)
+        else {
+            panic!("Derived must merge, never NeedsResolution");
+        };
+        assert_eq!(swapped, theirs);
     }
 
     /// Run a structured merge over JSON string inputs and return the parsed

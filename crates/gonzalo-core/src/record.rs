@@ -31,8 +31,9 @@ pub enum MergeClass {
     Opaque,
     /// Regenerable / don't-merge (e.g. per-view code-graph manifests, ADR 0012).
     /// The body can be re-derived from source, and views are single-writer, so a
-    /// divergence is rare and reconciled by last-writer-wins rather than a
-    /// content merge — never a surfaced conflict.
+    /// divergence is rare and reconciled deterministically in favor of side A
+    /// (the `ours` argument to `merge`, which has no `Meta` to compare) rather
+    /// than a content merge — never a surfaced conflict.
     Derived,
 }
 

@@ -49,7 +49,12 @@ pub async fn gc_blobs<B: BlobStore>(blobs: &B, live_manifests: &[Manifest]) -> R
     for hash in &freed {
         blobs.delete_blob(hash).await?;
     }
-    let retained = all.len() - freed.len();
+    // `all` may list a hash more than once (unspecified order, no dedup
+    // guarantee), while `freed` is deduplicated. Count retained from a
+    // deduplicated set of all hashes so a repeated hash doesn't inflate the
+    // total and skew `retained`.
+    let distinct = all.iter().cloned().collect::<BTreeSet<_>>().len();
+    let retained = distinct - freed.len();
     Ok(GcReport { freed, retained })
 }
 
@@ -101,5 +106,49 @@ mod tests {
         let all = vec![h("a"), h("b")];
         let live = BTreeSet::from([h("a"), h("b")]);
         assert!(unreferenced_slices(&all, &live).is_empty());
+    }
+
+    /// A `BlobStore` whose `list_blobs` returns a fixed, possibly-duplicated
+    /// list of hashes and records which hashes `delete_blob` was called on.
+    #[derive(Default)]
+    struct FakeBlobs {
+        listed: Vec<ContentHash>,
+        deleted: std::sync::Mutex<Vec<ContentHash>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FakeBlobs {
+        async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+            Ok(ContentHash::of(content))
+        }
+        async fn get_blob(&self, _hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+            Ok(self.listed.clone())
+        }
+        async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+            self.deleted.lock().unwrap().push(hash.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_counts_distinct_blobs_despite_duplicate_listing() {
+        // `list_blobs` reports `keep` twice and one unreferenced `drop`. There
+        // are two distinct blobs; one is freed, so exactly one is retained — the
+        // duplicate listing must not inflate `retained` to 2 (regression: #156).
+        let blobs = FakeBlobs {
+            listed: vec![h("keep"), h("keep"), h("drop")],
+            deleted: Default::default(),
+        };
+        let mut m = Manifest::new();
+        m.insert("f.rs", h("keep"));
+
+        let report = gc_blobs(&blobs, &[m]).await.unwrap();
+
+        assert_eq!(report.freed, vec![h("drop")]);
+        assert_eq!(report.retained, 1);
+        assert_eq!(*blobs.deleted.lock().unwrap(), vec![h("drop")]);
     }
 }
