@@ -96,8 +96,13 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
+/// Map a backend failure to an opaque `500`. The full error is logged
+/// server-side; the client sees only "internal error" so on-disk graph paths
+/// (`view_db_path`), SQLite text, and S3 endpoint/bucket detail never leak to
+/// the network (#148).
 fn server_error<E: std::fmt::Display>(e: E) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+    eprintln!("gonzalod: internal error: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
 async fn get_record(
@@ -118,8 +123,21 @@ async fn get_record(
 async fn put_record(
     State(svc): State<Arc<Service>>,
     Extension(principal): Extension<Principal>,
+    Path((ns, col, id)): Path<(String, String, String)>,
     Json(mut body): Json<PutBody>,
 ) -> Response {
+    // The URL path addresses the record; the body must agree with it. Without
+    // this check the path is decorative and authz/write key off the body alone,
+    // so a path-based proxy control could be bypassed by a mismatched body
+    // (#158). Reject the disagreement with 400 before any authz or write.
+    let key = &body.record.key;
+    if ns != key.namespace || col != key.collection || id != key.id {
+        return (
+            StatusCode::BAD_REQUEST,
+            "URL path does not match record key",
+        )
+            .into_response();
+    }
     let ns = &body.record.key.namespace;
     if !principal.allows(Access::Write, ns) {
         return forbidden(&principal, Access::Write, &ns.clone());
@@ -179,12 +197,13 @@ async fn ticket_sync(
     }
     match svc.ticket_sync(&conn, "gonzalod").await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        // A misconfigured request is the caller's own input → safe to echo. An
+        // internal failure goes through `server_error` so its detail is logged,
+        // not leaked (#148).
         Err(crate::service::TicketSyncError::BadRequest(m)) => {
             (StatusCode::BAD_REQUEST, m).into_response()
         }
-        Err(crate::service::TicketSyncError::Internal(m)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, m).into_response()
-        }
+        Err(crate::service::TicketSyncError::Internal(m)) => server_error(m),
     }
 }
 
@@ -525,6 +544,58 @@ mod tests {
         let (svc, _d) = fs_service();
         let (s, _) = call(svc, scoped(), "GET", "/v1/keys", Some("atok"), None).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn put_rejects_url_path_body_key_mismatch() {
+        // Body key is memory/col/x; URL path addresses .../col/y — a disagreement
+        // that must be rejected with 400 before any authz or write (#158).
+        let (svc, _d) = fs_service();
+        let (s, _) = call(
+            svc,
+            scoped(),
+            "PUT",
+            "/v1/records/memory/col/y",
+            Some("wtok"),
+            Some(put_body("memory", "writer")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // A matching path still commits.
+        let (svc, _d) = fs_service();
+        let (s, _) = call(
+            svc,
+            scoped(),
+            "PUT",
+            "/v1/records/memory/col/x",
+            Some("wtok"),
+            Some(put_body("memory", "writer")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn backend_error_is_opaque() {
+        // A forced backend failure yields an opaque 500 body — the leaky
+        // "store unreachable" detail never reaches the client (#148).
+        let dir = TempDir::new().unwrap();
+        let blobs = Arc::new(FsStore::new(dir.path()));
+        let svc = Service::new(Arc::new(DownStore), blobs);
+        let (s, body) = call(
+            svc,
+            scoped(),
+            "GET",
+            "/v1/records/memory/col/x",
+            Some("wtok"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        let text = String::from_utf8(body).unwrap();
+        assert_eq!(text, "internal error");
+        assert!(!text.contains("unreachable"));
     }
 
     #[tokio::test]
