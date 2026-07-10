@@ -41,12 +41,32 @@ impl GrpcAdapter {
         access: Access,
         namespace: &str,
     ) -> Result<Principal, Status> {
-        let principal = self
-            .auth
+        let principal = self.authenticate(metadata)?;
+        self.check_access(&principal, access, namespace)?;
+        Ok(principal)
+    }
+
+    /// Authenticate the call's bearer token into a [`Principal`], independent of
+    /// any namespace. Split out from [`authorize`] so a handler can reject an
+    /// unauthenticated caller *before* deserializing attacker-controlled JSON
+    /// (#146) and only then authorize against a namespace parsed from the body.
+    #[allow(clippy::result_large_err)]
+    fn authenticate(&self, metadata: &MetadataMap) -> Result<Principal, Status> {
+        self.auth
             .authenticate(bearer(metadata))
-            .ok_or_else(|| Status::unauthenticated("invalid or missing token"))?;
+            .ok_or_else(|| Status::unauthenticated("invalid or missing token"))
+    }
+
+    /// Authorize an already-authenticated `principal` for `access` on `namespace`.
+    #[allow(clippy::result_large_err)]
+    fn check_access(
+        &self,
+        principal: &Principal,
+        access: Access,
+        namespace: &str,
+    ) -> Result<(), Status> {
         if principal.allows(access, namespace) {
-            Ok(principal)
+            Ok(())
         } else {
             Err(Status::permission_denied(format!(
                 "principal {:?} lacks {access:?} on namespace {namespace:?}",
@@ -65,8 +85,13 @@ fn bearer(metadata: &MetadataMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
+/// Map a backend failure to an opaque `Internal` status. The full error is
+/// logged server-side; the client sees only "internal error" so on-disk graph
+/// paths, SQLite text, and S3 endpoint/bucket detail never leak to the network
+/// (#148).
 fn internal<E: std::fmt::Display>(e: E) -> Status {
-    Status::internal(e.to_string())
+    eprintln!("gonzalod: internal error: {e}");
+    Status::internal("internal error")
 }
 
 #[tonic::async_trait]
@@ -91,10 +116,17 @@ impl Gonzalo for GrpcAdapter {
 
     async fn put(&self, req: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let (metadata, _ext, r) = req.into_parts();
-        let mut record: Record = serde_json::from_slice(&r.record_json).map_err(internal)?;
-        let expected: Option<Revision> =
-            serde_json::from_slice(&r.expected_json).map_err(internal)?;
-        let principal = self.authorize(&metadata, Access::Write, &record.key.namespace)?;
+        // Authenticate BEFORE deserializing attacker-controlled JSON (#146): an
+        // unauthenticated caller is rejected without ever feeding its body to
+        // serde. Only then parse the body (malformed input is the caller's
+        // error → invalid_argument, not internal) and authorize the write
+        // against the namespace named in the record's key.
+        let principal = self.authenticate(&metadata)?;
+        let mut record: Record = serde_json::from_slice(&r.record_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let expected: Option<Revision> = serde_json::from_slice(&r.expected_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.check_access(&principal, Access::Write, &record.key.namespace)?;
         // Stamp the author from the authenticated principal — unforgeable (ADR
         // 0015). Open mode (no auth) leaves the record's author untouched.
         if principal.is_authenticated() {
@@ -150,8 +182,11 @@ impl Gonzalo for GrpcAdapter {
             .ticket_sync(&conn, "gonzalod")
             .await
             .map_err(|e| match e {
+                // A misconfigured request is the caller's own input → safe to
+                // echo. An internal failure goes through `internal` so its
+                // detail is logged, not leaked (#148).
                 crate::service::TicketSyncError::BadRequest(m) => Status::invalid_argument(m),
-                crate::service::TicketSyncError::Internal(m) => Status::internal(m),
+                crate::service::TicketSyncError::Internal(m) => internal(m),
             })?;
         Ok(Response::new(TicketSyncResponse {
             imported: summary.imported as u64,
@@ -382,6 +417,79 @@ mod tests {
             record_json: serde_json::to_vec(&record).unwrap(),
             expected_json: serde_json::to_vec(&Option::<Revision>::None).unwrap(),
         }
+    }
+
+    /// A well-formed `PutRequest` whose `record_json` is not valid JSON.
+    fn malformed_put_req() -> PutRequest {
+        PutRequest {
+            record_json: b"definitely not a record".to_vec(),
+            expected_json: serde_json::to_vec(&Option::<Revision>::None).unwrap(),
+        }
+    }
+
+    /// A store whose every op fails, to force the `internal` (server-error) path.
+    struct DownStore;
+
+    #[async_trait::async_trait]
+    impl Store for DownStore {
+        async fn get(&self, _key: &RecordKey) -> gonzalo_core::Result<Option<Record>> {
+            Err(gonzalo_core::CoreError::Backend(
+                "/var/lib/gonzalo/graphs/secret.sqlite unreachable".into(),
+            ))
+        }
+        async fn put(
+            &self,
+            _record: Record,
+            _expected: Option<Revision>,
+        ) -> gonzalo_core::Result<PutResult> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+        async fn list(
+            &self,
+            _prefix: &gonzalo_core::KeyPrefix,
+        ) -> gonzalo_core::Result<Vec<RecordKey>> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn put_authenticates_before_deserializing() {
+        // A malformed body with NO token is rejected at authentication, before
+        // serde ever runs on the attacker-controlled JSON (#146).
+        let adapter = fs_adapter(scoped_auth());
+        let err = adapter
+            .put(Request::new(malformed_put_req()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn put_malformed_body_is_invalid_argument_not_internal() {
+        // An authorized caller sending a malformed body gets InvalidArgument —
+        // the caller's own bad input — not Internal (#146).
+        let adapter = fs_adapter(scoped_auth());
+        let err = adapter
+            .put(with_token(malformed_put_req(), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn backend_error_is_opaque() {
+        // A forced backend failure yields an opaque Internal status; the leaky
+        // path/bucket detail never reaches the client (#148).
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(Arc::new(DownStore), fs));
+        let err = adapter.get(Request::new(get_req("any"))).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+        assert!(!err.message().contains("secret"));
     }
 
     #[tokio::test]
