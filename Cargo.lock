@@ -2158,6 +2158,7 @@ dependencies = [
  "async-trait",
  "git2",
  "gonzalo-core",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
