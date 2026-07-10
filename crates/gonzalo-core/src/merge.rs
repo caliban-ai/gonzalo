@@ -158,17 +158,32 @@ fn merge_field(
 fn append_only_merge(_base: &Body, ours: &Body, theirs: &Body) -> MergeOutcome {
     let ours_lines = split_lines(ours.bytes());
     let theirs_lines = split_lines(theirs.bytes());
+    // Compare by line *content* (ignoring a trailing `\n`) so a non-newline-
+    // terminated final line still counts as shared with a newline-terminated
+    // peer — otherwise `"a\nb"` vs `"a\nb\nc\n"` would treat `b` as divergent
+    // and fuse it with `theirs`' `b` into `bb`.
     let shared = ours_lines
         .iter()
         .zip(theirs_lines.iter())
-        .take_while(|(o, t)| o == t)
+        .take_while(|(o, t)| strip_nl(o) == strip_nl(t))
         .count();
 
     let mut out: Vec<u8> = ours.bytes().to_vec();
-    for line in &theirs_lines[shared..] {
+    let tail = &theirs_lines[shared..];
+    // If `ours` didn't end in a newline, separate its final line from `theirs`'
+    // appended tail so the two distinct lines don't fuse into one.
+    if !tail.is_empty() && out.last().is_some_and(|&b| b != b'\n') {
+        out.push(b'\n');
+    }
+    for line in tail {
         out.extend_from_slice(line);
     }
     MergeOutcome::Merged(Body::Inline(out))
+}
+
+/// A line slice without its trailing `\n`, for newline-insensitive comparison.
+fn strip_nl(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
 }
 
 /// Split `bytes` into lines, each slice keeping its trailing `\n` (the final
@@ -253,6 +268,30 @@ mod tests {
             panic!("expected merge");
         };
         assert_eq!(m, body("a\n\nyes\nyes\nfrom_a\nfrom_b\n"));
+    }
+
+    #[test]
+    fn append_only_handles_non_newline_terminated_ours() {
+        // `ours` has no trailing newline on its final line `b`. The last line
+        // must be recognized as shared with `theirs`' `b\n` (not fused into
+        // `bb`), and `theirs`' divergent tail appended cleanly on its own line.
+        let base = body("");
+        let ours = body("a\nb");
+        let theirs = body("a\nb\nc\n");
+        let MergeOutcome::Merged(m) = merge(MergeClass::AppendOnly, &base, &ours, &theirs) else {
+            panic!("expected merge");
+        };
+        assert_eq!(m, body("a\nb\nc\n"));
+
+        // And when the final line genuinely diverges, it is preserved (not
+        // fused) with a separating newline before theirs' tail.
+        let ours2 = body("a\nx");
+        let theirs2 = body("a\ny\nz\n");
+        let MergeOutcome::Merged(m2) = merge(MergeClass::AppendOnly, &base, &ours2, &theirs2)
+        else {
+            panic!("expected merge");
+        };
+        assert_eq!(m2, body("a\nx\ny\nz\n"));
     }
 
     #[test]
