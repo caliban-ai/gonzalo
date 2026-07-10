@@ -249,7 +249,13 @@ async fn collect_keys(
             {
                 let fname = f.file_name().to_string_lossy().to_string();
                 if let Some(id) = fname.strip_suffix(".json") {
-                    let key = RecordKey::new(ns_name.clone(), col_name.clone(), id.to_string());
+                    // Directory/file names are `segment`-encoded; decode each
+                    // component back to the original key so `list()` round-trips.
+                    let key = RecordKey::new(
+                        gonzalo_core::decode_segment(&ns_name),
+                        gonzalo_core::decode_segment(&col_name),
+                        gonzalo_core::decode_segment(id),
+                    );
                     if prefix.matches(&key) {
                         out.push(key);
                     }
