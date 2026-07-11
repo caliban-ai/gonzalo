@@ -3,7 +3,7 @@
 
 use gonzalo_domain::StateCategory;
 use gonzalo_ticket::conformance::{assert_ticket_invariants, assert_write_gating};
-use gonzalo_ticket::{Cursor, StateMapping, StateSignal, TicketSource};
+use gonzalo_ticket::{Cursor, SourceError, StateMapping, StateSignal, TicketSource};
 use gonzalo_ticket_gitlab::GitLabSource;
 use std::collections::BTreeMap;
 use wiremock::matchers::{method, path_regex};
@@ -75,4 +75,44 @@ async fn writes_state_and_note() {
     let src = GitLabSource::with_base(&server.uri(), "g/p", "tok").unwrap();
     src.set_state("g/p#7", StateCategory::Done).await.unwrap();
     src.comment("g/p#7", "hi").await.unwrap();
+}
+
+#[tokio::test]
+async fn non_terminal_set_state_under_scoped_label_is_unsupported() {
+    // #143: with a scoped-label mapping in effect, a non-terminal move can't be
+    // expressed via the intrinsic close/reopen event, so it must error rather
+    // than report a false success. No HTTP request should be made.
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/issues/7$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let src = GitLabSource::with_base(&server.uri(), "g/p", "tok")
+        .unwrap()
+        .with_mapping(workflow_mapping());
+
+    let err = src
+        .set_state("g/p#7", StateCategory::InProgress)
+        .await
+        .expect_err("non-terminal move under a scoped-label mapping must error");
+    assert!(matches!(err, SourceError::Unsupported(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn terminal_set_state_still_works_under_scoped_label() {
+    // #143: terminal moves remain expressible via the intrinsic close event even
+    // when a scoped-label mapping is configured.
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/issues/7$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let src = GitLabSource::with_base(&server.uri(), "g/p", "tok")
+        .unwrap()
+        .with_mapping(workflow_mapping());
+    src.set_state("g/p#7", StateCategory::Done).await.unwrap();
 }

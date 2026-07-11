@@ -52,6 +52,13 @@ fn resolve_state(
     labels: &[String],
     mapping: Option<&StateMapping>,
 ) -> (StateCategory, String) {
+    // A closed issue is terminal regardless of any lingering workflow label:
+    // the intrinsic `closed` state is authoritative and a scoped-label mapping
+    // only classifies *open* issues (#142). Otherwise a closed issue still
+    // carrying `workflow::in review` would be misreported as InProgress.
+    if issue_state == "closed" {
+        return (StateCategory::Done, issue_state.to_string());
+    }
     if let Some(m) = mapping
         && let StateSignal::ScopedLabel { prefix } = &m.signal
         && let Some(label) = labels.iter().find(|l| l.starts_with(prefix.as_str()))
@@ -59,11 +66,7 @@ fn resolve_state(
         let suffix = &label[prefix.len()..];
         return (m.category_of(suffix), label.clone());
     }
-    let category = match issue_state {
-        "closed" => StateCategory::Done,
-        _ => StateCategory::Open,
-    };
-    (category, issue_state.to_string())
+    (StateCategory::Open, issue_state.to_string())
 }
 
 fn actor(user: &GlUser, role: ActorRole) -> Actor {
@@ -207,5 +210,19 @@ mod tests {
         let m = workflow_mapping();
         let t = issue_to_ticket(&issue("closed", &["type::bug"]), "group/proj", Some(&m));
         assert_eq!(t.state.category, StateCategory::Done);
+    }
+
+    #[test]
+    fn closed_issue_is_terminal_despite_workflow_label() {
+        // #142: a closed issue still carrying `workflow::in review` must be
+        // classified terminal (Done), not by the scoped label (InProgress).
+        let m = workflow_mapping();
+        let t = issue_to_ticket(
+            &issue("closed", &["workflow::in review"]),
+            "group/proj",
+            Some(&m),
+        );
+        assert_eq!(t.state.category, StateCategory::Done);
+        assert_eq!(t.state.raw_name, "closed");
     }
 }

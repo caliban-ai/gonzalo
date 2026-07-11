@@ -10,7 +10,9 @@
 use crate::mapping::{AsanaTask, task_to_ticket};
 use async_trait::async_trait;
 use gonzalo_domain::{StateCategory, Ticket};
-use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
+use gonzalo_ticket::{
+    Capabilities, Cursor, Page, Result, SourceError, StateMapping, StateSignal, TicketSource,
+};
 use serde::Deserialize;
 
 const DEFAULT_BASE: &str = "https://app.asana.com/api/1.0";
@@ -154,9 +156,26 @@ impl TicketSource for AsanaSource {
 
     async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
         // The portable Asana write is the `completed` flag: terminal categories
-        // complete the task, others reopen it. (Section / custom-field moves are
-        // a future addition.)
-        let completed = matches!(target, StateCategory::Done | StateCategory::Canceled);
+        // complete the task, others reopen it.
+        let terminal = matches!(target, StateCategory::Done | StateCategory::Canceled);
+        // When a section / custom-field mapping drives the read path, the
+        // category comes from that field, not the `completed` bool. Only a
+        // terminal move is expressible via the completed flag; a non-terminal
+        // move would toggle `completed` without touching the section / custom
+        // field, so the read path would still report the field's category.
+        // Reject it rather than reporting a false success (#143). (Section /
+        // custom-field write-back is out of scope here.)
+        if !terminal
+            && matches!(
+                self.mapping.as_ref().map(|m| &m.signal),
+                Some(StateSignal::Section | StateSignal::CustomField { .. })
+            )
+        {
+            return Err(SourceError::Unsupported(
+                "non-terminal set_state under a section/custom-field mapping (section/custom-field write-back not implemented)",
+            ));
+        }
+        let completed = terminal;
         let url = self.url(&["tasks", uid])?;
         self.auth(
             self.client
