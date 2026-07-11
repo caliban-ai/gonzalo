@@ -4,7 +4,7 @@ use gonzalo_domain::StateCategory;
 use gonzalo_ticket::conformance::{assert_ticket_invariants, assert_write_gating};
 use gonzalo_ticket::{Cursor, TicketSource};
 use gonzalo_ticket_linear::LinearSource;
-use wiremock::matchers::method;
+use wiremock::matchers::{body_string_contains, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -47,18 +47,75 @@ async fn surfaces_graphql_errors() {
     assert!(err.to_string().contains("unauthorized"));
 }
 
-#[tokio::test]
-async fn set_state_resolves_team_state_then_updates() {
-    let server = MockServer::start().await;
+/// Mount the team-state resolution used by `set_state`.
+async fn mount_states(server: &MockServer) {
     Mock::given(method("POST"))
+        .and(body_string_contains("states"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {"issue": {"team": {"states": {"nodes": [
                 {"id": "st-done", "type": "completed"}
             ]}}}}
         })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn set_state_resolves_team_state_then_updates() {
+    let server = MockServer::start().await;
+    mount_states(&server).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("issueUpdate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"data": {"issueUpdate": {"success": true}}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("commentCreate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"data": {"commentCreate": {"success": true}}})),
+        )
         .mount(&server)
         .await;
     let src = LinearSource::with_endpoint(&server.uri(), "k").unwrap();
     src.set_state("u1", StateCategory::Done).await.unwrap();
     src.comment("u1", "hi").await.unwrap();
+}
+
+#[tokio::test]
+async fn set_state_errors_when_mutation_reports_failure() {
+    // Linear returns HTTP 200 with success:false and no `errors` array when it
+    // silently declines a write (bad stateId, missing permission).
+    let server = MockServer::start().await;
+    mount_states(&server).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("issueUpdate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"data": {"issueUpdate": {"success": false}}})),
+        )
+        .mount(&server)
+        .await;
+    let src = LinearSource::with_endpoint(&server.uri(), "k").unwrap();
+    let err = src.set_state("u1", StateCategory::Done).await.unwrap_err();
+    assert!(err.to_string().contains("success: false"), "got: {err}");
+}
+
+#[tokio::test]
+async fn comment_errors_when_mutation_reports_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("commentCreate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"data": {"commentCreate": {"success": false}}})),
+        )
+        .mount(&server)
+        .await;
+    let src = LinearSource::with_endpoint(&server.uri(), "k").unwrap();
+    let err = src.comment("u1", "hi").await.unwrap_err();
+    assert!(err.to_string().contains("success: false"), "got: {err}");
 }
