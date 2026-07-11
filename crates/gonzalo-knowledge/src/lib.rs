@@ -67,13 +67,15 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
     }
 
     /// Ingest the record at `key`: split it into per-kind [`chunk`]s, embed each,
-    /// and index it under a derived per-chunk key. Returns `false` (without
-    /// indexing) if the record is absent or its kind is not knowledge-bearing.
+    /// and index it under a derived per-chunk key. Returns `Ok(false)` (without
+    /// indexing) if the record is absent or its kind is definitionally not
+    /// knowledge-bearing; returns `Err` if a knowledge-bearing body fails to
+    /// parse — a corrupt record is a real failure, not "not indexable" (#139).
     pub async fn ingest(&self, key: &gonzalo_core::RecordKey) -> Result<bool> {
         let Some(record) = self.store.get(key).await? else {
             return Ok(false);
         };
-        let Some(chunks) = chunk(&record) else {
+        let Some(chunks) = chunk(&record)? else {
             return Ok(false);
         };
 
@@ -97,6 +99,27 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
             .unwrap()
             .insert(key.clone(), chunks.len());
         Ok(true)
+    }
+
+    /// De-index the record at `key`: remove every chunk vector it contributed to
+    /// the index and forget its chunk count. This is the counterpart to a record
+    /// being deleted from the store — without it, the record's chunk vectors are
+    /// orphaned, still matching in [`query`] but de-duping to a parent that no
+    /// longer resolves, so they silently shrink the result set (#150).
+    ///
+    /// Idempotent: removing a record that was never ingested (chunk count 0)
+    /// removes nothing. Uses the same [`chunk_key`] derivation as [`ingest`].
+    pub async fn remove(&self, key: &gonzalo_core::RecordKey) -> Result<()> {
+        // Read the count under a scoped lock — never held across an `.await`.
+        let count = {
+            let counts = self.chunk_counts.lock().unwrap();
+            counts.get(key).copied().unwrap_or(0)
+        };
+        for ordinal in 0..count {
+            self.index.remove(&chunk_key(key, ordinal)).await?;
+        }
+        self.chunk_counts.lock().unwrap().remove(key);
+        Ok(())
     }
 
     /// Semantic query, one hit per record. Embed `text`, over-fetch chunk
@@ -155,7 +178,7 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
         for m in matches {
             let (parent, ordinal) = parent_key(&m.key);
             if let Some(record) = self.store.get(&parent).await? {
-                let text = chunk(&record)
+                let text = chunk(&record)?
                     .and_then(|cs| cs.into_iter().nth(ordinal))
                     .unwrap_or_default();
                 hits.push(ChunkHit {
@@ -203,38 +226,53 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
 /// knowledge-bearing (ADR 0011). Kept as the one-document view: the [`chunk`]s
 /// joined back into a single string.
 pub fn knowledge_text(record: &Record) -> Option<String> {
-    chunk(record).map(|cs| cs.join("\n"))
+    // A body that fails to parse is not a "one document"; collapse it to `None`
+    // for this convenience view. The indexing path ([`chunk`]/[`ingest`])
+    // surfaces the error instead (#139).
+    chunk(record).ok().flatten().map(|cs| cs.join("\n"))
 }
 
-/// Split a record into ordered chunk texts, or `None` if its kind is not
-/// knowledge-bearing (ADR 0011). Chunking is per-kind: a `Session` by turn, a
-/// long `MemoryTier`/`Ticket` by section/paragraph, a `Topic` by bullet. The
-/// kind's title/name is folded into the first chunk so it stays searchable. A
-/// kind that yields a single piece is the one-document fallback — identical to
-/// phase-1 behavior. Extraction goes through the `gonzalo-domain` typed views.
-pub fn chunk(record: &Record) -> Option<Vec<String>> {
-    match record.kind {
-        RecordKind::MemoryTier => MemoryTier::from_body(&record.body)
-            .ok()
-            .map(|t| prepend_header(&t.name, split_paragraphs(&t.content))),
-        RecordKind::Topic => Topic::from_body(&record.body)
-            .ok()
-            .map(|t| prepend_header(&t.slug, t.bullets)),
-        RecordKind::Session => Session::from_body(&record.body)
-            .ok()
-            .map(|s| prepend_header(&s.name, s.turns.into_iter().map(|turn| turn.text).collect())),
-        RecordKind::Ticket => Ticket::from_body(&record.body).ok().map(|t| {
+/// Split a record into ordered chunk texts. Returns `Ok(None)` if the kind is
+/// definitionally not knowledge-bearing (`Checkpoint`/`GraphManifest`, ADR
+/// 0011), and `Err` if a knowledge-bearing body fails to parse — so a corrupt
+/// record is distinguishable from a genuinely non-indexable one (#139).
+/// Chunking is per-kind: a `Session` by turn, a long `MemoryTier`/`Ticket` by
+/// section/paragraph, a `Topic` by bullet. The kind's title/name is folded into
+/// the first chunk so it stays searchable. A kind that yields a single piece is
+/// the one-document fallback — identical to phase-1 behavior. Extraction goes
+/// through the `gonzalo-domain` typed views.
+pub fn chunk(record: &Record) -> Result<Option<Vec<String>>> {
+    let chunks = match record.kind {
+        RecordKind::MemoryTier => {
+            let t = MemoryTier::from_body(&record.body)?;
+            prepend_header(&t.name, split_paragraphs(&t.content))
+        }
+        RecordKind::Topic => {
+            let t = Topic::from_body(&record.body)?;
+            prepend_header(&t.slug, t.bullets)
+        }
+        RecordKind::Session => {
+            let s = Session::from_body(&record.body)?;
+            prepend_header(&s.name, s.turns.into_iter().map(|turn| turn.text).collect())
+        }
+        RecordKind::Ticket => {
+            let t = Ticket::from_body(&record.body)?;
             let mut cs = vec![format!("{}\n{}", t.title, t.labels.join(" "))];
             cs.extend(split_paragraphs(&t.body.markdown));
             cs
-        }),
-        RecordKind::TicketEvent => TicketEvent::from_body(&record.body)
-            .ok()
-            .map(|e| vec![e.body]),
+        }
+        RecordKind::TicketEvent => {
+            let e = TicketEvent::from_body(&record.body)?;
+            vec![e.body]
+        }
         // Not knowledge-bearing: a checkpoint is opaque state; a graph manifest
         // is a path -> content-hash map, not natural-language text (ADR 0011/0012).
-        RecordKind::Checkpoint | RecordKind::GraphManifest => None,
-    }
+        // These are the ONLY definitionally-opaque kinds — a parse failure on a
+        // knowledge-bearing kind above propagates as an error rather than being
+        // silently indistinguishable from "not indexable" (#139).
+        RecordKind::Checkpoint | RecordKind::GraphManifest => return Ok(None),
+    };
+    Ok(Some(chunks))
 }
 
 /// Fold `header` into the first `pieces` chunk so it stays searchable; if
@@ -363,6 +401,7 @@ mod tests {
             RecordKind::Session,
             session.to_body().unwrap(),
         ))
+        .unwrap()
         .unwrap();
         assert_eq!(chunks.len(), 3);
         // Session name is prepended to the first chunk so it stays searchable.
@@ -380,7 +419,9 @@ mod tests {
             bullets: vec!["use clippy".into(), "run rustfmt".into()],
         };
         let key = RecordKey::new("caliban", "topics", "rust");
-        let chunks = chunk(&record(&key, RecordKind::Topic, topic.to_body().unwrap())).unwrap();
+        let chunks = chunk(&record(&key, RecordKind::Topic, topic.to_body().unwrap()))
+            .unwrap()
+            .unwrap();
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].contains("rust"));
         assert!(chunks[0].contains("use clippy"));
@@ -391,12 +432,14 @@ mod tests {
             slug: "solo".into(),
             bullets: vec!["only bullet".into()],
         };
-        let chunks = chunk(&record(&key, RecordKind::Topic, one.to_body().unwrap())).unwrap();
+        let chunks = chunk(&record(&key, RecordKind::Topic, one.to_body().unwrap()))
+            .unwrap()
+            .unwrap();
         assert_eq!(chunks.len(), 1);
 
         // Non-knowledge kinds still gate to None.
         let ck = record(&key, RecordKind::Checkpoint, Body::Inline(b"{}".to_vec()));
-        assert_eq!(chunk(&ck), None);
+        assert_eq!(chunk(&ck).unwrap(), None);
     }
 
     #[test]
@@ -689,6 +732,99 @@ mod tests {
         .await;
         let ks = KnowledgeStore::new(store, MemoryVectorIndex::default(), Bow);
         assert!(!ks.ingest(&key).await.unwrap(), "checkpoint is not indexed");
+    }
+
+    #[tokio::test]
+    async fn ingest_surfaces_body_parse_error_and_gates_opaque_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        // A knowledge-bearing kind (Topic) whose body bytes are not a valid
+        // Topic: a corrupt record is a real failure, not "not indexable" (#139).
+        let corrupt = RecordKey::new("caliban", "topics", "corrupt");
+        put(
+            &store,
+            record(
+                &corrupt,
+                RecordKind::Topic,
+                Body::Inline(b"not a valid topic".to_vec()),
+            ),
+        )
+        .await;
+
+        // A definitionally-opaque kind still gates cleanly to Ok(false).
+        let ck = RecordKey::new("caliban", "checkpoints", "c1");
+        put(
+            &store,
+            record(
+                &ck,
+                RecordKind::Checkpoint,
+                Body::Inline(b"opaque".to_vec()),
+            ),
+        )
+        .await;
+
+        let ks = KnowledgeStore::new(store, MemoryVectorIndex::default(), Bow);
+        assert!(
+            ks.ingest(&corrupt).await.is_err(),
+            "a corrupt knowledge-bearing body must surface an error, not Ok(false)"
+        );
+        assert!(
+            !ks.ingest(&ck).await.unwrap(),
+            "a genuinely-opaque kind is non-indexable: Ok(false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deindexes_a_records_chunk_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        // Three topics all matching "gamma". One will be removed; the other two
+        // are the live set.
+        let removed = RecordKey::new("caliban", "topics", "removed");
+        let live1 = RecordKey::new("caliban", "topics", "live1");
+        let live2 = RecordKey::new("caliban", "topics", "live2");
+        for key in [&removed, &live1, &live2] {
+            put(
+                &store,
+                record(
+                    key,
+                    RecordKind::Topic,
+                    Topic {
+                        slug: "gamma".into(),
+                        bullets: vec!["gamma".into()],
+                    }
+                    .to_body()
+                    .unwrap(),
+                ),
+            )
+            .await;
+        }
+
+        let ks = KnowledgeStore::new(store, MemoryVectorIndex::default(), Bow);
+        for key in [&removed, &live1, &live2] {
+            assert!(ks.ingest(key).await.unwrap());
+        }
+
+        // De-index the one record. Its chunk vectors must no longer match, so
+        // the k=2 query is filled entirely by the live records — no shrinkage
+        // from orphaned vectors, and the removed record never appears (#150).
+        ks.remove(&removed).await.unwrap();
+
+        let hits = ks.query("gamma", 2, &KeyPrefix::default()).await.unwrap();
+        assert_eq!(hits.len(), 2, "k=2 should be filled by the live records");
+        let keys: std::collections::BTreeSet<RecordKey> =
+            hits.iter().map(|h| h.record.key.clone()).collect();
+        assert!(
+            !keys.contains(&removed),
+            "removed record must not appear after de-indexing"
+        );
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([live1, live2]),
+            "only the live records should remain"
+        );
     }
 
     #[cfg(feature = "graph")]
