@@ -207,7 +207,11 @@ async fn main() -> Result<()> {
             id,
         } => match get(&root, &namespace, &collection, &id).await? {
             Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
-            None => println!("not found"),
+            // Automation-driven CLI: an absent record is an error, not a success.
+            // Report to stderr (stdout stays empty for clean piping) and let main
+            // map the `Err` to a non-zero exit so callers can tell absent apart
+            // from present.
+            None => anyhow::bail!("record not found: {namespace}/{collection}/{id}"),
         },
 
         Commands::Status { root } => {
@@ -248,7 +252,9 @@ async fn main() -> Result<()> {
                     debounce: Duration::from_millis(debounce_ms),
                     full_reconcile: Duration::from_secs(reconcile_secs),
                 };
-                watch(&root, &src, &repo, &view, config).await?;
+                // Thread `--gc` into the watch loop so each reconcile sweeps when
+                // requested, rather than silently dropping the flag (#157).
+                watch(&root, &src, &repo, &view, config, gc).await?;
                 return Ok(());
             }
             let (summary, swept) = index_with_gc(&root, &src, &repo, &view, gc).await?;
@@ -320,7 +326,9 @@ async fn main() -> Result<()> {
                 // spans all providers; `get` needs the exact collection.
                 match get(&root, "tickets", "github", &uid).await? {
                     Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
-                    None => println!("not found"),
+                    // Absent ticket → stderr message + non-zero exit (stdout empty)
+                    // so automation can distinguish missing from present.
+                    None => anyhow::bail!("ticket not found: {uid}"),
                 }
             }
             TicketCommands::Move {
