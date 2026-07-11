@@ -649,7 +649,9 @@ pub async fn ticket_sync(
     let store = FsStore::new(root);
     let mut reports = Vec::new();
     for (name, source) in config.sources().context("building ticket sources")? {
-        let summary = gonzalo_ticket::ingest(source.as_ref(), &store, author)
+        // Scope each record key by connection name so the same issue on two
+        // boards yields two distinct records rather than colliding (#159).
+        let summary = gonzalo_ticket::ingest(source.as_ref(), &store, author, Some(&name))
             .await
             .with_context(|| format!("syncing connection {name}"))?;
         reports.push(TicketSyncReport {

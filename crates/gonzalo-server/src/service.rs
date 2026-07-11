@@ -79,9 +79,16 @@ impl Service {
         author: &str,
     ) -> std::result::Result<IngestSummary, TicketSyncError> {
         let source = gonzalo_ticket_config::build_source(conn).map_err(classify_config_err)?;
-        gonzalo_ticket::ingest(source.as_ref(), self.store.as_ref(), author)
-            .await
-            .map_err(|e| TicketSyncError::Internal(e.to_string()))
+        // Scope record keys by connection name so the same issue synced from two
+        // boards produces two distinct records instead of colliding (#159).
+        gonzalo_ticket::ingest(
+            source.as_ref(),
+            self.store.as_ref(),
+            author,
+            Some(&conn.name),
+        )
+        .await
+        .map_err(|e| TicketSyncError::Internal(e.to_string()))
     }
 
     // --- Code graph queries (EPIC C) ---
