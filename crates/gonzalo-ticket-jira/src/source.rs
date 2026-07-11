@@ -37,6 +37,8 @@ struct Transition {
 
 #[derive(Debug, Deserialize)]
 struct TransitionTo {
+    #[serde(default)]
+    name: String,
     #[serde(rename = "statusCategory")]
     status_category: StatusCategoryRef,
 }
@@ -44,6 +46,55 @@ struct TransitionTo {
 #[derive(Debug, Deserialize)]
 struct StatusCategoryRef {
     key: String,
+}
+
+/// Does a target status name read as a cancellation / won't-do outcome rather
+/// than a genuine completion? Matched case-insensitively against a set of
+/// cancel-intent words so that `set_state(Canceled)` never lands on a plain
+/// "Done" (see #138).
+fn is_cancel_intent(status_name: &str) -> bool {
+    let name = status_name.to_ascii_lowercase();
+    // `cancel` covers cancel/canceled/cancelled; `reject` covers rejected;
+    // `abandon`/`discard` cover their -ed forms.
+    const NEEDLES: &[&str] = &[
+        "cancel",
+        "won't do",
+        "wont do",
+        "will not do",
+        "reject",
+        "abandon",
+        "discard",
+    ];
+    NEEDLES.iter().any(|needle| name.contains(needle))
+}
+
+/// Select the workflow transition to apply for a desired [`StateCategory`].
+///
+/// Jira collapses both completion and cancellation into statusCategory `done`,
+/// so a first-match on category alone routes a cancel to whatever done-status
+/// comes first (often "Done"). This prefers a cancel-intent status when the
+/// target is [`StateCategory::Canceled`], and a non-cancel status when the
+/// target is [`StateCategory::Done`], falling back to the first category match
+/// when no better candidate exists.
+fn choose_transition(transitions: &[Transition], target: StateCategory) -> Option<&Transition> {
+    let want = target_status_category(target);
+    let candidates: Vec<&Transition> = transitions
+        .iter()
+        .filter(|t| t.to.status_category.key == want)
+        .collect();
+    let first = *candidates.first()?;
+    let preferred = match target {
+        StateCategory::Canceled => candidates
+            .iter()
+            .copied()
+            .find(|t| is_cancel_intent(&t.to.name)),
+        StateCategory::Done => candidates
+            .iter()
+            .copied()
+            .find(|t| !is_cancel_intent(&t.to.name)),
+        _ => None,
+    };
+    Some(preferred.unwrap_or(first))
 }
 
 const FIELDS: &[&str] = &[
@@ -195,16 +246,12 @@ impl TicketSource for JiraSource {
             .map_err(be)?;
         let available: TransitionsResponse = resp.json().await.map_err(be)?;
 
-        let want = target_status_category(target);
-        let transition = available
-            .transitions
-            .iter()
-            .find(|t| t.to.status_category.key == want)
-            .ok_or_else(|| {
-                SourceError::Backend(format!(
-                    "no available transition into statusCategory '{want}' for {uid}"
-                ))
-            })?;
+        let transition = choose_transition(&available.transitions, target).ok_or_else(|| {
+            let want = target_status_category(target);
+            SourceError::Backend(format!(
+                "no available transition into statusCategory '{want}' for {uid}"
+            ))
+        })?;
 
         let post_url = self.url(&["rest", "api", "3", "issue", uid, "transitions"])?;
         self.auth(
@@ -280,5 +327,92 @@ mod tests {
     #[test]
     fn rejects_bad_site_url() {
         assert!(JiraSource::new("not a url", "e", "t").is_err());
+    }
+
+    fn transition(id: &str, name: &str, category: &str) -> Transition {
+        Transition {
+            id: id.to_string(),
+            to: TransitionTo {
+                name: name.to_string(),
+                status_category: StatusCategoryRef {
+                    key: category.to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn cancel_intent_recognizes_wont_do_variants() {
+        for name in [
+            "Cancel",
+            "Canceled",
+            "Cancelled",
+            "Won't Do",
+            "Wont Do",
+            "Will Not Do",
+            "Rejected",
+            "Abandoned",
+            "Discarded",
+        ] {
+            assert!(
+                is_cancel_intent(name),
+                "expected cancel-intent for {name:?}"
+            );
+        }
+        for name in ["Done", "Closed", "Resolved", "Completed"] {
+            assert!(!is_cancel_intent(name), "expected non-cancel for {name:?}");
+        }
+    }
+
+    #[test]
+    fn canceled_prefers_wont_do_over_done() {
+        // Both land in statusCategory "done"; #138 required Canceled to pick the
+        // won't-do transition rather than the first done-category one.
+        let transitions = vec![
+            transition("11", "Done", "done"),
+            transition("21", "Won't Do", "done"),
+        ];
+
+        let canceled = choose_transition(&transitions, StateCategory::Canceled).unwrap();
+        assert_eq!(canceled.id, "21");
+        assert_eq!(canceled.to.name, "Won't Do");
+
+        let done = choose_transition(&transitions, StateCategory::Done).unwrap();
+        assert_eq!(done.id, "11");
+        assert_eq!(done.to.name, "Done");
+    }
+
+    #[test]
+    fn canceled_falls_back_to_first_done_when_no_cancel_status() {
+        // Only a plain "Done" is available; a cancel request should still move
+        // the issue (best-effort) rather than fail.
+        let transitions = vec![transition("11", "Done", "done")];
+        let chosen = choose_transition(&transitions, StateCategory::Canceled).unwrap();
+        assert_eq!(chosen.id, "11");
+    }
+
+    #[test]
+    fn done_falls_back_to_cancel_status_when_no_plain_done() {
+        // Only a won't-do transition exists in the done category; Done has no
+        // better option and falls back to the first candidate.
+        let transitions = vec![transition("21", "Won't Do", "done")];
+        let chosen = choose_transition(&transitions, StateCategory::Done).unwrap();
+        assert_eq!(chosen.id, "21");
+    }
+
+    #[test]
+    fn in_progress_takes_first_indeterminate() {
+        let transitions = vec![
+            transition("31", "In Review", "indeterminate"),
+            transition("32", "In Progress", "indeterminate"),
+        ];
+        let chosen = choose_transition(&transitions, StateCategory::InProgress).unwrap();
+        assert_eq!(chosen.id, "31");
+    }
+
+    #[test]
+    fn no_matching_category_yields_none() {
+        let transitions = vec![transition("11", "Done", "done")];
+        assert!(choose_transition(&transitions, StateCategory::InProgress).is_none());
     }
 }
