@@ -118,6 +118,17 @@ fn is_precondition_failed(code: Option<&str>) -> bool {
     matches!(code, Some("PreconditionFailed"))
 }
 
+/// Decide the continuation token for the next `list_objects_v2` page, driving
+/// pagination off token *presence* rather than the `is_truncated` flag. A
+/// well-behaved backend only returns a token when there is more to fetch, but a
+/// misbehaving one can report `is_truncated = true` yet omit the token; keying
+/// off the flag would then re-request page 1 forever. So: if a token is present
+/// we continue with it, otherwise we terminate — regardless of `is_truncated`.
+/// This guarantees the pagination loop always makes progress or stops.
+fn next_continuation(_is_truncated: Option<bool>, token: Option<&str>) -> Option<String> {
+    token.map(str::to_string)
+}
+
 #[async_trait]
 impl gonzalo_core::Store for S3Store {
     async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
@@ -212,10 +223,9 @@ impl gonzalo_core::Store for S3Store {
                     out.push(key);
                 }
             }
-            if resp.is_truncated().unwrap_or(false) {
-                continuation = resp.next_continuation_token().map(str::to_string);
-            } else {
-                break;
+            match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
+                Some(token) => continuation = Some(token),
+                None => break,
             }
         }
         Ok(out)
@@ -305,10 +315,9 @@ impl BlobStore for S3Store {
                     out.push(hash);
                 }
             }
-            if resp.is_truncated().unwrap_or(false) {
-                continuation = resp.next_continuation_token().map(str::to_string);
-            } else {
-                break;
+            match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
+                Some(token) => continuation = Some(token),
+                None => break,
             }
         }
         Ok(out)
@@ -413,6 +422,30 @@ mod tests {
             precondition(&Some(rev()), Some("\"abc123\"")),
             Precondition::IfMatch("\"abc123\"".to_string())
         );
+    }
+
+    #[test]
+    fn next_continuation_terminates_when_token_absent() {
+        // The pagination bug: a backend reports more pages but omits the token.
+        // Keying off `is_truncated` would loop forever; we must terminate.
+        assert_eq!(next_continuation(Some(true), None), None);
+        // No token, not truncated → also terminate (the normal last page).
+        assert_eq!(next_continuation(Some(false), None), None);
+        assert_eq!(next_continuation(None, None), None);
+    }
+
+    #[test]
+    fn next_continuation_advances_when_token_present() {
+        // A token means fetch the next page, regardless of the flag's value.
+        assert_eq!(
+            next_continuation(Some(true), Some("t1")),
+            Some("t1".to_string())
+        );
+        assert_eq!(
+            next_continuation(Some(false), Some("t2")),
+            Some("t2".to_string())
+        );
+        assert_eq!(next_continuation(None, Some("t3")), Some("t3".to_string()));
     }
 
     #[test]
