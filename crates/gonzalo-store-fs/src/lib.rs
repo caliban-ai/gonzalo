@@ -8,8 +8,10 @@ use gonzalo_core::{
     Store, store::Conflict,
 };
 use rustix::fs::{FlockOperation, flock};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncWriteExt;
 
 /// A `Store` backed by JSON files under a root directory.
 pub struct FsStore {
@@ -90,12 +92,32 @@ impl BlobStore for FsStore {
         // and the unique temp keeps two racing writers from clobbering one temp.
         let nonce = BLOB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
-        tokio::fs::write(&tmp, content)
+        // Durable publish: write the temp file and `sync_all` it so its bytes
+        // reach disk BEFORE the rename, then fsync the parent directory AFTER
+        // the rename so the new directory entry survives a crash too. `rename`
+        // is atomic against concurrent readers but not against power loss — on
+        // ext4 delayed allocation a crash just after a reported success can
+        // otherwise leave a zero-length or truncated blob.
+        let mut f = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| CoreError::Backend(e.to_string()))?;
+        f.write_all(content)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        f.sync_all()
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        drop(f);
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| CoreError::Backend(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || fsync_dir(&parent))
+                .await
+                .map_err(|e| CoreError::Backend(format!("fsync task panicked: {e}")))?
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+        }
         Ok(hash)
     }
 
@@ -200,11 +222,39 @@ fn put_locked(root: &Path, record: Record, expected: Option<Revision>) -> Result
     }
 
     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| CoreError::Serde(e.to_string()))?;
-    // Atomic write: temp file + rename.
+    // Durable atomic write: write the temp file and `sync_all` it so its bytes
+    // reach disk BEFORE the rename, then fsync the parent directory AFTER the
+    // rename so the new directory entry survives a crash too. `rename` is atomic
+    // against concurrent readers but not against power loss — on ext4 delayed
+    // allocation a crash just after a reported Committed can otherwise leave a
+    // zero-length or truncated record.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| CoreError::Backend(e.to_string()))?;
+    let mut f = std::fs::File::create(&tmp).map_err(|e| CoreError::Backend(e.to_string()))?;
+    f.write_all(&bytes)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    f.sync_all()
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    drop(f);
     std::fs::rename(&tmp, &path).map_err(|e| CoreError::Backend(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+    }
     Ok(PutResult::Committed(record.revision))
+}
+
+/// Best-effort fsync of the directory `path`, making a preceding `rename` into
+/// it durable across a crash. A `rename` is atomic against concurrent readers,
+/// but on power loss the new directory entry can still be lost until the parent
+/// directory's own metadata is flushed. Where a platform rejects fsync on a
+/// directory handle (surfaced as `EINVAL`/`InvalidInput`), treat it as a no-op
+/// rather than a write failure.
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    let dir = std::fs::File::open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Walk `<root>/<ns>/<col>/<id>.json` and collect keys matching `prefix`.
