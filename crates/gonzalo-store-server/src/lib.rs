@@ -151,14 +151,12 @@ impl Store for ServerStore {
                     .send()
                     .await
                     .map_err(be)?;
-                if resp.status().is_server_error() || resp.status().as_u16() == 401 {
-                    return Err(CoreError::Backend(format!(
-                        "daemon returned {}",
-                        resp.status()
-                    )));
-                }
-                let outcome = resp.json::<PutOutcome>().await.map_err(be)?;
-                Ok(outcome_to_result(outcome))
+                // Read the body as text first so error statuses (403/413/400,
+                // which carry plain-text bodies) surface their real status and
+                // message instead of being masked as a JSON decode error (#147).
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_put_response(status, &text)
             }
             Backend::Grpc { client, token } => {
                 let mut client = client.clone();
@@ -240,6 +238,26 @@ fn outcome_to_result(outcome: PutOutcome) -> PutResult {
     }
 }
 
+/// Decide a `put`'s result from the HTTP response status and body text.
+///
+/// The daemon speaks JSON (`PutOutcome`) only for `200 OK` (committed) and
+/// `409 Conflict`; every other status — notably `403` (namespace authorization
+/// denial), `413` (too large), and `400` (bad request) — carries a plain-text
+/// body. Feeding those bodies to a JSON parser masks the real failure behind a
+/// generic "error decoding response body" (#147), so any other status is
+/// surfaced verbatim as `CoreError::Backend("daemon returned <status>: <body>")`.
+fn classify_put_response(status: reqwest::StatusCode, body: &str) -> Result<PutResult> {
+    match status {
+        reqwest::StatusCode::OK | reqwest::StatusCode::CONFLICT => {
+            let outcome: PutOutcome = serde_json::from_str(body).map_err(se)?;
+            Ok(outcome_to_result(outcome))
+        }
+        other => Err(CoreError::Backend(format!(
+            "daemon returned {other}: {body}"
+        ))),
+    }
+}
+
 fn be<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Backend(e.to_string())
 }
@@ -248,4 +266,109 @@ fn se<E: std::fmt::Display>(e: E) -> CoreError {
 }
 fn status(s: tonic::Status) -> CoreError {
     CoreError::Backend(s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gonzalo_core::store::Conflict;
+    use gonzalo_core::{Body, Identity, Meta, Record, RecordKind};
+    use reqwest::StatusCode;
+    use std::collections::BTreeMap;
+
+    fn sample_record() -> Record {
+        let body = Body::Inline(b"hello".to_vec());
+        Record {
+            key: RecordKey::new("ns", "col", "id"),
+            kind: RecordKind::Topic,
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            meta: Meta {
+                author: Identity::new("tester"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+        }
+    }
+
+    /// `200 OK` carries a `committed` JSON body → `PutResult::Committed`.
+    #[test]
+    fn ok_body_parses_committed() {
+        let revision = Revision::initial(b"hello");
+        let json = serde_json::to_string(&PutOutcome::Committed {
+            revision: revision.clone(),
+        })
+        .unwrap();
+        let result = classify_put_response(StatusCode::OK, &json).unwrap();
+        assert!(matches!(result, PutResult::Committed(r) if r == revision));
+    }
+
+    /// `409 Conflict` carries a `conflict` JSON body → `PutResult::Conflict`.
+    #[test]
+    fn conflict_body_parses_conflict() {
+        let record = sample_record();
+        let conflict = Conflict {
+            key: record.key.clone(),
+            expected: None,
+            current: record,
+        };
+        let json = serde_json::to_string(&PutOutcome::Conflict {
+            conflict: Box::new(conflict),
+        })
+        .unwrap();
+        let result = classify_put_response(StatusCode::CONFLICT, &json).unwrap();
+        assert!(matches!(result, PutResult::Conflict(_)));
+    }
+
+    /// #147: a `403` with a plain-text body surfaces the status + body as a
+    /// `Backend` error — NOT a masked JSON decode error.
+    #[test]
+    fn forbidden_surfaces_status_and_body() {
+        let body = "principal \"alice\" lacks Write on namespace \"secrets\"";
+        let err = classify_put_response(StatusCode::FORBIDDEN, body).unwrap_err();
+        match err {
+            CoreError::Backend(msg) => {
+                assert!(msg.contains("403"), "want status 403 in {msg:?}");
+                assert!(msg.contains(body), "want daemon body in {msg:?}");
+                assert!(
+                    !msg.contains("decoding"),
+                    "must not be a decode error: {msg:?}"
+                );
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    /// `413 Payload Too Large` (plain-text body) also surfaces status + body.
+    #[test]
+    fn payload_too_large_surfaces_status_and_body() {
+        let body = "record exceeds max size";
+        let err = classify_put_response(StatusCode::PAYLOAD_TOO_LARGE, body).unwrap_err();
+        match err {
+            CoreError::Backend(msg) => {
+                assert!(msg.contains("413"), "want status 413 in {msg:?}");
+                assert!(msg.contains(body), "want daemon body in {msg:?}");
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    /// `400 Bad Request` (plain-text body) surfaces status + body, not a decode
+    /// error.
+    #[test]
+    fn bad_request_surfaces_status_and_body() {
+        let body = "path/body key disagreement";
+        let err = classify_put_response(StatusCode::BAD_REQUEST, body).unwrap_err();
+        match err {
+            CoreError::Backend(msg) => {
+                assert!(msg.contains("400"), "want status 400 in {msg:?}");
+                assert!(msg.contains(body), "want daemon body in {msg:?}");
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
 }
