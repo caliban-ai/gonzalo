@@ -150,8 +150,12 @@ fn mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> candle_core::Result<Te
 }
 
 /// L2-normalize each row of `(batch, hidden)` to unit length.
+///
+/// The norm is floored at a tiny epsilon so a zero/degenerate pooled row
+/// divides by a small positive value instead of `0.0`, yielding a finite
+/// (near-zero) vector rather than emitting `NaN`.
 fn l2_normalize(v: &Tensor) -> candle_core::Result<Tensor> {
-    let norm = v.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?; // (b, 1)
+    let norm = v.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?.maximum(1e-12f64)?; // (b, 1)
     v.broadcast_div(&norm)
 }
 
@@ -178,6 +182,19 @@ mod tests {
         assert!((out[1] - 0.8).abs() < 1e-5);
         let len = (out[0] * out[0] + out[1] * out[1]).sqrt();
         assert!((len - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn l2_normalize_zero_row_is_finite_not_nan() {
+        // A degenerate all-zero pooled row must not divide by zero and emit NaN.
+        let v = Tensor::from_vec(vec![0f32, 0.0], (1, 2), &Device::Cpu).unwrap();
+        let out = l2_normalize(&v)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(out.iter().all(|x| x.is_finite()), "output must be finite");
     }
 
     #[test]
