@@ -142,6 +142,10 @@ enum TicketCommands {
         /// Root directory of the fs store.
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Connection name the ticket was synced under. Required to find records
+        /// synced from a board, whose keys are scoped by connection (#159).
+        #[arg(long)]
+        connection: Option<String>,
         /// Ticket uid (owner/repo#number).
         uid: String,
     },
@@ -319,12 +323,20 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            TicketCommands::Get { root, uid } => {
+            TicketCommands::Get {
+                root,
+                connection,
+                uid,
+            } => {
                 // Phase 1: github-projects is the only provider, so every ticket
                 // record lives under collection "github" (see gonzalo_ticket::record_key).
                 // `ticket list` (above) filters only the "tickets" namespace, so it
-                // spans all providers; `get` needs the exact collection.
-                match get(&root, "tickets", "github", &uid).await? {
+                // spans all providers; `get` needs the exact collection + id.
+                // Board records key their id as "<connection>/<uid>" (#159), so
+                // pass --connection to reconstruct the exact id; without it we look
+                // up the bare uid (plain/unscoped records).
+                let id = gonzalo_ticket::scoped_uid(&uid, connection.as_deref());
+                match get(&root, "tickets", "github", &id).await? {
                     Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
                     // Absent ticket → stderr message + non-zero exit (stdout empty)
                     // so automation can distinguish missing from present.

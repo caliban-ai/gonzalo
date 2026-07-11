@@ -33,17 +33,23 @@ pub enum IngestError {
 
 /// Pull all changed tickets from `source` and upsert them into `store`,
 /// attributing writes to `author`.
+///
+/// `scope` is the board/connection discriminator woven into each record key
+/// (see [`crate::record_key`]): pass the connection name for board sources so
+/// the same external item on two boards lands in two distinct records (#159),
+/// or `None` for a single-board / board-agnostic source.
 pub async fn ingest(
     source: &dyn TicketSource,
     store: &dyn Store,
     author: &str,
+    scope: Option<&str>,
 ) -> Result<IngestSummary, IngestError> {
     let mut summary = IngestSummary::default();
     let mut cursor = crate::Cursor::default();
     loop {
         let page = source.fetch_changed(&cursor).await?;
         for ticket in &page.tickets {
-            match upsert(store, ticket, author).await? {
+            match upsert(store, ticket, author, scope).await? {
                 Outcome::Imported => summary.imported += 1,
                 Outcome::Updated => summary.updated += 1,
                 Outcome::Unchanged => summary.unchanged += 1,
@@ -64,8 +70,13 @@ enum Outcome {
     Unchanged,
 }
 
-async fn upsert(store: &dyn Store, ticket: &Ticket, author: &str) -> Result<Outcome, IngestError> {
-    let key = record_key(ticket);
+async fn upsert(
+    store: &dyn Store,
+    ticket: &Ticket,
+    author: &str,
+    scope: Option<&str>,
+) -> Result<Outcome, IngestError> {
+    let key = record_key(ticket, scope);
     let body = ticket.to_body()?;
     let new_hash = ContentHash::of(body.bytes());
 
@@ -150,7 +161,7 @@ mod tests {
         let store = FsStore::new(dir.path());
 
         let src = InMemorySource::new(vec![ticket("a", "A"), ticket("b", "B")]);
-        let s1 = ingest(&src, &store, "tester").await.unwrap();
+        let s1 = ingest(&src, &store, "tester", None).await.unwrap();
         assert_eq!(
             s1,
             IngestSummary {
@@ -160,7 +171,7 @@ mod tests {
             }
         );
 
-        let s2 = ingest(&src, &store, "tester").await.unwrap();
+        let s2 = ingest(&src, &store, "tester", None).await.unwrap();
         assert_eq!(
             s2,
             IngestSummary {
@@ -171,7 +182,7 @@ mod tests {
         );
 
         let src2 = InMemorySource::new(vec![ticket("a", "A2"), ticket("b", "B")]);
-        let s3 = ingest(&src2, &store, "tester").await.unwrap();
+        let s3 = ingest(&src2, &store, "tester", None).await.unwrap();
         assert_eq!(
             s3,
             IngestSummary {
@@ -218,8 +229,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::new(dir.path());
 
-        let summary = ingest(&PagedSource, &store, "tester").await.unwrap();
+        let summary = ingest(&PagedSource, &store, "tester", None).await.unwrap();
         assert_eq!(summary.imported, 2);
+    }
+
+    #[tokio::test]
+    async fn same_issue_on_two_boards_does_not_thrash_one_record() {
+        // #159: the same uid imported under two connections must yield two
+        // distinct records (one per board), not alternating overwrites of one.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        // Board A puts the card in "Todo"; board B in "Done" — same uid.
+        let mut on_b = ticket("caliban-ai/gonzalo#15", "shared");
+        on_b.state.raw_name = "Done".into();
+        on_b.state.category = StateCategory::Done;
+        let src_a = InMemorySource::new(vec![ticket("caliban-ai/gonzalo#15", "shared")]);
+        let src_b = InMemorySource::new(vec![on_b]);
+
+        // First import on each board is a fresh record — no collision.
+        let a1 = ingest(&src_a, &store, "tester", Some("board-a"))
+            .await
+            .unwrap();
+        let b1 = ingest(&src_b, &store, "tester", Some("board-b"))
+            .await
+            .unwrap();
+        assert_eq!(a1.imported, 1);
+        assert_eq!(b1.imported, 1);
+
+        // Re-syncing each is idempotent: neither disturbs the other's record,
+        // which is exactly the thrash the shared key used to cause.
+        let a2 = ingest(&src_a, &store, "tester", Some("board-a"))
+            .await
+            .unwrap();
+        let b2 = ingest(&src_b, &store, "tester", Some("board-b"))
+            .await
+            .unwrap();
+        assert_eq!(a2.unchanged, 1, "board-a stayed put: {a2:?}");
+        assert_eq!(b2.unchanged, 1, "board-b stayed put: {b2:?}");
+
+        // Both records exist side by side under distinct keys.
+        let ka = record_key(&ticket("caliban-ai/gonzalo#15", "shared"), Some("board-a"));
+        let kb = record_key(&ticket("caliban-ai/gonzalo#15", "shared"), Some("board-b"));
+        assert_ne!(ka, kb);
+        assert!(store.get(&ka).await.unwrap().is_some());
+        assert!(store.get(&kb).await.unwrap().is_some());
     }
 
     /// A store whose `put` always conflicts, to exercise the conflict arm.
@@ -257,7 +311,9 @@ mod tests {
     #[tokio::test]
     async fn surfaces_store_conflict() {
         let src = InMemorySource::new(vec![ticket("a", "A")]);
-        let err = ingest(&src, &ConflictStore, "tester").await.unwrap_err();
+        let err = ingest(&src, &ConflictStore, "tester", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, IngestError::Conflict { .. }));
     }
 }

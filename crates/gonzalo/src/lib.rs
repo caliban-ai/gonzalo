@@ -39,7 +39,7 @@ pub use gonzalo_graph::{
 #[cfg(feature = "ticket")]
 pub use gonzalo_ticket::{
     Capabilities, Cursor, FieldMapping, InMemorySource, Page, SourceError, StateMapping,
-    StateSignal, TicketSource, record_key,
+    StateSignal, TicketSource, record_key, scoped_uid,
 };
 
 #[cfg(feature = "ticket-github")]
