@@ -9,6 +9,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+gonzalo-core  = { workspace = true }
 gonzalo-graph = { workspace = true }
 rusqlite      = { workspace = true }
 serde_json    = { workspace = true }

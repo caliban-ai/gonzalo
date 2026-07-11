@@ -2055,6 +2055,7 @@ dependencies = [
 name = "gonzalo-graph-sqlite"
 version = "0.2.0"
 dependencies = [
+ "gonzalo-core",
  "gonzalo-graph",
  "rusqlite",
  "serde_json",
