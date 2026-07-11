@@ -90,18 +90,19 @@ pub fn view_db_path(graph_root: &Path, repo: &str, view_id: &str) -> std::path::
         .join(format!("{}.db", fs_safe(view_id)))
 }
 
-/// Map an identifier to a single filesystem-safe path segment (non
-/// `[A-Za-z0-9._-]` -> `_`), so `repo`/`view_id` cannot escape `graph_root`.
+/// Map an identifier to a single filesystem-safe path segment via the shared,
+/// **injective** percent-style encoder ([`gonzalo_core::segment`]): the
+/// unreserved set `[A-Za-z0-9_-]` survives verbatim and every other byte
+/// (including `/` and `.`) becomes `%XX`. Because the map is injective,
+/// distinct `(repo, view_id)` pairs can never collide onto one `.db` file (the
+/// old lossy `_`-collapse let `org/repo` and `org_repo` share a path). Escaping
+/// `.` and `/` also keeps a component from escaping `graph_root`, and since the
+/// encoded `view_id` contains no literal `.`, the only `.` in the filename is
+/// the trailing `.db` suffix. The mapping is a pure function so the writer
+/// (indexer) and reader (server) always agree; the path is never parsed back
+/// into `repo`/`view_id`, so no decode is needed here.
 fn fs_safe(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    gonzalo_core::segment(s)
 }
 
 /// A [`SymbolKind`](gonzalo_graph::SymbolKind) as stored TEXT (its serde form).
@@ -273,5 +274,34 @@ impl GraphStore for SqliteGraphStore {
             .expect("query all_references");
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect all_references")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for #132: distinct `(repo, view)` pairs that collided under
+    /// the old lossy `_`-collapse must now map to different db files. Under the
+    /// old scheme both `("org/repo","main")` and `("org_repo","main")` produced
+    /// `<root>/org_repo/main.db`; one view's graph would serve/overwrite the
+    /// other. The injective encoder keeps them apart.
+    #[test]
+    fn view_db_path_is_injective_across_colliding_pairs() {
+        let root = Path::new("/graphs");
+        let a = view_db_path(root, "org/repo", "main");
+        let b = view_db_path(root, "org_repo", "main");
+        assert_ne!(a, b, "distinct repos must not collide onto one db file");
+
+        // The `/` is percent-escaped, so `repo` stays a single non-escaping
+        // segment and the filename's only `.` is the `.db` suffix.
+        assert_eq!(a, Path::new("/graphs/org%2Frepo/main.db"));
+        assert_eq!(b, Path::new("/graphs/org_repo/main.db"));
+        assert!(a.extension().is_some_and(|e| e == "db"));
+
+        // Collisions in the view_id component are likewise avoided.
+        let c = view_db_path(root, "org/repo", "v1.0");
+        let d = view_db_path(root, "org/repo", "v1_0");
+        assert_ne!(c, d, "distinct views must not collide onto one db file");
     }
 }
