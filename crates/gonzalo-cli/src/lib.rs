@@ -265,19 +265,24 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
         .as_deref()
         .and_then(|base| gonzalo_store_git::changed_paths(src, base).ok());
 
+    // Stage every persistent-graph mutation instead of applying it inline. The
+    // SqliteGraphStore is advanced only after the manifest that describes it
+    // commits, so a concurrent-writer Conflict (below) leaves the graph
+    // untouched rather than advanced ahead of a manifest that never landed (#153).
+    let mut staging = GraphStaging::default();
     let (desired, files, skipped, incremental) = match incremental_changed {
         Some(changed) => {
-            build_desired_incremental(&store, &mut graph, pool.as_ref(), src, &current, &changed)
+            build_desired_incremental(&store, &mut staging, pool.as_ref(), src, &current, &changed)
                 .await?
         }
-        None => build_desired_full(&store, &mut graph, pool.as_ref(), src).await?,
+        None => build_desired_full(&store, &mut staging, pool.as_ref(), src).await?,
     };
 
-    // Reconcile against the current manifest and drop removed paths from the
-    // persistent graph.
+    // Reconcile against the current manifest and stage removed paths for the
+    // persistent graph (applied only after the manifest commit).
     let recon = current.reconcile(&desired);
     for path in &recon.deleted {
-        graph.remove_path(path);
+        staging.removes.push(path.clone());
     }
 
     // Write the manifest record (create-or-update under OCC).
@@ -308,9 +313,16 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
     match store.put(record, expected).await? {
         PutResult::Committed(_) => {}
         PutResult::Conflict(_) => {
+            // The manifest moved under us: abandon the run WITHOUT touching the
+            // persistent graph, so the SqliteGraphStore never advances ahead of a
+            // committed manifest (#153). Orphaned slice blobs written above are
+            // reclaimed by a later gc pass.
             anyhow::bail!("manifest for {repo}/{view} changed concurrently; retry the index")
         }
     }
+
+    // Manifest committed — now advance the persistent graph to match it.
+    staging.apply(&mut graph);
 
     // Record the current HEAD as the base for the next run's incremental diff.
     // Only succeeds when `src` is a git repo root with at least one commit.
@@ -331,10 +343,36 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
     })
 }
 
+/// A set of persistent-graph mutations collected during a [`index`] run but not
+/// yet applied. Staging the writes lets [`index`] commit the view's manifest
+/// first and only then advance the [`SqliteGraphStore`] — so a manifest Conflict
+/// leaves the persistent graph untouched (#153).
+#[derive(Default)]
+struct GraphStaging {
+    /// `(relative path, parsed slice)` to (re)insert; insert replaces the path's
+    /// existing rows.
+    inserts: Vec<(String, CodeGraph)>,
+    /// Relative paths whose rows should be removed.
+    removes: Vec<String>,
+}
+
+impl GraphStaging {
+    /// Apply every staged mutation to the persistent graph. Called only after
+    /// the manifest commit succeeds.
+    fn apply(self, graph: &mut SqliteGraphStore) {
+        for (rel, slice) in self.inserts {
+            graph.insert(&rel, slice);
+        }
+        for rel in self.removes {
+            graph.remove_path(&rel);
+        }
+    }
+}
+
 /// Full-walk desired set: parse every supported source file under `src`.
 async fn build_desired_full(
     store: &FsStore,
-    graph: &mut SqliteGraphStore,
+    staging: &mut GraphStaging,
     pool: Option<&ParserPool>,
     src: &Path,
 ) -> Result<(BTreeMap<String, ContentHash>, usize, usize, bool)> {
@@ -353,7 +391,7 @@ async fn build_desired_full(
             continue;
         };
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
-        graph.insert(&rel, slice); // insert replaces this path's rows
+        staging.inserts.push((rel.clone(), slice)); // insert replaces this path's rows
         desired.insert(rel, hash);
     }
     let files = desired.len();
@@ -366,7 +404,7 @@ async fn build_desired_full(
 /// files re-parsed this run.
 async fn build_desired_incremental(
     store: &FsStore,
-    graph: &mut SqliteGraphStore,
+    staging: &mut GraphStaging,
     pool: Option<&ParserPool>,
     src: &Path,
     current: &Manifest,
@@ -393,7 +431,7 @@ async fn build_desired_incremental(
             Ok(c) => c,
             Err(_) => {
                 if desired.remove(rel).is_some() {
-                    graph.remove_path(rel);
+                    staging.removes.push(rel.clone());
                 }
                 continue;
             }
@@ -403,14 +441,14 @@ async fn build_desired_incremental(
             continue;
         };
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
-        graph.insert(rel, slice);
+        staging.inserts.push((rel.clone(), slice));
         desired.insert(rel.clone(), hash);
         files += 1;
     }
 
     for rel in &changed.deleted {
         if desired.remove(rel).is_some() {
-            graph.remove_path(rel);
+            staging.removes.push(rel.clone());
         }
     }
 
@@ -1028,6 +1066,45 @@ mod tests {
             g.definitions("gone").is_empty(),
             "deleted file's symbols must be gone from the graph"
         );
+    }
+
+    // ── index: manifest commit precedes the SQLite graph write (gonzalo#153) ──
+
+    #[tokio::test]
+    async fn build_desired_stages_graph_writes_without_touching_the_store() {
+        // The reordered control flow (#153): parsing/desired-set construction
+        // must only *stage* persistent-graph mutations. The SqliteGraphStore is
+        // advanced solely by GraphStaging::apply — which index() calls strictly
+        // after the manifest commit — so a manifest Conflict leaves the graph
+        // untouched instead of advanced ahead of an uncommitted manifest.
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+
+        let store = FsStore::new(root.path());
+        let db_path = view_db_path(&root.path().join("graphs"), "r", "main");
+        let mut graph = SqliteGraphStore::open(&db_path).unwrap();
+
+        let mut staging = GraphStaging::default();
+        let (desired, files, _skipped, incremental) =
+            build_desired_full(&store, &mut staging, None, src.path())
+                .await
+                .unwrap();
+        assert!(!incremental);
+        assert_eq!(files, 1);
+        assert_eq!(desired.len(), 1);
+        assert_eq!(staging.inserts.len(), 1, "the write is staged, not applied");
+
+        // Nothing has reached the persistent graph yet — this is the state after
+        // a manifest Conflict would `bail!`.
+        assert!(
+            graph.definitions("a").is_empty(),
+            "SqliteGraphStore must be untouched until the manifest commits"
+        );
+
+        // Applying the staged writes (index()'s post-commit step) advances it.
+        staging.apply(&mut graph);
+        assert_eq!(graph.definitions("a")[0].path, "a.rs");
     }
 
     // ── index: git-driven incremental sync (gonzalo#93) ──────────────────────
