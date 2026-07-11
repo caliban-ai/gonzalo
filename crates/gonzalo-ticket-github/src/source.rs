@@ -101,17 +101,25 @@ impl TicketSource for GitHubSource {
     }
 
     async fn fetch_changed(&self, cursor: &Cursor) -> Result<Page> {
-        let mut url = self.issues_url(&[])?;
-        {
-            let mut q = url.query_pairs_mut();
-            q.append_pair("state", "all");
-            q.append_pair("per_page", "100");
-            q.append_pair("sort", "updated");
-            q.append_pair("direction", "asc");
-            if let Some(since) = &cursor.0 {
-                q.append_pair("since", since);
+        // Follow GitHub's `Link`-header pagination. The first call (empty
+        // cursor) builds the issues URL; every later call GETs the `rel="next"`
+        // URL that the previous page carried forward in the cursor — page N+1,
+        // with `per_page`/`sort`/`direction` echoed by GitHub. When GitHub stops
+        // emitting a `rel="next"`, the cursor terminates and the ingest loop stops.
+        let url: reqwest::Url = match &cursor.0 {
+            Some(next) => reqwest::Url::parse(next).map_err(be)?,
+            None => {
+                let mut url = self.issues_url(&[])?;
+                {
+                    let mut q = url.query_pairs_mut();
+                    q.append_pair("state", "all");
+                    q.append_pair("per_page", "100");
+                    q.append_pair("sort", "updated");
+                    q.append_pair("direction", "asc");
+                }
+                url
             }
-        }
+        };
         let resp = self
             .send(self.client.get(url))
             .send()
@@ -119,17 +127,23 @@ impl TicketSource for GitHubSource {
             .map_err(be)?
             .error_for_status()
             .map_err(be)?;
+        // Read the next-page indicator before consuming the body.
+        let next = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_next_link);
         let issues: Vec<GhIssue> = resp.json().await.map_err(be)?;
         let tickets = issues
             .iter()
             .filter(|i| !i.is_pull_request())
             .map(|i| issue_to_ticket(i, &self.owner_repo))
             .collect();
-        // TODO(#19): advance the cursor from the page's max `updated_at` and
-        // follow Link-header pagination. Single page for now.
+        // TODO(#19): incremental `since`-based sync (advancing off each page's
+        // max `updated_at`) is still future work; this always starts from page 1.
         Ok(Page {
             tickets,
-            next: Cursor::default(),
+            next: Cursor(next),
         })
     }
 
@@ -197,6 +211,37 @@ fn be<E: std::fmt::Display>(e: E) -> SourceError {
     SourceError::Backend(e.to_string())
 }
 
+/// Parse a GitHub `Link` response header, returning the URL of the `rel="next"`
+/// relation if one is present.
+///
+/// GitHub paginates with a comma-separated list of `<url>; rel="name"` entries,
+/// e.g. `<...?page=2>; rel="next", <...?page=9>; rel="last"`. The last page
+/// omits `next` entirely, so `None` is the terminating signal: the ingest loop
+/// stops when the cursor holds no next URL.
+fn parse_next_link(header: &str) -> Option<String> {
+    for part in header.split(',') {
+        let mut segs = part.split(';').map(str::trim);
+        let Some(url) = segs
+            .next()
+            .and_then(|s| s.strip_prefix('<'))
+            .and_then(|s| s.strip_suffix('>'))
+        else {
+            continue;
+        };
+        for param in segs {
+            if let Some(rel) = param.strip_prefix("rel=")
+                && rel
+                    .trim_matches('"')
+                    .split_whitespace()
+                    .any(|r| r == "next")
+            {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +262,27 @@ mod tests {
             src.issues_url(&["15", "comments"]).unwrap().as_str(),
             "https://api.github.com/repos/caliban-ai/gonzalo/issues/15/comments"
         );
+    }
+
+    #[test]
+    fn parse_next_link_finds_next_among_multiple_rels() {
+        let header = concat!(
+            "<https://api.github.com/repositories/1/issues?page=2>; rel=\"next\", ",
+            "<https://api.github.com/repositories/1/issues?page=9>; rel=\"last\""
+        );
+        assert_eq!(
+            parse_next_link(header),
+            Some("https://api.github.com/repositories/1/issues?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_next_link_terminates_without_a_next_rel() {
+        // The last page emits only prev/first — no `next`, so pagination ends.
+        let header = concat!(
+            "<https://api.github.com/repositories/1/issues?page=8>; rel=\"prev\", ",
+            "<https://api.github.com/repositories/1/issues?page=1>; rel=\"first\""
+        );
+        assert_eq!(parse_next_link(header), None);
     }
 }
