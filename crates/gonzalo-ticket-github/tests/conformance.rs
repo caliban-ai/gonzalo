@@ -5,7 +5,7 @@ use gonzalo_domain::{Resolution, StateCategory};
 use gonzalo_ticket::conformance::{assert_ticket_invariants, assert_write_gating};
 use gonzalo_ticket::{Cursor, TicketSource};
 use gonzalo_ticket_github::GitHubSource;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -39,6 +39,55 @@ async fn imports_issues_and_filters_pull_requests() {
     assert_eq!(t.state.resolution, Some(Resolution::Done));
     assert_ticket_invariants(t);
     assert_write_gating(&src, &t.uid).await;
+}
+
+#[tokio::test]
+async fn follows_link_header_pagination_across_pages() {
+    let server = MockServer::start().await;
+
+    // Page 1 carries a `rel="next"` pointing at page 2 of the same server.
+    let next = format!(
+        "<{base}/repos/o/r/issues?page=2>; rel=\"next\", \
+         <{base}/repos/o/r/issues?page=2>; rel=\"last\"",
+        base = server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            { "number": 2, "node_id": "I_2", "title": "two", "state": "open",
+              "html_url": "https://h/2" }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The initial request (no `page` query) returns page 1 plus the Link header.
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("link", next.as_str())
+                .set_body_json(serde_json::json!([
+                    { "number": 1, "node_id": "I_1", "title": "one", "state": "open",
+                      "html_url": "https://h/1" }
+                ])),
+        )
+        .mount(&server)
+        .await;
+
+    let src = GitHubSource::with_base(&server.uri(), "o/r", None).unwrap();
+
+    // Page 1: one ticket, and a non-terminating cursor pointing at page 2.
+    let p1 = src.fetch_changed(&Cursor::default()).await.unwrap();
+    assert_eq!(p1.tickets.len(), 1);
+    assert_eq!(p1.tickets[0].uid, "o/r#1");
+    assert!(p1.next.0.is_some(), "page 1 must carry a next cursor");
+
+    // Page 2: fetched via the cursor from page 1; no further next -> terminates.
+    let p2 = src.fetch_changed(&p1.next).await.unwrap();
+    assert_eq!(p2.tickets.len(), 1);
+    assert_eq!(p2.tickets[0].uid, "o/r#2");
+    assert_eq!(p2.next, Cursor::default(), "last page must terminate");
 }
 
 #[tokio::test]
