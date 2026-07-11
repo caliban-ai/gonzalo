@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-domain",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-domain"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "serde",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-embed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-graph"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-store-fs",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-graph-sqlite"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-graph",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-knowledge"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-graph",
@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-parse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-graph",
  "serde",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "prost",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "git2",
@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-s3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2180,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-asana"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-domain",
  "gonzalo-ticket",
@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-github"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-gitlab"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2265,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-jira"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2279,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-linear"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-vector"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
