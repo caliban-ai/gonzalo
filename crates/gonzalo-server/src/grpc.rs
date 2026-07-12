@@ -3,10 +3,11 @@
 
 use crate::Service;
 use crate::auth::{Access, Auth, Principal};
-use gonzalo_core::{Identity, KeyPrefix, PutResult, Record, RecordKey, Revision};
+use gonzalo_core::{DeleteResult, Identity, KeyPrefix, PutResult, Record, RecordKey, Revision};
 use gonzalo_proto::v1::{
-    GetRequest, GetResponse, GraphLocatedResponse, GraphNamesResponse, GraphQueryRequest,
-    ListRequest, ListResponse, PutRequest, PutResponse, TicketSyncRequest, TicketSyncResponse,
+    DeleteRequest, DeleteResponse, GetRequest, GetResponse, GraphLocatedResponse,
+    GraphNamesResponse, GraphQueryRequest, ListRequest, ListResponse, PutRequest, PutResponse,
+    TicketSyncRequest, TicketSyncResponse,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };
 use serde::Serialize;
@@ -139,6 +140,38 @@ impl Gonzalo for GrpcAdapter {
                 payload_json: serde_json::to_vec(&rev).map_err(internal)?,
             },
             PutResult::Conflict(c) => PutResponse {
+                outcome: "conflict".into(),
+                payload_json: serde_json::to_vec(&*c).map_err(internal)?,
+            },
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn delete(
+        &self,
+        req: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        // Authenticate BEFORE deserializing attacker-controlled JSON (#146), then
+        // parse the precondition (malformed input is the caller's error →
+        // invalid_argument), authorize the write against the path's namespace,
+        // and build the key from (namespace, collection, id).
+        let principal = self.authenticate(&metadata)?;
+        let expected: Option<Revision> = serde_json::from_slice(&r.expected_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.check_access(&principal, Access::Write, &r.namespace)?;
+        let key = RecordKey::new(r.namespace, r.collection, r.id);
+        let outcome = self
+            .service
+            .delete(&key, expected)
+            .await
+            .map_err(internal)?;
+        let resp = match outcome {
+            DeleteResult::Deleted => DeleteResponse {
+                outcome: "deleted".into(),
+                payload_json: Vec::new(),
+            },
+            DeleteResult::Conflict(c) => DeleteResponse {
                 outcome: "conflict".into(),
                 payload_json: serde_json::to_vec(&*c).map_err(internal)?,
             },
@@ -450,6 +483,15 @@ mod tests {
             &self,
             _prefix: &gonzalo_core::KeyPrefix,
         ) -> gonzalo_core::Result<Vec<RecordKey>> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+        async fn delete(
+            &self,
+            _key: &RecordKey,
+            _expected: Option<Revision>,
+        ) -> gonzalo_core::Result<DeleteResult> {
             Err(gonzalo_core::CoreError::Backend(
                 "s3://secret-bucket".into(),
             ))

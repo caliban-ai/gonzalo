@@ -6,10 +6,13 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store, store::Conflict,
+    CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store,
+    store::Conflict,
 };
-use gonzalo_proto::http::{PutBody, PutOutcome};
-use gonzalo_proto::v1::{GetRequest, ListRequest, PutRequest, gonzalo_client::GonzaloClient};
+use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
+use gonzalo_proto::v1::{
+    DeleteRequest, GetRequest, ListRequest, PutRequest, gonzalo_client::GonzaloClient,
+};
 use tonic::transport::Channel;
 
 enum Backend {
@@ -228,6 +231,77 @@ impl Store for ServerStore {
                     .collect()
             }
         }
+    }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::records_url(base, key)?;
+                let body = DeleteBody { expected };
+                let resp = maybe_auth(client.delete(url).json(&body), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                // Read the body as text first so error statuses (403/400, which
+                // carry plain-text bodies) surface their real status and message
+                // instead of being masked as a JSON decode error (mirrors `put`).
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_delete_response(status, &text)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    DeleteRequest {
+                        namespace: key.namespace.clone(),
+                        collection: key.collection.clone(),
+                        id: key.id.clone(),
+                        expected_json: serde_json::to_vec(&expected).map_err(se)?,
+                    },
+                    token,
+                )?;
+                let resp = client.delete(req).await.map_err(status)?.into_inner();
+                match resp.outcome.as_str() {
+                    "deleted" => Ok(DeleteResult::Deleted),
+                    "conflict" => {
+                        let c: Conflict = serde_json::from_slice(&resp.payload_json).map_err(se)?;
+                        Ok(DeleteResult::Conflict(Box::new(c)))
+                    }
+                    other => Err(CoreError::Backend(format!(
+                        "unknown delete outcome: {other}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+fn delete_outcome_to_result(outcome: DeleteOutcome) -> DeleteResult {
+    match outcome {
+        DeleteOutcome::Deleted => DeleteResult::Deleted,
+        DeleteOutcome::Conflict { conflict } => DeleteResult::Conflict(conflict),
+    }
+}
+
+/// Decide a `delete`'s result from the HTTP response status and body text.
+///
+/// The daemon speaks JSON (`DeleteOutcome`) only for `200 OK` (deleted) and
+/// `409 Conflict`; every other status (`403` authorization denial, `400` bad
+/// request) carries a plain-text body, surfaced verbatim as
+/// `CoreError::Backend("daemon returned <status>: <body>")` (mirrors `put`).
+fn classify_delete_response(status: reqwest::StatusCode, body: &str) -> Result<DeleteResult> {
+    match status {
+        reqwest::StatusCode::OK | reqwest::StatusCode::CONFLICT => {
+            let outcome: DeleteOutcome = serde_json::from_str(body).map_err(se)?;
+            Ok(delete_outcome_to_result(outcome))
+        }
+        other => Err(CoreError::Backend(format!(
+            "daemon returned {other}: {body}"
+        ))),
     }
 }
 

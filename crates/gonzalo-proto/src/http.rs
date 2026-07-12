@@ -19,3 +19,18 @@ pub enum PutOutcome {
     Committed { revision: Revision },
     Conflict { conflict: Box<Conflict> },
 }
+
+/// Body of `DELETE /v1/records/{ns}/{col}/{id}`. The key is addressed by the
+/// URL path; the body carries only the OCC precondition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteBody {
+    pub expected: Option<Revision>,
+}
+
+/// Response of a DELETE: mirrors `gonzalo_core::DeleteResult` on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DeleteOutcome {
+    Deleted,
+    Conflict { conflict: Box<Conflict> },
+}

@@ -4,7 +4,9 @@
 
 use async_trait::async_trait;
 
-use crate::{BlobStore, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store};
+use crate::{
+    BlobStore, DeleteResult, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store,
+};
 
 /// Wraps a record [`Store`] and an ancestry [`BlobStore`]. On a committed `put`
 /// it also writes the record's `body.bytes()` to the ancestry store; because
@@ -51,6 +53,13 @@ impl<S: Store, B: BlobStore> Store for AncestryStore<S, B> {
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
         self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        // Delete is local and leaves ancestry blobs untouched: retained bodies
+        // stay available for a later divergence's 3-way merge (ADR 0016), and a
+        // sync from a peer may resurrect the record (ADR 0018).
+        self.inner.delete(key, expected).await
     }
 }
 
@@ -100,6 +109,25 @@ pub(crate) mod tests {
                 .filter(|k| prefix.matches(k))
                 .cloned()
                 .collect())
+        }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.records.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
         }
     }
 

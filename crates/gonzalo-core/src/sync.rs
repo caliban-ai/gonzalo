@@ -212,7 +212,7 @@ fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PutResult, RecordKind, store::Conflict};
+    use crate::{DeleteResult, PutResult, RecordKind, store::Conflict};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -251,6 +251,25 @@ mod tests {
                 .filter(|k| prefix.matches(k))
                 .cloned()
                 .collect())
+        }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.0.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
         }
     }
 
@@ -310,6 +329,25 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.inner.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
+        }
     }
 
     /// A store whose conditional `put` *always* races (a concurrent writer that
@@ -350,6 +388,25 @@ mod tests {
                 .filter(|k| prefix.matches(k))
                 .cloned()
                 .collect())
+        }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.0.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
         }
     }
 

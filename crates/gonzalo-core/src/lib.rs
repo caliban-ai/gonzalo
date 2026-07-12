@@ -22,7 +22,7 @@ pub mod error;
 pub use error::{CoreError, Result};
 
 pub mod store;
-pub use store::{BlobStore, Conflict, PutResult, Store};
+pub use store::{BlobStore, Conflict, DeleteResult, PutResult, Store};
 
 pub mod merge;
 pub use merge::{MergeOutcome, merge};
