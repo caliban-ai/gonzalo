@@ -4,8 +4,8 @@ mod layout;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
-    Store, store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
+    Result, Revision, Store, store::Conflict,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::io::{self, Write};
@@ -60,6 +60,17 @@ impl Store for FsStore {
         let mut out = Vec::new();
         collect_keys(&self.root, prefix, &mut out).await?;
         Ok(out)
+    }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        // Mirror `put`'s critical section: hold the per-record flock so the
+        // read→check→remove is atomic against a concurrent writer. Blocking, so
+        // run it on a blocking thread rather than stalling the async runtime.
+        let root = self.root.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || delete_locked(&root, &key, expected))
+            .await
+            .map_err(|e| CoreError::Backend(format!("delete task panicked: {e}")))?
     }
 }
 
@@ -240,6 +251,67 @@ fn put_locked(root: &Path, record: Record, expected: Option<Revision>) -> Result
         fsync_dir(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
     }
     Ok(PutResult::Committed(record.revision))
+}
+
+/// Perform the conditional `delete` under the same per-record advisory lock
+/// `put_locked` uses, so the read→check→remove is atomic against a concurrent
+/// writer. Blocking by design; call from `spawn_blocking`.
+///
+/// `expected == None` removes the record if present (idempotent no-op if
+/// absent). `expected == Some(rev)` removes only if the current revision matches;
+/// a mismatch is a `Conflict`, and an already-absent key is an idempotent
+/// `Deleted` (the revision is already gone — nothing to conflict on). We leave
+/// the sibling `.lock` file in place (it is reused by the next writer).
+fn delete_locked(root: &Path, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+    let path = layout::record_path(root, key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+    }
+
+    // Acquire the exclusive lock; it lives until `lock` drops at function end.
+    let lock_path = path.with_extension("json.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    flock(&lock, FlockOperation::LockExclusive).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+    // Critical section: revision check and removal are now serialized per record.
+    let current = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<Record>(&bytes)
+                .map_err(|e| CoreError::Serde(e.to_string()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(CoreError::Backend(e.to_string())),
+    };
+
+    match (current, &expected) {
+        // Absent: nothing to remove. Idempotent `Deleted` regardless of
+        // `expected` — the revision the caller named is already gone.
+        (None, _) => Ok(DeleteResult::Deleted),
+        // Unconditional, or the expected revision matches: remove the record.
+        (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // A concurrent remover won under the lock hand-off — still absent.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(CoreError::Backend(e.to_string())),
+            }
+            if let Some(parent) = path.parent() {
+                fsync_dir(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+            }
+            Ok(DeleteResult::Deleted)
+        }
+        // Present but the expected revision differs: surface a Conflict.
+        (Some(cur), _) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+            key: key.clone(),
+            expected,
+            current: cur,
+        }))),
+    }
 }
 
 /// Best-effort fsync of the directory `path`, making a preceding `rename` into

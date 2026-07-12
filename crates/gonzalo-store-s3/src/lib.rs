@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
-    decode_segment, object_key, store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
+    Result, Revision, decode_segment, object_key, store::Conflict,
 };
 
 /// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
@@ -229,6 +229,67 @@ impl gonzalo_core::Store for S3Store {
             }
         }
         Ok(out)
+    }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        // Unconditional delete (`expected = None`): S3 delete of an absent key
+        // already succeeds, so this is an idempotent `Deleted`.
+        let Some(want) = expected.clone() else {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(object_key(key))
+                .send()
+                .await
+                .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
+            return Ok(DeleteResult::Deleted);
+        };
+
+        // Conditional delete: read the current object *and its ETag*, then make
+        // the removal conditional on that ETag (`If-Match`) so a writer that
+        // slips in between our read and delete loses the race with a 412 — the
+        // same TOCTOU close as `put`. An already-absent key is an idempotent
+        // `Deleted` (the revision is already gone — nothing to conflict on).
+        let Some((current, etag)) = self.read_with_etag(key).await? else {
+            return Ok(DeleteResult::Deleted);
+        };
+        if current.revision != want {
+            return Ok(DeleteResult::Conflict(Box::new(Conflict {
+                key: key.clone(),
+                expected,
+                current,
+            })));
+        }
+
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(object_key(key))
+            .if_match(etag)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(DeleteResult::Deleted),
+            Err(e) => {
+                let svc = e.into_service_error();
+                // A 412 means a concurrent writer changed the object between our
+                // read and conditional delete: re-read for the fresh state and
+                // surface the normal, recoverable Conflict (or `Deleted` if it
+                // was concurrently removed — the revision is already gone).
+                if is_precondition_failed(svc.code()) {
+                    return match self.read(key).await? {
+                        Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                            key: key.clone(),
+                            expected,
+                            current: cur,
+                        }))),
+                        None => Ok(DeleteResult::Deleted),
+                    };
+                }
+                Err(CoreError::Backend(svc.to_string()))
+            }
+        }
     }
 }
 

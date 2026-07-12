@@ -306,6 +306,14 @@ mod tests {
         ) -> gonzalo_core::Result<Vec<gonzalo_core::RecordKey>> {
             Ok(vec![])
         }
+
+        async fn delete(
+            &self,
+            _key: &gonzalo_core::RecordKey,
+            _expected: Option<Revision>,
+        ) -> gonzalo_core::Result<gonzalo_core::DeleteResult> {
+            Ok(gonzalo_core::DeleteResult::Deleted)
+        }
     }
 
     #[tokio::test]

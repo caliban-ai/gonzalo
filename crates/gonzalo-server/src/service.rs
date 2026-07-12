@@ -5,8 +5,8 @@
 //! content-addressed slices on the fly.
 
 use gonzalo_core::{
-    BlobStore, CoreError, KeyPrefix, Manifest, PutResult, Record, RecordKey, Result, Revision,
-    Store,
+    BlobStore, CoreError, DeleteResult, KeyPrefix, Manifest, PutResult, Record, RecordKey, Result,
+    Revision, Store,
 };
 use gonzalo_graph::{GraphStore, Located, Reference, Symbol, assemble};
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
@@ -67,6 +67,14 @@ impl Service {
 
     pub async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
         self.store.list(prefix).await
+    }
+
+    pub async fn delete(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+    ) -> Result<DeleteResult> {
+        self.store.delete(key, expected).await
     }
 
     /// Build a source for `conn` from the registry and ingest its tickets into

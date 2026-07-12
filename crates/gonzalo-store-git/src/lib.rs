@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    Body, ContentHash, CoreError, Identity, KeyPrefix, MergeOutcome, Meta, PutResult, Record,
-    RecordKey, Result, Revision, decode_segment, merge, record_components, store::Conflict,
+    Body, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, MergeOutcome, Meta, PutResult,
+    Record, RecordKey, Result, Revision, decode_segment, merge, record_components, store::Conflict,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::cell::RefCell;
@@ -80,6 +80,40 @@ impl GitStore {
             .map_err(|e| CoreError::Backend(e.to_string()))?;
         index
             .add_path(rel)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        index
+            .write()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let sig = git2::Signature::now("gonzalo", "gonzalo@localhost")
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Commit the removal of `rel` (a `git rm` equivalent): stage the deletion in
+    /// the index, write the tree, and record a commit. Mirrors `commit_file` but
+    /// removes the path from the index instead of adding it.
+    fn commit_removal(&self, rel: &Path, message: &str) -> Result<()> {
+        let repo =
+            git2::Repository::open(&self.root).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let mut index = repo
+            .index()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        index
+            .remove_path(rel)
             .map_err(|e| CoreError::Backend(e.to_string()))?;
         index
             .write()
@@ -525,6 +559,43 @@ impl gonzalo_core::Store for GitStore {
             let mut out = Vec::new();
             collect_keys(&root, &prefix, &mut out)?;
             Ok(out)
+        })
+        .await
+    }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        let root = self.root.clone();
+        let key = key.clone();
+        run_blocking(move || {
+            let store = GitStore { root: root.clone() };
+            // Serialize the read→check→remove→commit critical section over the
+            // shared index+HEAD, exactly as `put`; the lock releases when `_lock`
+            // drops (all paths).
+            let _lock = lock_repo(&root)?;
+            let current = store.read(&key)?;
+            match (current, &expected) {
+                // Absent: nothing to remove — idempotent `Deleted`.
+                (None, _) => Ok(DeleteResult::Deleted),
+                // Unconditional, or the expected revision matches: remove + commit.
+                (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
+                    let (ns, col, file) = record_components(&key);
+                    let rel = Path::new(&ns).join(&col).join(&file);
+                    let abs = root.join(&rel);
+                    match std::fs::remove_file(&abs) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(CoreError::Backend(e.to_string())),
+                    }
+                    store.commit_removal(&rel, &format!("delete {key}"))?;
+                    Ok(DeleteResult::Deleted)
+                }
+                // Present but the expected revision differs: surface a Conflict.
+                (Some(cur), _) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur,
+                }))),
+            }
         })
         .await
     }

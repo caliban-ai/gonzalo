@@ -10,8 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use gonzalo_core::{Identity, KeyPrefix, PutResult, RecordKey};
-use gonzalo_proto::http::{PutBody, PutOutcome};
+use gonzalo_core::{DeleteResult, Identity, KeyPrefix, PutResult, RecordKey};
+use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ pub fn router(service: Service, auth: Arc<Auth>) -> Router {
         .route("/readyz", get(readyz))
         .route(
             "/v1/records/{ns}/{col}/{id}",
-            get(get_record).put(put_record),
+            get(get_record).put(put_record).delete(delete_record),
         )
         .route("/v1/keys", get(list_keys))
         .route("/v1/tickets/sync", axum::routing::post(ticket_sync))
@@ -154,6 +154,31 @@ async fn put_record(
         Ok(PutResult::Conflict(conflict)) => (
             StatusCode::CONFLICT,
             Json(PutOutcome::Conflict { conflict }),
+        )
+            .into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// The URL path addresses the record; the OCC precondition rides in an optional
+/// JSON body. Authorize `Write` on the path's namespace, then delegate — the key
+/// is taken from the path, so there is no body-key-vs-path check to make.
+async fn delete_record(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path((ns, col, id)): Path<(String, String, String)>,
+    body: Option<Json<DeleteBody>>,
+) -> Response {
+    if !principal.allows(Access::Write, &ns) {
+        return forbidden(&principal, Access::Write, &ns);
+    }
+    let expected = body.map(|Json(b)| b.expected).unwrap_or_default();
+    let key = RecordKey::new(ns, col, id);
+    match svc.delete(&key, expected).await {
+        Ok(DeleteResult::Deleted) => (StatusCode::OK, Json(DeleteOutcome::Deleted)).into_response(),
+        Ok(DeleteResult::Conflict(conflict)) => (
+            StatusCode::CONFLICT,
+            Json(DeleteOutcome::Conflict { conflict }),
         )
             .into_response(),
         Err(e) => server_error(e),
@@ -389,6 +414,13 @@ mod tests {
             Err(CoreError::Backend("store unreachable".into()))
         }
         async fn list(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn delete(
+            &self,
+            _key: &RecordKey,
+            _expected: Option<Revision>,
+        ) -> CoreResult<DeleteResult> {
             Err(CoreError::Backend("store unreachable".into()))
         }
     }
