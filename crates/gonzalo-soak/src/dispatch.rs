@@ -84,7 +84,9 @@ impl Dispatcher {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use gonzalo_core::{Body, CoreError, Identity, KeyPrefix, Meta, RecordKind, store::Conflict};
+    use gonzalo_core::{
+        Body, CoreError, DeleteResult, Identity, KeyPrefix, Meta, RecordKind, store::Conflict,
+    };
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicBool;
 
@@ -130,6 +132,18 @@ mod tests {
         }
         async fn list(&self, _prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
             Ok(Vec::new())
+        }
+        async fn delete(
+            &self,
+            _key: &RecordKey,
+            _expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.alive.load(Ordering::SeqCst) {
+                Ok(DeleteResult::Deleted)
+            } else {
+                Err(CoreError::Backend("connection refused".into()))
+            }
         }
     }
 
@@ -241,6 +255,9 @@ mod tests {
             }
             async fn list(&self, _p: &KeyPrefix) -> Result<Vec<RecordKey>> {
                 Ok(Vec::new())
+            }
+            async fn delete(&self, _k: &RecordKey, _e: Option<Revision>) -> Result<DeleteResult> {
+                Ok(DeleteResult::Deleted)
             }
         }
         let c0 = Arc::new(Conflicter(AtomicUsize::new(0)));
