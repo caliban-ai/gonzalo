@@ -107,7 +107,11 @@ run() {
 # The `gonzalo-parse-worker` is likewise a subprocess entrypoint `llvm-cov`
 # cannot instrument (it runs as a child); its behavior is exercised through the
 # `ParserPool` tests.
-IGNORE_REGEX='crates/gonzalo-server/src/bin/gonzalod\.rs|crates/gonzalo-mcp/src/main\.rs|crates/gonzalo-parse/src/bin/gonzalo-parse-worker\.rs|crates/gonzalo-cli/src/watch\.rs'
+# `gonzalo-soak`: its pure logic (oracle/dispatch/target/workload) IS covered by
+# unit + in-process-FsStore tests. `replica`/`harness`/`main` spawn real gonzalod
+# subprocesses against a live RustFS and are only exercised by the docker-gated
+# `ha-soak` job (which skips in the coverage run), so they're excluded here.
+IGNORE_REGEX='crates/gonzalo-server/src/bin/gonzalod\.rs|crates/gonzalo-mcp/src/main\.rs|crates/gonzalo-parse/src/bin/gonzalo-parse-worker\.rs|crates/gonzalo-cli/src/watch\.rs|crates/gonzalo-soak/src/replica\.rs|crates/gonzalo-soak/src/harness\.rs|crates/gonzalo-soak/src/main\.rs'
 
 # Whole-workspace coverage with every substrate/capability feature enabled, so
 # the facade's feature-gated re-exports are instrumented too.
