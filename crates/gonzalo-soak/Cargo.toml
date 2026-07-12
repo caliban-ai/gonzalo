@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+# Internal HA chaos-soak harness (gonzalo#52) — not a consumable crate.
+publish = false
 
 [lib]
 path = "src/lib.rs"
