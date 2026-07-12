@@ -212,7 +212,7 @@ fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PutResult, RecordKind, store::Conflict};
+    use crate::{DeleteResult, PutResult, RecordKind, store::Conflict};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -251,6 +251,25 @@ mod tests {
                 .filter(|k| prefix.matches(k))
                 .cloned()
                 .collect())
+        }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.0.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
         }
     }
 
@@ -310,6 +329,25 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.inner.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
+        }
     }
 
     /// A store whose conditional `put` *always* races (a concurrent writer that
@@ -350,6 +388,25 @@ mod tests {
                 .filter(|k| prefix.matches(k))
                 .cloned()
                 .collect())
+        }
+        async fn delete(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+        ) -> Result<DeleteResult> {
+            let mut g = self.0.lock().unwrap();
+            match g.get(key) {
+                None => Ok(DeleteResult::Deleted),
+                Some(cur) if expected.is_none() || expected.as_ref() == Some(&cur.revision) => {
+                    g.remove(key);
+                    Ok(DeleteResult::Deleted)
+                }
+                Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur.clone(),
+                }))),
+            }
         }
     }
 
@@ -493,6 +550,46 @@ mod tests {
         let report = sync(&a, &b).await.unwrap();
         assert_eq!(report.merged, vec![RecordKey::new("ns", "col", "s")]);
         assert!(report.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_with_blank_and_duplicate_lines_survives_divergent_sync() {
+        // Regression for #133: a Session whose committed body legitimately holds
+        // a blank line and a repeated line must survive a divergent sync intact.
+        // `sync` merges against an empty base, so the old split+dedup path
+        // silently dropped the blank line and collapsed the repeat, corrupting
+        // BOTH stores (ADR 0005 violation). The merge must be side A verbatim
+        // plus side B's divergent tail.
+        let a = MemStore::default();
+        let b = MemStore::default();
+        let _ = a
+            .put(
+                rec("s", RecordKind::Session, "a\n\nyes\nyes\nfrom_a\n"),
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = b
+            .put(
+                rec("s", RecordKind::Session, "a\n\nyes\nyes\nfrom_b\n"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let report = sync(&a, &b).await.unwrap();
+        let key = RecordKey::new("ns", "col", "s");
+        assert_eq!(report.merged, vec![key.clone()]);
+        assert!(report.conflicts.is_empty());
+
+        let ma = a.get(&key).await.unwrap().unwrap();
+        let text = String::from_utf8(ma.body.bytes().to_vec()).unwrap();
+        // Blank line preserved, "yes\nyes" not collapsed, both appends present.
+        assert_eq!(text, "a\n\nyes\nyes\nfrom_a\nfrom_b\n");
+        // Both stores converge to the same merged revision.
+        let mb = b.get(&key).await.unwrap().unwrap();
+        assert_eq!(ma.revision, mb.revision);
+        assert_eq!(ma.body, mb.body);
     }
 
     #[tokio::test]

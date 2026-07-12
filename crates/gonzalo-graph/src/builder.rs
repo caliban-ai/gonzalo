@@ -1,7 +1,7 @@
 //! Build a [`CodeGraph`] from source using tree-sitter. Parsing is
 //! language-parameterized ([`Language`]); Rust, Python, JavaScript,
 //! TypeScript/TSX, Go, Java, C#, C, C++, Ruby, PHP, Bash, Kotlin, Swift, Lua,
-//! and Scala are supported, and a new grammar is a matter of adding its
+//! Scala, and Elixir are supported, and a new grammar is a matter of adding its
 //! node-kind mappings.
 
 use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
@@ -29,6 +29,7 @@ pub enum Language {
     Swift,
     Lua,
     Scala,
+    Elixir,
 }
 
 impl Language {
@@ -53,6 +54,7 @@ impl Language {
             "swift" => Some(Self::Swift),
             "lua" => Some(Self::Lua),
             "scala" | "sc" => Some(Self::Scala),
+            "ex" | "exs" => Some(Self::Elixir),
             _ => None,
         }
     }
@@ -76,11 +78,17 @@ impl Language {
             Self::Swift => tree_sitter_swift::LANGUAGE.into(),
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Scala => tree_sitter_scala::LANGUAGE.into(),
+            Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         }
     }
 
-    /// Map a node kind to the symbol it defines, if any.
-    fn item_kind(self, node_kind: &str) -> Option<SymbolKind> {
+    /// Map a node to the symbol it defines, if any. Takes the whole node (not
+    /// just its kind) because some languages need to inspect children — e.g. a
+    /// JS `variable_declarator` is only a function when its value is an
+    /// arrow/function expression, and Swift/Kotlin distinguish struct/enum/
+    /// interface by a keyword child.
+    fn item_kind(self, node: Node<'_>, bytes: &[u8]) -> Option<SymbolKind> {
+        let node_kind = node.kind();
         match self {
             Self::Rust => match node_kind {
                 "function_item" => Some(SymbolKind::Function),
@@ -99,9 +107,9 @@ impl Language {
                 "class_definition" => Some(SymbolKind::Class),
                 _ => None,
             },
-            Self::JavaScript => js_item_kind(node_kind),
+            Self::JavaScript => js_item_kind(node),
             // TypeScript/TSX are a superset of JavaScript's declarations.
-            Self::TypeScript | Self::Tsx => js_item_kind(node_kind).or(match node_kind {
+            Self::TypeScript | Self::Tsx => js_item_kind(node).or(match node_kind {
                 "interface_declaration" => Some(SymbolKind::Interface),
                 "type_alias_declaration" => Some(SymbolKind::TypeAlias),
                 "enum_declaration" => Some(SymbolKind::Enum),
@@ -161,20 +169,21 @@ impl Language {
                 "function_definition" => Some(SymbolKind::Function),
                 _ => None,
             },
-            // Kotlin `object` (a named singleton) and `interface` both surface as
-            // class-like type declarations; interfaces are `class_declaration`
-            // with an `interface` keyword, so they read as Class here.
+            // Kotlin `class_declaration` covers both `class` and `interface`
+            // (distinguished by a leading keyword child); `object` (a named
+            // singleton) is its own `object_declaration` node and reads as Class.
             Self::Kotlin => match node_kind {
                 "function_declaration" => Some(SymbolKind::Function),
-                "class_declaration" | "object_declaration" => Some(SymbolKind::Class),
+                "class_declaration" => Some(kotlin_class_kind(node)),
+                "object_declaration" => Some(SymbolKind::Class),
                 _ => None,
             },
-            // Swift `class_declaration` covers class/struct/enum/actor
-            // (distinguished by a `declaration_kind` field we don't split on);
-            // `protocol` maps to Interface.
+            // Swift `class_declaration` covers class/struct/enum/actor,
+            // distinguished by a `declaration_kind` keyword child; `protocol`
+            // maps to Interface.
             Self::Swift => match node_kind {
                 "function_declaration" => Some(SymbolKind::Function),
-                "class_declaration" => Some(SymbolKind::Class),
+                "class_declaration" => Some(swift_type_kind(node)),
                 "protocol_declaration" => Some(SymbolKind::Interface),
                 _ => None,
             },
@@ -192,6 +201,14 @@ impl Language {
                 "enum_definition" => Some(SymbolKind::Enum),
                 _ => None,
             },
+            // Elixir is homoiconic: `def`/`defp`/`defmacro`/`defmacrop` and
+            // `defmodule` all parse as ordinary `call` nodes distinguished by
+            // their target identifier's *text*, not by node kind.
+            Self::Elixir => elixir_target_name(node, bytes).and_then(|t| match t.as_str() {
+                "defmodule" => Some(SymbolKind::Module),
+                "def" | "defp" | "defmacro" | "defmacrop" => Some(SymbolKind::Function),
+                _ => None,
+            }),
         }
     }
 
@@ -216,6 +233,10 @@ impl Language {
             (Self::C | Self::Cpp, SymbolKind::Function | SymbolKind::TypeAlias) => {
                 c_declarator_name(node, bytes)
             }
+            // Elixir defs carry no `name` field; the defined name is the head of
+            // the first argument — a nested `call` (`def add(a, b)`), a bare
+            // `identifier` (`def run`), or an `alias` (`defmodule Math`).
+            (Self::Elixir, _) => elixir_defined_name(node, bytes),
             _ => name_field(node, bytes),
         }
     }
@@ -234,11 +255,19 @@ impl Language {
             Self::Java => node_kind == "method_invocation",
             Self::CSharp => node_kind == "invocation_expression",
             Self::Ruby => node_kind == "call",
-            Self::Php => node_kind == "function_call_expression",
+            // PHP: plain `f()`, method `$x->m()` / `$x?->m()`, and static `A::b()`.
+            Self::Php => matches!(
+                node_kind,
+                "function_call_expression"
+                    | "member_call_expression"
+                    | "nullsafe_member_call_expression"
+                    | "scoped_call_expression"
+            ),
             // Bash "calls" are commands (`helper arg`).
             Self::Bash => node_kind == "command",
             Self::Kotlin | Self::Swift | Self::Scala => node_kind == "call_expression",
             Self::Lua => node_kind == "function_call",
+            Self::Elixir => node_kind == "call",
         }
     }
 
@@ -319,9 +348,13 @@ impl Language {
             // Java, Ruby, Bash, Kotlin, Swift, and Lua route through `callee_name`
             // (their callee is a dedicated field/child on the call node, not a
             // nested `function` node); these arms only keep the match exhaustive.
-            Self::Java | Self::Ruby | Self::Bash | Self::Kotlin | Self::Swift | Self::Lua => {
-                node_text(func, bytes).map(str::to_string)
-            }
+            Self::Java
+            | Self::Ruby
+            | Self::Bash
+            | Self::Kotlin
+            | Self::Swift
+            | Self::Lua
+            | Self::Elixir => node_text(func, bytes).map(str::to_string),
         }
     }
 
@@ -354,6 +387,34 @@ impl Language {
             Self::Lua => call
                 .child_by_field_name("name")
                 .and_then(|n| last_identifier(n, bytes)),
+            // PHP: plain calls carry the callee in a `function` field (a
+            // `name`/`qualified_name`); method (`$x->m()`) and static (`A::b()`)
+            // calls carry the invoked member in a `name` field.
+            Self::Php => match call.kind() {
+                "function_call_expression" => call
+                    .child_by_field_name("function")
+                    .and_then(|func| self.call_name(func, bytes)),
+                _ => call
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string),
+            },
+            // Elixir: every `call` carries its callee in a `target` field. A
+            // definition call (`def`/`defp`/`defmacro`/`defmacrop`/`defmodule`)
+            // and a definition *head* (`add(a, b)` in `def add(a, b)`) are not
+            // references; every other call is, keyed by the target's trailing
+            // identifier (`helper` for `helper(..)`, `add` for `Mod.add(..)`).
+            Self::Elixir => match elixir_target_name(call, bytes) {
+                Some(name)
+                    if !matches!(
+                        name.as_str(),
+                        "def" | "defp" | "defmacro" | "defmacrop" | "defmodule"
+                    ) && !elixir_is_def_head(call, bytes) =>
+                {
+                    Some(name)
+                }
+                _ => None,
+            },
             _ => call
                 .child_by_field_name("function")
                 .and_then(|func| self.call_name(func, bytes)),
@@ -379,14 +440,91 @@ fn last_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     result
 }
 
+/// The first named child of `node` whose kind is `kind`, if any.
+fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).find(|c| c.kind() == kind)
+}
+
+/// The trailing identifier text of an Elixir `call` node's `target` — a bare
+/// `identifier` (`helper(..)`) or the `right` member of a `dot` (`Mod.fun(..)`).
+/// `None` when `node` is not a call (no `target` field).
+fn elixir_target_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let target = node.child_by_field_name("target")?;
+    last_identifier(target, bytes)
+}
+
+/// The name defined by an Elixir definition call. The signature is the first
+/// argument: a nested `call` (`def add(a, b)` → `add`), a bare `identifier`
+/// (`def run` → `run`), or an `alias` (`defmodule Math` → `Math`).
+fn elixir_defined_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let head = child_of_kind(node, "arguments")?.named_child(0)?;
+    match head.kind() {
+        "call" => elixir_target_name(head, bytes),
+        _ => last_identifier(head, bytes).or_else(|| node_text(head, bytes).map(str::to_string)),
+    }
+}
+
+/// Whether an Elixir `call` is the *head* of a definition — the first argument
+/// of a `def`/`defp`/`defmacro`/`defmacrop`/`defmodule` call (e.g. `add(a, b)`
+/// in `def add(a, b)`). Such a head names the defined symbol, not a call.
+fn elixir_is_def_head(node: Node<'_>, bytes: &[u8]) -> bool {
+    let Some(args) = node.parent().filter(|p| p.kind() == "arguments") else {
+        return false;
+    };
+    if args.named_child(0).map(|h| h.id()) != Some(node.id()) {
+        return false;
+    }
+    let Some(def_call) = args.parent().filter(|g| g.kind() == "call") else {
+        return false;
+    };
+    matches!(
+        elixir_target_name(def_call, bytes).as_deref(),
+        Some("def" | "defp" | "defmacro" | "defmacrop" | "defmodule")
+    )
+}
+
 /// JavaScript declaration node kinds shared by JS and TS/TSX.
-fn js_item_kind(node_kind: &str) -> Option<SymbolKind> {
-    match node_kind {
+fn js_item_kind(node: Node<'_>) -> Option<SymbolKind> {
+    match node.kind() {
         "function_declaration" | "generator_function_declaration" | "method_definition" => {
             Some(SymbolKind::Function)
         }
         "class_declaration" | "abstract_class_declaration" => Some(SymbolKind::Class),
+        // `const foo = () => {}` / `const foo = function () {}` and class-field
+        // `foo = () => {}`: a binding whose value is an arrow/function expression
+        // is a named function. The name lives on the binding's `name` field.
+        "variable_declarator" | "public_field_definition" => {
+            match node.child_by_field_name("value").map(|v| v.kind()) {
+                Some("arrow_function" | "function_expression") => Some(SymbolKind::Function),
+                _ => None,
+            }
+        }
         _ => None,
+    }
+}
+
+/// Swift `class_declaration` keyword (`struct`/`enum`/`actor`/`class`) → kind.
+/// `actor` (a reference type) and `class` both read as Class.
+fn swift_type_kind(node: Node<'_>) -> SymbolKind {
+    match node
+        .child_by_field_name("declaration_kind")
+        .map(|k| k.kind())
+    {
+        Some("struct") => SymbolKind::Struct,
+        Some("enum") => SymbolKind::Enum,
+        _ => SymbolKind::Class,
+    }
+}
+
+/// Kotlin `class_declaration` is an `interface` when it has a leading
+/// `interface` keyword child; otherwise a `class`.
+fn kotlin_class_kind(node: Node<'_>) -> SymbolKind {
+    let mut cursor = node.walk();
+    if node.children(&mut cursor).any(|c| c.kind() == "interface") {
+        SymbolKind::Interface
+    } else {
+        SymbolKind::Class
     }
 }
 
@@ -457,7 +595,7 @@ fn walk(
 ) {
     let mut enclosing = current_fn.map(str::to_string);
 
-    if let Some(kind) = language.item_kind(node.kind())
+    if let Some(kind) = language.item_kind(node, bytes)
         && let Some(name) = language.item_name(node, kind, bytes)
     {
         graph.symbols.push(Symbol {
@@ -605,6 +743,8 @@ def main():
         assert_eq!(Language::from_extension("swift"), Some(Language::Swift));
         assert_eq!(Language::from_extension("lua"), Some(Language::Lua));
         assert_eq!(Language::from_extension("scala"), Some(Language::Scala));
+        assert_eq!(Language::from_extension("ex"), Some(Language::Elixir));
+        assert_eq!(Language::from_extension("exs"), Some(Language::Elixir));
         assert_eq!(Language::from_extension("txt"), None);
     }
 
@@ -1210,5 +1350,170 @@ def main(): Unit = { helper(2) }
                 .any(|r| r.name == "helper" && r.from.as_deref() == Some("main")),
             "helper() call from main"
         );
+    }
+
+    const ELIXIR_SRC: &str = r#"
+defmodule Math do
+  def add(a, b) do
+    helper(a) + b
+  end
+
+  defp helper(x), do: x
+
+  def run do
+    Remote.compute(1)
+  end
+end
+"#;
+
+    #[test]
+    fn elixir_extracts_definitions() {
+        let g = build(Language::Elixir, ELIXIR_SRC);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        // `defmodule Math` -> Module (name is the `alias`).
+        assert_eq!(named("Math"), Some(SymbolKind::Module));
+        // `def add(a, b)` -> Function (name is the nested-call head).
+        assert_eq!(named("add"), Some(SymbolKind::Function));
+        // `defp helper(x)` -> Function.
+        assert_eq!(named("helper"), Some(SymbolKind::Function));
+        // `def run` (no parens) -> Function (name is a bare identifier head).
+        assert_eq!(named("run"), Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn elixir_records_calls() {
+        let g = build(Language::Elixir, ELIXIR_SRC);
+        // `helper(a)` -> reference to `helper` from inside `add`; the def head
+        // `add(a, b)` is not itself recorded as a call.
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "helper" && r.from.as_deref() == Some("add")),
+            "helper() call from add"
+        );
+        // Remote call `Remote.compute(1)` -> reference to `compute` from `run`
+        // (the target's trailing identifier).
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "compute" && r.from.as_deref() == Some("run")),
+            "Remote.compute() call from run"
+        );
+        // The definition heads must not leak in as self-calls.
+        assert!(
+            !g.references.iter().any(|r| r.name == "add"),
+            "def head add(a, b) not recorded as a call"
+        );
+    }
+
+    // #136: JS/TS arrow-function and function-expression bindings are named
+    // functions; a `variable_declarator`/`public_field_definition` whose value
+    // is an `arrow_function`/`function_expression`.
+    #[test]
+    fn javascript_extracts_arrow_and_function_expression_bindings() {
+        let src = r#"
+const foo = () => { bar(); };
+const baz = function () { qux(); };
+"#;
+        let g = build(Language::JavaScript, src);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("foo"), Some(SymbolKind::Function));
+        assert_eq!(named("baz"), Some(SymbolKind::Function));
+        // Calls inside are attributed to the binding name (`walk` sets enclosing).
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "bar" && r.from.as_deref() == Some("foo")),
+            "bar() call attributed to foo"
+        );
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "qux" && r.from.as_deref() == Some("baz")),
+            "qux() call attributed to baz"
+        );
+    }
+
+    #[test]
+    fn typescript_extracts_arrow_bindings_and_class_fields() {
+        // A `const` arrow binding and a class-field arrow (`public_field_definition`).
+        let src = r#"
+const foo = (): void => { bar(); };
+class C { handler = (): void => { onClick(); }; }
+"#;
+        let g = build(Language::TypeScript, src);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("foo"), Some(SymbolKind::Function));
+        assert_eq!(named("handler"), Some(SymbolKind::Function));
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "bar" && r.from.as_deref() == Some("foo")),
+            "bar() call attributed to foo"
+        );
+        assert!(
+            g.references
+                .iter()
+                .any(|r| r.name == "onClick" && r.from.as_deref() == Some("handler")),
+            "onClick() call attributed to handler"
+        );
+    }
+
+    // #137: PHP method (`$this->m()`, `member_call_expression`) and static
+    // (`A::b()`, `scoped_call_expression`) calls are recorded.
+    #[test]
+    fn php_records_method_and_static_calls() {
+        let src = r#"<?php
+class A {
+    function run() {
+        $this->other();
+        self::x();
+        B::stat();
+    }
+}
+"#;
+        let g = build(Language::Php, src);
+        let called = |n: &str| {
+            g.references
+                .iter()
+                .any(|r| r.name == n && r.from.as_deref() == Some("run"))
+        };
+        assert!(called("other"), "$this->other() recorded from run");
+        assert!(called("x"), "self::x() recorded from run");
+        assert!(called("stat"), "B::stat() recorded from run");
+    }
+
+    // #151: Swift struct/enum/actor and Kotlin interface/object are no longer all
+    // mislabeled Class.
+    #[test]
+    fn swift_distinguishes_struct_enum_class() {
+        let src = r#"
+struct Point { var x: Int }
+enum Color { case red }
+class Widget {}
+actor Worker {}
+protocol Shape {}
+"#;
+        let g = build(Language::Swift, src);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Point"), Some(SymbolKind::Struct));
+        assert_eq!(named("Color"), Some(SymbolKind::Enum));
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Worker"), Some(SymbolKind::Class)); // `actor` -> Class
+        assert_eq!(named("Shape"), Some(SymbolKind::Interface)); // `protocol`
+    }
+
+    #[test]
+    fn kotlin_distinguishes_interface_from_class() {
+        let src = r#"
+interface Shape { }
+class Widget { }
+object Config
+"#;
+        let g = build(Language::Kotlin, src);
+        let named = |n: &str| g.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(named("Shape"), Some(SymbolKind::Interface));
+        assert_eq!(named("Widget"), Some(SymbolKind::Class));
+        assert_eq!(named("Config"), Some(SymbolKind::Class)); // `object` singleton
     }
 }

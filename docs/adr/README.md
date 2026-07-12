@@ -42,6 +42,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted |
 | [0016](0016-threeway-merge-stored-ancestry.md) | 3-way merge with content-addressed stored ancestry | accepted |
 | [0017](0017-nonff-pull-content-merge.md) | Non-fast-forward git pull via content-aware merge | accepted |
+| [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted |
 
 ## Adding a new ADR
 

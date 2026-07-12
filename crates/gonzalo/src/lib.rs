@@ -4,9 +4,9 @@
 //! selects storage substrates via Cargo features (`fs` is on by default).
 
 pub use gonzalo_core::{
-    Body, Conflict, ContentHash, CoreError, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta,
-    PutResult, Record, RecordKey, RecordKind, Result, Revision, Store, SyncConflict, SyncReport,
-    merge, sync,
+    Body, Conflict, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, MergeClass,
+    MergeOutcome, Meta, PutResult, Record, RecordKey, RecordKind, Result, Revision, Store,
+    SyncConflict, SyncReport, merge, sync,
 };
 
 pub use gonzalo_domain::{
@@ -39,7 +39,7 @@ pub use gonzalo_graph::{
 #[cfg(feature = "ticket")]
 pub use gonzalo_ticket::{
     Capabilities, Cursor, FieldMapping, InMemorySource, Page, SourceError, StateMapping,
-    StateSignal, TicketSource, record_key,
+    StateSignal, TicketSource, record_key, scoped_uid,
 };
 
 #[cfg(feature = "ticket-github")]

@@ -9,6 +9,68 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-11
+
+The hardening & language-breadth release. A broad correctness and robustness
+sweep — a 20-finding QA pass turned into fixes across the core merge/OCC model,
+every storage substrate, the daemon, the ticket connectors, and the
+knowledge/vector layer — lands alongside eight new code-graph grammars that
+take language coverage from nine to **seventeen**.
+
+### Added
+
+- **Language breadth for the code graph** — grammars for **Ruby, PHP, Bash**
+  (#87), **Kotlin** (#87), **Swift** (#87), **Lua** (#87), **Scala** (#87), and
+  **Elixir** (#87). Elixir is homoiconic (`def`/`defp`/`defmacro`/`defmodule`
+  parse as ordinary `call` nodes), so it uses a value-based `walk()` dispatch on
+  the call target's text rather than a node-kind mapping. Coverage is now 17
+  languages. (#126, #127, #128, #129, #130, #181)
+
+### Changed
+
+- **Ticket `RecordKey`s are board-scoped** — a board-scoped source folds its
+  connection/board discriminator into the key, so the same issue imported from
+  two boards no longer collides onto one thrashing record. Stored keys for board
+  sources change shape and re-import on the next sync. (#159)
+
+### Fixed
+
+- **core** — record-key encoding is now a reversible, injective percent-style
+  codec, so distinct keys can never collide onto one physical path (silent
+  cross-key overwrite / OCC bypass); append-only merge preserves blank and
+  legitimately-repeated committed lines instead of stripping/de-duping them, and
+  the `Derived`/gc semantics are corrected. (#131, #133)
+- **storage substrates** — the git substrate locks the `put` critical section
+  (no lost updates under concurrent writers) and detects non-fast-forward push
+  rejection; filesystem writes fsync the temp file and parent directory for
+  crash durability; S3 list-pagination terminates when the continuation token is
+  absent; graph-sqlite view-db paths use the injective encoder. (#132, #134,
+  #144, #145)
+- **daemon** — authorization runs before request deserialization, internal
+  backend errors are returned opaquely (no path/bucket/SQLite leakage), the PUT
+  record route validates its URL path against the body key, and the remote
+  client surfaces daemon 403/413 responses instead of masking them as a decode
+  error. (#146, #147)
+- **code graph** — JS/TS arrow-function and function-expression bindings are
+  extracted, PHP method and static calls are recorded, and Swift/Kotlin
+  `struct`/`enum`/`interface` declarations get their correct `SymbolKind`. (#136)
+- **knowledge / vector / domain** — a corrupt knowledge-bearing body surfaces an
+  ingest error (rather than silently not indexing) and removed records are
+  de-indexed; non-finite vectors score `0.0` and rank deterministically; the
+  domain codec rejects a `Body::Blob` instead of misparsing its content hash.
+  (#139, #149, #154)
+- **cli** — `get`/`ticket get` exit non-zero (message on stderr) when a record
+  is absent, `index` advances the persistent SQLite graph only after the
+  manifest commits, and `--gc` is honored under `--watch`. (#152)
+- **ticket connectors** — Jira routes a `Canceled` move to a won't-do status
+  rather than Done; a closed GitLab issue is terminal and non-terminal moves no
+  longer report a false success; Linear fails a mutation that returns
+  `success: false`; the GitHub REST connector follows `Link` pagination so all
+  issues import, not just the first 100. (#138, #140, #141, #142)
+
+Testing: de-flaked `gonzalo-parse`'s hung-worker timeout test, whose 300 ms
+budget false-timed-out the healthy recovery parse under heavy build load. (#178)
+
 ## [0.2.0] - 2026-07-06
 
 The code-graph release. Gonzalo grows a full **code-graph capability** —
@@ -115,6 +177,7 @@ milestone (M1–M6).
   ADRs 0001–0009; added CI (fmt/clippy/build/test), a line-coverage gate, the
   Kanban label taxonomy, and board/triage automation.
 
-[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/caliban-ai/gonzalo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caliban-ai/gonzalo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/caliban-ai/gonzalo/releases/tag/v0.1.0

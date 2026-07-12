@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
-    object_key, store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
+    Result, Revision, decode_segment, object_key, store::Conflict,
 };
 
 /// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
@@ -118,6 +118,17 @@ fn is_precondition_failed(code: Option<&str>) -> bool {
     matches!(code, Some("PreconditionFailed"))
 }
 
+/// Decide the continuation token for the next `list_objects_v2` page, driving
+/// pagination off token *presence* rather than the `is_truncated` flag. A
+/// well-behaved backend only returns a token when there is more to fetch, but a
+/// misbehaving one can report `is_truncated = true` yet omit the token; keying
+/// off the flag would then re-request page 1 forever. So: if a token is present
+/// we continue with it, otherwise we terminate — regardless of `is_truncated`.
+/// This guarantees the pagination loop always makes progress or stops.
+fn next_continuation(_is_truncated: Option<bool>, token: Option<&str>) -> Option<String> {
+    token.map(str::to_string)
+}
+
 #[async_trait]
 impl gonzalo_core::Store for S3Store {
     async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
@@ -212,13 +223,73 @@ impl gonzalo_core::Store for S3Store {
                     out.push(key);
                 }
             }
-            if resp.is_truncated().unwrap_or(false) {
-                continuation = resp.next_continuation_token().map(str::to_string);
-            } else {
-                break;
+            match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
+                Some(token) => continuation = Some(token),
+                None => break,
             }
         }
         Ok(out)
+    }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        // Unconditional delete (`expected = None`): S3 delete of an absent key
+        // already succeeds, so this is an idempotent `Deleted`.
+        let Some(want) = expected.clone() else {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(object_key(key))
+                .send()
+                .await
+                .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
+            return Ok(DeleteResult::Deleted);
+        };
+
+        // Conditional delete: read the current object *and its ETag*, then make
+        // the removal conditional on that ETag (`If-Match`) so a writer that
+        // slips in between our read and delete loses the race with a 412 — the
+        // same TOCTOU close as `put`. An already-absent key is an idempotent
+        // `Deleted` (the revision is already gone — nothing to conflict on).
+        let Some((current, etag)) = self.read_with_etag(key).await? else {
+            return Ok(DeleteResult::Deleted);
+        };
+        if current.revision != want {
+            return Ok(DeleteResult::Conflict(Box::new(Conflict {
+                key: key.clone(),
+                expected,
+                current,
+            })));
+        }
+
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(object_key(key))
+            .if_match(etag)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(DeleteResult::Deleted),
+            Err(e) => {
+                let svc = e.into_service_error();
+                // A 412 means a concurrent writer changed the object between our
+                // read and conditional delete: re-read for the fresh state and
+                // surface the normal, recoverable Conflict (or `Deleted` if it
+                // was concurrently removed — the revision is already gone).
+                if is_precondition_failed(svc.code()) {
+                    return match self.read(key).await? {
+                        Some(cur) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                            key: key.clone(),
+                            expected,
+                            current: cur,
+                        }))),
+                        None => Ok(DeleteResult::Deleted),
+                    };
+                }
+                Err(CoreError::Backend(svc.to_string()))
+            }
+        }
     }
 }
 
@@ -305,10 +376,9 @@ impl BlobStore for S3Store {
                     out.push(hash);
                 }
             }
-            if resp.is_truncated().unwrap_or(false) {
-                continuation = resp.next_continuation_token().map(str::to_string);
-            } else {
-                break;
+            match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
+                Some(token) => continuation = Some(token),
+                None => break,
             }
         }
         Ok(out)
@@ -339,13 +409,20 @@ fn blob_hash_from_key(key: &str) -> Option<ContentHash> {
     Some(ContentHash(rest.to_string()))
 }
 
-/// Parse `namespace/collection/id.json` back into a `RecordKey`. Returns
-/// `None` for objects that don't match the expected three-part `.json` shape.
+/// Parse `namespace/collection/id.json` back into a `RecordKey`, decoding each
+/// component (the exact inverse of `object_key`). Returns `None` for objects
+/// that don't match the expected three-part `.json` shape. Since every literal
+/// `/` in a component is escaped, splitting on `/` always yields exactly the
+/// three separators' worth of parts.
 fn parse_object_key(s: &str) -> Option<RecordKey> {
     let rest = s.strip_suffix(".json")?;
     let parts: Vec<&str> = rest.split('/').collect();
     if parts.len() == 3 {
-        Some(RecordKey::new(parts[0], parts[1], parts[2]))
+        Some(RecordKey::new(
+            decode_segment(parts[0]),
+            decode_segment(parts[1]),
+            decode_segment(parts[2]),
+        ))
     } else {
         None
     }
@@ -359,6 +436,24 @@ mod tests {
     fn parse_roundtrips_object_key() {
         let k = RecordKey::new("ns", "col", "id");
         assert_eq!(parse_object_key(&object_key(&k)), Some(k));
+    }
+
+    #[test]
+    fn parse_roundtrips_special_char_keys() {
+        // Keys with `.`, `/`, spaces, and `%` must survive the object-key
+        // round-trip and stay distinct (no collision onto one object).
+        for k in [
+            RecordKey::new("a/b", "c.d", "e/f"),
+            RecordKey::new("ns", "col", "v1.0"),
+            RecordKey::new("ns", "col", "v1_0"),
+            RecordKey::new("50% off", "café", "🚀"),
+        ] {
+            assert_eq!(parse_object_key(&object_key(&k)), Some(k));
+        }
+        assert_ne!(
+            object_key(&RecordKey::new("ns", "col", "v1.0")),
+            object_key(&RecordKey::new("ns", "col", "v1_0")),
+        );
     }
 
     #[test]
@@ -388,6 +483,30 @@ mod tests {
             precondition(&Some(rev()), Some("\"abc123\"")),
             Precondition::IfMatch("\"abc123\"".to_string())
         );
+    }
+
+    #[test]
+    fn next_continuation_terminates_when_token_absent() {
+        // The pagination bug: a backend reports more pages but omits the token.
+        // Keying off `is_truncated` would loop forever; we must terminate.
+        assert_eq!(next_continuation(Some(true), None), None);
+        // No token, not truncated → also terminate (the normal last page).
+        assert_eq!(next_continuation(Some(false), None), None);
+        assert_eq!(next_continuation(None, None), None);
+    }
+
+    #[test]
+    fn next_continuation_advances_when_token_present() {
+        // A token means fetch the next page, regardless of the flag's value.
+        assert_eq!(
+            next_continuation(Some(true), Some("t1")),
+            Some("t1".to_string())
+        );
+        assert_eq!(
+            next_continuation(Some(false), Some("t2")),
+            Some("t2".to_string())
+        );
+        assert_eq!(next_continuation(None, Some("t3")), Some("t3".to_string()));
     }
 
     #[test]

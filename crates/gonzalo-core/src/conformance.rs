@@ -3,8 +3,8 @@
 //! tests. The factory returns a fresh, empty store per invocation.
 
 use crate::{
-    BlobStore, Body, ContentHash, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey,
-    RecordKind, Revision, Store,
+    BlobStore, Body, ContentHash, DeleteResult, Identity, KeyPrefix, Meta, PutResult, Record,
+    RecordKey, RecordKind, Revision, Store,
 };
 use std::collections::BTreeMap;
 
@@ -39,6 +39,112 @@ where
     stale_expected_returns_conflict(&factory().await).await;
     update_commits_then_stale_update_conflicts(&factory().await).await;
     list_filters_by_prefix(&factory().await).await;
+    special_char_keys_dont_collide(&factory().await).await;
+    delete_unconditional_removes(&factory().await).await;
+    delete_absent_is_idempotent(&factory().await).await;
+    delete_stale_expected_conflicts(&factory().await).await;
+    delete_matching_expected_removes(&factory().await).await;
+}
+
+/// (a) A `put` then an unconditional `delete` (`expected = None`) removes the
+/// record: the follow-up `get` returns `None`.
+async fn delete_unconditional_removes<S: Store>(store: &S) {
+    let key = RecordKey::new("ns", "del", "unconditional");
+    let rec = sample(key.clone(), b"bye");
+    assert!(matches!(
+        store.put(rec, None).await.unwrap(),
+        PutResult::Committed(_)
+    ));
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    assert_eq!(store.get(&key).await.unwrap(), None);
+}
+
+/// (b) Deleting an absent key with `expected = None` is an idempotent `Deleted`.
+async fn delete_absent_is_idempotent<S: Store>(store: &S) {
+    let key = RecordKey::new("ns", "del", "absent");
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+}
+
+/// (c) A conditional `delete` with the wrong expected revision is a `Conflict`
+/// whose `current.revision` is the live revision, and the record still exists.
+async fn delete_stale_expected_conflicts<S: Store>(store: &S) {
+    let key = RecordKey::new("ns", "del", "stale");
+    let rec = sample(key.clone(), b"keep");
+    let rev = match store.put(rec, None).await.unwrap() {
+        PutResult::Committed(rev) => rev,
+        PutResult::Conflict(_) => panic!("unexpected conflict on create"),
+    };
+    let wrong = Revision::initial(b"a-revision-that-was-never-current");
+    assert_ne!(wrong, rev);
+    match store.delete(&key, Some(wrong)).await.unwrap() {
+        DeleteResult::Conflict(c) => {
+            assert_eq!(c.key, key);
+            assert_eq!(c.current.revision, rev);
+        }
+        DeleteResult::Deleted => panic!("stale conditional delete must conflict"),
+    }
+    // The record survived the rejected delete.
+    assert_eq!(store.get(&key).await.unwrap().unwrap().revision, rev);
+}
+
+/// (d) A conditional `delete` with the matching expected revision removes it.
+async fn delete_matching_expected_removes<S: Store>(store: &S) {
+    let key = RecordKey::new("ns", "del", "matching");
+    let rec = sample(key.clone(), b"gone");
+    let rev = match store.put(rec, None).await.unwrap() {
+        PutResult::Committed(rev) => rev,
+        PutResult::Conflict(_) => panic!("unexpected conflict on create"),
+    };
+    assert_eq!(
+        store.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    assert_eq!(store.get(&key).await.unwrap(), None);
+}
+
+/// Distinct keys that mapped to the *same* physical path under the old lossy
+/// `_`-collapse (`.` and `/` both became `_`) must now be independent records:
+/// no cross-key overwrite, no spurious OCC conflict, and `list()` must return
+/// each original key verbatim (encode/decode round-trip).
+async fn special_char_keys_dont_collide<S: Store>(store: &S) {
+    let dotted = RecordKey::new("ns", "col", "v1.0");
+    let under = RecordKey::new("ns", "col", "v1_0");
+    let slashy = RecordKey::new("a/b", "c.d", "e/f");
+
+    // Creating all three with `expected = None` must each Commit — under the
+    // old collision, `under` would see `dotted` already present and Conflict.
+    for (k, payload) in [
+        (&dotted, b"dotted".as_slice()),
+        (&under, b"under".as_slice()),
+        (&slashy, b"slashy".as_slice()),
+    ] {
+        match store.put(sample(k.clone(), payload), None).await.unwrap() {
+            PutResult::Committed(_) => {}
+            PutResult::Conflict(_) => panic!("distinct key {k:?} collided onto an existing record"),
+        }
+    }
+
+    // Each retrievable independently with its own body — no clobber.
+    for (k, payload) in [
+        (&dotted, b"dotted".as_slice()),
+        (&under, b"under".as_slice()),
+        (&slashy, b"slashy".as_slice()),
+    ] {
+        let got = store.get(k).await.unwrap().expect("record present");
+        assert_eq!(got.body.bytes(), payload, "wrong body for {k:?}");
+    }
+
+    // `list()` round-trips the exact keys (decode is the inverse of encode).
+    let keys = store.list(&KeyPrefix::default()).await.unwrap();
+    for k in [&dotted, &under, &slashy] {
+        assert!(keys.contains(k), "list() missing {k:?}; got {keys:?}");
+    }
 }
 
 async fn get_absent_returns_none<S: Store>(store: &S) {

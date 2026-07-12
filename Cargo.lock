@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-domain",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-domain"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "serde",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-embed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-graph"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-store-fs",
@@ -2037,6 +2037,7 @@ dependencies = [
  "tree-sitter-c",
  "tree-sitter-c-sharp",
  "tree-sitter-cpp",
+ "tree-sitter-elixir",
  "tree-sitter-go",
  "tree-sitter-java",
  "tree-sitter-javascript",
@@ -2053,8 +2054,9 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-graph-sqlite"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "gonzalo-core",
  "gonzalo-graph",
  "rusqlite",
  "serde_json",
@@ -2063,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-knowledge"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2077,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "gonzalo-graph",
@@ -2092,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-parse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-graph",
  "serde",
@@ -2103,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-core",
  "prost",
@@ -2115,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2154,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2166,11 +2168,12 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "git2",
  "gonzalo-core",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2178,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-s3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2190,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-store-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2207,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -2221,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-asana"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2235,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gonzalo-domain",
  "gonzalo-ticket",
@@ -2247,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-github"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2261,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-gitlab"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2275,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-jira"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2289,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-ticket-linear"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-domain",
@@ -2303,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "gonzalo-vector"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
@@ -5006,6 +5009,16 @@ name = "tree-sitter-cpp"
 version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df2196ea9d47b4ab4a31b9297eaa5a5d19a0b121dceb9f118f6790ad0ab94743"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-elixir"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66dd064a762ed95bfc29857fa3cb7403bb1e5cb88112de0f6341b7e47284ba40"
 dependencies = [
  "cc",
  "tree-sitter-language",

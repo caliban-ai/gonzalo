@@ -10,7 +10,9 @@
 use crate::mapping::{GlIssue, issue_to_ticket};
 use async_trait::async_trait;
 use gonzalo_domain::{StateCategory, Ticket};
-use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
+use gonzalo_ticket::{
+    Capabilities, Cursor, Page, Result, SourceError, StateMapping, StateSignal, TicketSource,
+};
 
 const DEFAULT_BASE: &str = "https://gitlab.com";
 
@@ -142,12 +144,26 @@ impl TicketSource for GitLabSource {
 
     async fn set_state(&self, uid: &str, target: StateCategory) -> Result<()> {
         // GitLab issue state is binary; map terminal categories to `close`,
-        // everything else to `reopen`. (Scoped-label workflow writes are a
-        // future addition.)
-        let event = match target {
-            StateCategory::Done | StateCategory::Canceled => "close",
-            _ => "reopen",
-        };
+        // everything else to `reopen`.
+        let terminal = matches!(target, StateCategory::Done | StateCategory::Canceled);
+        // When a scoped-label mapping drives the read path, the category comes
+        // from the `workflow::` label. Only a terminal move is expressible via
+        // the intrinsic `close` event; a non-terminal move would toggle the
+        // intrinsic state without touching the label, so the read path would
+        // still report the label's category. Reject it rather than reporting a
+        // false success (#143). (Scoped-label workflow write-back is out of
+        // scope here.)
+        if !terminal
+            && matches!(
+                self.mapping.as_ref().map(|m| &m.signal),
+                Some(StateSignal::ScopedLabel { .. })
+            )
+        {
+            return Err(SourceError::Unsupported(
+                "non-terminal set_state under a scoped-label mapping (workflow label write-back not implemented)",
+            ));
+        }
+        let event = if terminal { "close" } else { "reopen" };
         let url = self.issues_url(&[&issue_iid(uid)?.to_string()])?;
         self.auth(
             self.client

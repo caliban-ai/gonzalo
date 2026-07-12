@@ -142,6 +142,10 @@ enum TicketCommands {
         /// Root directory of the fs store.
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Connection name the ticket was synced under. Required to find records
+        /// synced from a board, whose keys are scoped by connection (#159).
+        #[arg(long)]
+        connection: Option<String>,
         /// Ticket uid (owner/repo#number).
         uid: String,
     },
@@ -207,7 +211,11 @@ async fn main() -> Result<()> {
             id,
         } => match get(&root, &namespace, &collection, &id).await? {
             Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
-            None => println!("not found"),
+            // Automation-driven CLI: an absent record is an error, not a success.
+            // Report to stderr (stdout stays empty for clean piping) and let main
+            // map the `Err` to a non-zero exit so callers can tell absent apart
+            // from present.
+            None => anyhow::bail!("record not found: {namespace}/{collection}/{id}"),
         },
 
         Commands::Status { root } => {
@@ -248,7 +256,9 @@ async fn main() -> Result<()> {
                     debounce: Duration::from_millis(debounce_ms),
                     full_reconcile: Duration::from_secs(reconcile_secs),
                 };
-                watch(&root, &src, &repo, &view, config).await?;
+                // Thread `--gc` into the watch loop so each reconcile sweeps when
+                // requested, rather than silently dropping the flag (#157).
+                watch(&root, &src, &repo, &view, config, gc).await?;
                 return Ok(());
             }
             let (summary, swept) = index_with_gc(&root, &src, &repo, &view, gc).await?;
@@ -313,14 +323,24 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            TicketCommands::Get { root, uid } => {
+            TicketCommands::Get {
+                root,
+                connection,
+                uid,
+            } => {
                 // Phase 1: github-projects is the only provider, so every ticket
                 // record lives under collection "github" (see gonzalo_ticket::record_key).
                 // `ticket list` (above) filters only the "tickets" namespace, so it
-                // spans all providers; `get` needs the exact collection.
-                match get(&root, "tickets", "github", &uid).await? {
+                // spans all providers; `get` needs the exact collection + id.
+                // Board records key their id as "<connection>/<uid>" (#159), so
+                // pass --connection to reconstruct the exact id; without it we look
+                // up the bare uid (plain/unscoped records).
+                let id = gonzalo_ticket::scoped_uid(&uid, connection.as_deref());
+                match get(&root, "tickets", "github", &id).await? {
                     Some(record) => println!("{}", serde_json::to_string_pretty(&record)?),
-                    None => println!("not found"),
+                    // Absent ticket → stderr message + non-zero exit (stdout empty)
+                    // so automation can distinguish missing from present.
+                    None => anyhow::bail!("ticket not found: {uid}"),
                 }
             }
             TicketCommands::Move {

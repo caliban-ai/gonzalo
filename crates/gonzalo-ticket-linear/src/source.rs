@@ -97,6 +97,38 @@ struct IssueData {
     issue: Option<LinearIssue>,
 }
 
+/// The `{ success }` payload every Linear mutation returns.
+#[derive(Debug, Deserialize)]
+struct SuccessFlag {
+    success: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueUpdateResp {
+    #[serde(rename = "issueUpdate")]
+    issue_update: SuccessFlag,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommentCreateResp {
+    #[serde(rename = "commentCreate")]
+    comment_create: SuccessFlag,
+}
+
+/// Linear returns HTTP 200 with `success: false` (and no `errors` array) for
+/// writes it silently declines — an invalid `stateId`, insufficient
+/// permissions, etc. Turn that into an error so a failed write never looks like
+/// a successful one.
+fn check_success(success: bool, op: &str) -> Result<()> {
+    if success {
+        Ok(())
+    } else {
+        Err(SourceError::Backend(format!(
+            "linear {op} reported success: false"
+        )))
+    }
+}
+
 /// Imports issues from a Linear workspace.
 pub struct LinearSource {
     client: reqwest::Client,
@@ -229,18 +261,18 @@ impl TicketSource for LinearSource {
             })?;
 
         let mutation = "mutation($id: String!, $sid: String!) { issueUpdate(id: $id, input: { stateId: $sid }) { success } }";
-        let _: serde_json::Value = self
+        let resp: IssueUpdateResp = self
             .query(mutation, serde_json::json!({ "id": uid, "sid": state.id }))
             .await?;
-        Ok(())
+        check_success(resp.issue_update.success, "issueUpdate")
     }
 
     async fn comment(&self, uid: &str, body: &str) -> Result<()> {
         let mutation = "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }";
-        let _: serde_json::Value = self
+        let resp: CommentCreateResp = self
             .query(mutation, serde_json::json!({ "id": uid, "body": body }))
             .await?;
-        Ok(())
+        check_success(resp.comment_create.success, "commentCreate")
     }
 }
 
@@ -267,5 +299,37 @@ mod tests {
             serde_json::from_str(r#"{"errors":[{"message":"bad"}]}"#).unwrap();
         assert!(resp.data.is_none());
         assert_eq!(resp.errors[0].message, "bad");
+    }
+
+    #[test]
+    fn issue_update_success_false_is_deserialized() {
+        // Linear returns HTTP 200 with success:false and no `errors` array.
+        let resp: GqlResponse<IssueUpdateResp> =
+            serde_json::from_str(r#"{"data":{"issueUpdate":{"success":false}}}"#).unwrap();
+        assert!(!resp.data.unwrap().issue_update.success);
+    }
+
+    #[test]
+    fn comment_create_success_is_deserialized() {
+        let resp: GqlResponse<CommentCreateResp> =
+            serde_json::from_str(r#"{"data":{"commentCreate":{"success":true}}}"#).unwrap();
+        assert!(resp.data.unwrap().comment_create.success);
+    }
+
+    #[test]
+    fn check_success_maps_false_to_backend_error() {
+        let err = check_success(false, "issueUpdate").unwrap_err();
+        match err {
+            SourceError::Backend(msg) => {
+                assert!(msg.contains("issueUpdate"), "message was: {msg}");
+                assert!(msg.contains("success: false"), "message was: {msg}");
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_success_passes_true() {
+        assert!(check_success(true, "commentCreate").is_ok());
     }
 }

@@ -86,7 +86,13 @@ async fn respawns_and_recovers_after_a_worker_crash() {
 
 #[tokio::test]
 async fn times_out_a_hung_worker() {
-    let p = ParserPool::new(worker_bin(), 1, Duration::from_millis(300))
+    // The timeout is a liveness deadline (catch a worker that never responds),
+    // NOT a latency SLA. A hung worker never returns, so a generous budget still
+    // detects it; a tight budget (was 300ms) instead false-times-out the healthy
+    // recovery parse below when the machine is under heavy build load, which is
+    // the flake this guards against. 5s is comfortably above a loaded
+    // spawn+parse yet still bounded.
+    let p = ParserPool::new(worker_bin(), 1, Duration::from_secs(5))
         .with_worker_env(vec![("GONZALO_PARSE_HANG_TOKEN".into(), "__HANG__".into())]);
     let err = p.parse(Language::Rust, "__HANG__").await.unwrap_err();
     assert!(matches!(err, ParseError::Timeout(_)), "got {err:?}");

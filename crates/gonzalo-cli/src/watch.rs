@@ -14,7 +14,7 @@
 //! like the daemon/worker entrypoints. The logic worth testing — debounce
 //! coalescing — lives in [`Debouncer`](crate::Debouncer), which is covered.
 
-use crate::{Debouncer, index};
+use crate::{Debouncer, index_with_gc};
 use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
 use std::path::Path;
@@ -43,18 +43,27 @@ impl Default for WatchConfig {
 /// Ctrl-C. Runs one index up front, then re-indexes on a debounced burst of
 /// filesystem changes and on a periodic full-reconcile tick. Long-running:
 /// returns `Ok(())` on graceful shutdown.
+///
+/// When `gc` is set, every index (the initial prime, each debounced re-index,
+/// and each periodic reconcile) sweeps orphaned slices across all live views —
+/// so `--gc` is honored under `--watch` rather than silently dropped (#157).
 pub async fn watch(
     root: &Path,
     src: &Path,
     repo: &str,
     view: &str,
     config: WatchConfig,
+    gc: bool,
 ) -> Result<()> {
     // Prime the view before watching, so a fresh run is immediately queryable.
-    let summary = index(root, src, repo, view).await?;
+    let (summary, swept) = index_with_gc(root, src, repo, view, gc).await?;
     eprintln!(
-        "gonzalo watch: initial index ({} files, {} added, {} modified, {} deleted)",
-        summary.files, summary.added, summary.modified, summary.deleted
+        "gonzalo watch: initial index ({} files, {} added, {} modified, {} deleted{})",
+        summary.files,
+        summary.added,
+        summary.modified,
+        summary.deleted,
+        gc_note(&swept),
     );
 
     // Bridge notify's callback thread to the async loop over an unbounded
@@ -90,12 +99,12 @@ pub async fn watch(
             _ = debounce_tick.tick() => {
                 if debouncer.is_due(Instant::now()) {
                     debouncer.clear();
-                    reindex(root, src, repo, view, "incremental").await;
+                    reindex(root, src, repo, view, gc, "incremental").await;
                 }
             }
             _ = reconcile_tick.tick() => {
                 debouncer.clear(); // a full pass subsumes any pending change
-                reindex(root, src, repo, view, "full reconcile").await;
+                reindex(root, src, repo, view, gc, "full reconcile").await;
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("gonzalo watch: shutting down");
@@ -106,17 +115,29 @@ pub async fn watch(
     Ok(())
 }
 
-/// Run one re-index, logging the outcome. A failure is logged, not fatal — the
-/// watcher keeps running so a transient error (e.g. a half-written file) is
-/// corrected on the next event or reconcile.
-async fn reindex(root: &Path, src: &Path, repo: &str, view: &str, reason: &str) {
-    match index(root, src, repo, view).await {
-        Ok(s) => eprintln!(
-            "gonzalo watch: re-indexed ({reason}): {} added, {} modified, {} deleted",
-            s.added, s.modified, s.deleted
+/// Run one re-index, logging the outcome. When `gc` is set the run also sweeps
+/// orphaned slices. A failure is logged, not fatal — the watcher keeps running
+/// so a transient error (e.g. a half-written file) is corrected on the next
+/// event or reconcile.
+async fn reindex(root: &Path, src: &Path, repo: &str, view: &str, gc: bool, reason: &str) {
+    match index_with_gc(root, src, repo, view, gc).await {
+        Ok((s, swept)) => eprintln!(
+            "gonzalo watch: re-indexed ({reason}): {} added, {} modified, {} deleted{}",
+            s.added,
+            s.modified,
+            s.deleted,
+            gc_note(&swept),
         ),
         Err(e) => eprintln!("gonzalo watch: re-index failed ({reason}): {e:#}"),
     }
+}
+
+/// Human-readable `", gc freed N"` suffix when a sweep ran, else empty.
+fn gc_note(swept: &Option<crate::GcSummary>) -> String {
+    swept
+        .as_ref()
+        .map(|g| format!(", gc freed {}", g.freed))
+        .unwrap_or_default()
 }
 
 /// Whether a notify event represents a content change worth re-indexing
@@ -127,4 +148,46 @@ fn is_content_change(event: &notify::Event) -> bool {
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{gc, index};
+    use tempfile::TempDir;
+
+    /// #157: the `gc` flag threaded into the watch loop is honored — a reindex
+    /// with `gc = true` sweeps orphaned slices (the OS-event/timer glue around
+    /// this call is untestable, so we drive `reindex` directly).
+    #[tokio::test]
+    async fn reindex_sweeps_orphans_when_gc_is_set() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.rs"), "fn a() {}").unwrap();
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        // Change the file so the pre-edit slice is orphaned, then reindex under
+        // the watch loop's helper with gc enabled.
+        std::fs::write(src.path().join("a.rs"), "fn a() { b(); }").unwrap();
+        reindex(root.path(), src.path(), "r", "main", true, "test").await;
+
+        // The orphan was already swept during the reindex, so an explicit gc
+        // finds nothing left to free.
+        assert_eq!(gc(root.path()).await.unwrap().freed, 0);
+    }
+
+    /// Counterpart: without the flag, the reindex leaves the orphan behind.
+    #[tokio::test]
+    async fn reindex_leaves_orphans_when_gc_is_unset() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.rs"), "fn a() {}").unwrap();
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        std::fs::write(src.path().join("a.rs"), "fn a() { b(); }").unwrap();
+        reindex(root.path(), src.path(), "r", "main", false, "test").await;
+
+        // The orphan survived: an explicit gc still has one to free.
+        assert_eq!(gc(root.path()).await.unwrap().freed, 1);
+    }
 }

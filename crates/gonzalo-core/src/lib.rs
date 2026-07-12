@@ -22,13 +22,13 @@ pub mod error;
 pub use error::{CoreError, Result};
 
 pub mod store;
-pub use store::{BlobStore, Conflict, PutResult, Store};
+pub use store::{BlobStore, Conflict, DeleteResult, PutResult, Store};
 
 pub mod merge;
 pub use merge::{MergeOutcome, merge};
 
 pub mod paths;
-pub use paths::{object_key, record_components, segment};
+pub use paths::{decode_segment, object_key, record_components, segment};
 
 pub mod ancestry;
 pub use ancestry::AncestryStore;

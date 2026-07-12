@@ -4,11 +4,14 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    Body, ContentHash, CoreError, Identity, KeyPrefix, MergeOutcome, Meta, PutResult, Record,
-    RecordKey, Result, Revision, merge, record_components, store::Conflict,
+    Body, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, MergeOutcome, Meta, PutResult,
+    Record, RecordKey, Result, Revision, decode_segment, merge, record_components, store::Conflict,
 };
+use rustix::fs::{FlockOperation, flock};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 mod diff;
@@ -100,6 +103,40 @@ impl GitStore {
         Ok(())
     }
 
+    /// Commit the removal of `rel` (a `git rm` equivalent): stage the deletion in
+    /// the index, write the tree, and record a commit. Mirrors `commit_file` but
+    /// removes the path from the index instead of adding it.
+    fn commit_removal(&self, rel: &Path, message: &str) -> Result<()> {
+        let repo =
+            git2::Repository::open(&self.root).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let mut index = repo
+            .index()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        index
+            .remove_path(rel)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        index
+            .write()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let sig = git2::Signature::now("gonzalo", "gonzalo@localhost")
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     /// Pull `branch` from `remote` (typically "origin"). A fast-forward advances
     /// the branch; a divergence is reconciled by a content-aware 3-way merge
     /// (gonzalo `merge()` per record, ADR 0017), with unresolved records kept
@@ -122,6 +159,27 @@ impl GitStore {
 
 fn be<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Backend(e.to_string())
+}
+
+/// Acquire the repo-level exclusive lock guarding `put`'s OCC critical section.
+///
+/// Unlike `FsStore`, whose per-record lock suffices, `GitStore::put` mutates the
+/// *shared* on-disk index and HEAD (via `commit_file`), so serialization must be
+/// repo-wide: two puts on different keys still race on the same index+HEAD. The
+/// lock is a `<root>/.gonzalo-git.lock` file held exclusively via `flock`; it is
+/// released when the returned handle drops, which covers every `put` exit path
+/// (the `Conflict`/`NotFound` early returns and any error). Blocking by design —
+/// call only from the `spawn_blocking` section.
+fn lock_repo(root: &Path) -> Result<std::fs::File> {
+    let lock_path = root.join(".gonzalo-git.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(be)?;
+    flock(&lock, FlockOperation::LockExclusive).map_err(be)?;
+    Ok(lock)
 }
 
 fn git_pull(root: &Path, remote: &str, branch: &str) -> Result<PullReport> {
@@ -338,9 +396,9 @@ fn key_from_path(path: &Path) -> Option<RecordKey> {
     }
     let id = comps[2].strip_suffix(".json")?;
     Some(RecordKey::new(
-        comps[0].clone(),
-        comps[1].clone(),
-        id.to_string(),
+        decode_segment(&comps[0]),
+        decode_segment(&comps[1]),
+        decode_segment(id),
     ))
 }
 
@@ -401,13 +459,38 @@ fn merged_record(key: &RecordKey, local: &Record, remote: &Record, body: Body) -
 }
 
 fn git_push(root: &Path, remote: &str, branch: &str) -> Result<()> {
-    let repo = git2::Repository::open(root).map_err(|e| CoreError::Backend(e.to_string()))?;
-    let mut rem = repo
-        .find_remote(remote)
-        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    let repo = git2::Repository::open(root).map_err(be)?;
+    let mut rem = repo.find_remote(remote).map_err(be)?;
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    rem.push(&[refspec.as_str()], None)
-        .map_err(|e| CoreError::Backend(e.to_string()))?;
+
+    // libgit2's `push` returns Ok even when the remote refuses a ref update
+    // (e.g. non-fast-forward): the per-ref verdict arrives ONLY through the
+    // `push_update_reference` callback, whose `status` is `Some(msg)` on
+    // rejection and `None` on success. Capture every rejection so we can fail
+    // the push instead of silently reporting success.
+    let rejected: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let mut callbacks = git2::RemoteCallbacks::new();
+    {
+        let rejected = Rc::clone(&rejected);
+        callbacks.push_update_reference(move |refname, status| {
+            if let Some(msg) = status {
+                rejected.borrow_mut().push(format!("{refname}: {msg}"));
+            }
+            Ok(())
+        });
+    }
+    let mut opts = git2::PushOptions::new();
+    opts.remote_callbacks(callbacks);
+    rem.push(&[refspec.as_str()], Some(&mut opts)).map_err(be)?;
+    drop(opts); // release the callback's borrow of `rejected` before we read it
+
+    let rejected = rejected.borrow();
+    if !rejected.is_empty() {
+        return Err(CoreError::Backend(format!(
+            "push rejected by remote '{remote}': {}",
+            rejected.join(", ")
+        )));
+    }
     Ok(())
 }
 
@@ -439,6 +522,9 @@ impl gonzalo_core::Store for GitStore {
         let root = self.root.clone();
         run_blocking(move || {
             let store = GitStore { root: root.clone() };
+            // Serialize the read→check→write→commit critical section over the
+            // shared index+HEAD; the lock releases when `_lock` drops (all paths).
+            let _lock = lock_repo(&root)?;
             let current = store.read(&record.key)?;
             let current_rev = current.as_ref().map(|r| r.revision.clone());
             if current_rev != expected {
@@ -476,6 +562,43 @@ impl gonzalo_core::Store for GitStore {
         })
         .await
     }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        let root = self.root.clone();
+        let key = key.clone();
+        run_blocking(move || {
+            let store = GitStore { root: root.clone() };
+            // Serialize the read→check→remove→commit critical section over the
+            // shared index+HEAD, exactly as `put`; the lock releases when `_lock`
+            // drops (all paths).
+            let _lock = lock_repo(&root)?;
+            let current = store.read(&key)?;
+            match (current, &expected) {
+                // Absent: nothing to remove — idempotent `Deleted`.
+                (None, _) => Ok(DeleteResult::Deleted),
+                // Unconditional, or the expected revision matches: remove + commit.
+                (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
+                    let (ns, col, file) = record_components(&key);
+                    let rel = Path::new(&ns).join(&col).join(&file);
+                    let abs = root.join(&rel);
+                    match std::fs::remove_file(&abs) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(CoreError::Backend(e.to_string())),
+                    }
+                    store.commit_removal(&rel, &format!("delete {key}"))?;
+                    Ok(DeleteResult::Deleted)
+                }
+                // Present but the expected revision differs: surface a Conflict.
+                (Some(cur), _) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+                    key: key.clone(),
+                    expected,
+                    current: cur,
+                }))),
+            }
+        })
+        .await
+    }
 }
 
 fn collect_keys(root: &Path, prefix: &KeyPrefix, out: &mut Vec<RecordKey>) -> Result<()> {
@@ -500,7 +623,13 @@ fn collect_keys(root: &Path, prefix: &KeyPrefix, out: &mut Vec<RecordKey>) -> Re
                 let f = f.map_err(|e| CoreError::Backend(e.to_string()))?;
                 let fname = f.file_name().to_string_lossy().to_string();
                 if let Some(id) = fname.strip_suffix(".json") {
-                    let key = RecordKey::new(ns_name.clone(), col_name.clone(), id.to_string());
+                    // Path components are `segment`-encoded; decode to recover
+                    // the original key so `list()` round-trips.
+                    let key = RecordKey::new(
+                        decode_segment(&ns_name),
+                        decode_segment(&col_name),
+                        decode_segment(id),
+                    );
                     if prefix.matches(&key) {
                         out.push(key);
                     }

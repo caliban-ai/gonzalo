@@ -16,10 +16,20 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
+    // Guard against a zero norm (undefined direction) and any non-finite input
+    // (a NaN/inf component propagates into `dot`/`norm_*`). A non-finite result
+    // would otherwise scatter arbitrarily during ranking, so score it 0.0 —
+    // ranked last, never NaN.
+    if norm_a == 0.0
+        || norm_b == 0.0
+        || !dot.is_finite()
+        || !norm_a.is_finite()
+        || !norm_b.is_finite()
+    {
         0.0
     } else {
-        dot / (norm_a * norm_b)
+        let score = dot / (norm_a * norm_b);
+        if score.is_finite() { score } else { 0.0 }
     }
 }
 
@@ -93,12 +103,10 @@ impl VectorIndex for MemoryVectorIndex {
             .collect();
 
         // Sort descending by score; break ties by RecordKey order (ascending).
-        matches.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.key.cmp(&b.key))
-        });
+        // Use `f32::total_cmp` so ordering is total and deterministic even if a
+        // non-finite score (NaN/inf) slips through — `partial_cmp` returns
+        // `None` for NaN and would scatter such entries arbitrarily.
+        matches.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
 
         matches.truncate(k);
         Ok(matches)
@@ -308,6 +316,86 @@ mod tests {
         let idx = MemoryVectorIndex::new();
         let key = RecordKey::new("ns", "col", "ghost");
         assert!(idx.remove(&key).await.is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // #154: non-finite components score 0.0, never NaN
+    // ------------------------------------------------------------------
+    #[test]
+    fn cosine_nan_component_scores_zero() {
+        // A NaN in either operand must score 0.0, not NaN.
+        assert_eq!(cosine(&[f32::NAN, 1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 0.0], &[f32::NAN, 1.0]), 0.0);
+        // An infinity likewise scores 0.0 rather than a non-finite value.
+        assert_eq!(cosine(&[f32::INFINITY, 1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 0.0], &[f32::NEG_INFINITY, 1.0]), 0.0);
+        // The pre-existing zero-norm guard still holds.
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        // A genuine match still scores ~1.0.
+        assert!((cosine(&[3.0, 4.0], &[3.0, 4.0]) - 1.0).abs() < 1e-6);
+    }
+
+    // ------------------------------------------------------------------
+    // #154: a NaN-bearing vector never outranks a genuinely similar one
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn nan_vector_never_occupies_top_k_ahead_of_match() {
+        let idx = MemoryVectorIndex::new();
+
+        // A vector aligned with the query (should rank first) ...
+        idx.upsert(RecordKey::new("ns", "col", "good"), vec![1.0, 0.0])
+            .await
+            .unwrap();
+        // ... and a poisoned vector with a NaN component.
+        idx.upsert(RecordKey::new("ns", "col", "poison"), vec![f32::NAN, 1.0])
+            .await
+            .unwrap();
+
+        let results = idx
+            .query(&[1.0, 0.0], 2, &KeyPrefix::default())
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // The genuine match ranks first; the poisoned vector scores 0.0 last.
+        assert_eq!(results[0].key.id, "good");
+        assert_eq!(results[1].key.id, "poison");
+        assert!(results.iter().all(|m| m.score.is_finite()));
+        assert_eq!(results[1].score, 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // #154: ranking is deterministic across repeated queries
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn ranking_is_deterministic_with_poisoned_vectors() {
+        let idx = MemoryVectorIndex::new();
+        idx.upsert(RecordKey::new("ns", "col", "a"), vec![1.0, 0.0])
+            .await
+            .unwrap();
+        idx.upsert(RecordKey::new("ns", "col", "b"), vec![f32::NAN, 1.0])
+            .await
+            .unwrap();
+        idx.upsert(RecordKey::new("ns", "col", "c"), vec![f32::INFINITY, 0.0])
+            .await
+            .unwrap();
+        idx.upsert(RecordKey::new("ns", "col", "d"), vec![0.9, 0.1])
+            .await
+            .unwrap();
+
+        let first = idx
+            .query(&[1.0, 0.0], 4, &KeyPrefix::default())
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            let again = idx
+                .query(&[1.0, 0.0], 4, &KeyPrefix::default())
+                .await
+                .unwrap();
+            let ids_first: Vec<_> = first.iter().map(|m| m.key.id.clone()).collect();
+            let ids_again: Vec<_> = again.iter().map(|m| m.key.id.clone()).collect();
+            assert_eq!(ids_first, ids_again, "ordering must be deterministic");
+        }
     }
 
     // ------------------------------------------------------------------

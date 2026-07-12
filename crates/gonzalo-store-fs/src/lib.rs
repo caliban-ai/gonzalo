@@ -4,12 +4,14 @@ mod layout;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
-    Store, store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
+    Result, Revision, Store, store::Conflict,
 };
 use rustix::fs::{FlockOperation, flock};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncWriteExt;
 
 /// A `Store` backed by JSON files under a root directory.
 pub struct FsStore {
@@ -59,6 +61,17 @@ impl Store for FsStore {
         collect_keys(&self.root, prefix, &mut out).await?;
         Ok(out)
     }
+
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        // Mirror `put`'s critical section: hold the per-record flock so the
+        // read→check→remove is atomic against a concurrent writer. Blocking, so
+        // run it on a blocking thread rather than stalling the async runtime.
+        let root = self.root.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || delete_locked(&root, &key, expected))
+            .await
+            .map_err(|e| CoreError::Backend(format!("delete task panicked: {e}")))?
+    }
 }
 
 /// Process-unique nonce for blob temp files, so concurrent writers never share
@@ -90,12 +103,32 @@ impl BlobStore for FsStore {
         // and the unique temp keeps two racing writers from clobbering one temp.
         let nonce = BLOB_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
-        tokio::fs::write(&tmp, content)
+        // Durable publish: write the temp file and `sync_all` it so its bytes
+        // reach disk BEFORE the rename, then fsync the parent directory AFTER
+        // the rename so the new directory entry survives a crash too. `rename`
+        // is atomic against concurrent readers but not against power loss — on
+        // ext4 delayed allocation a crash just after a reported success can
+        // otherwise leave a zero-length or truncated blob.
+        let mut f = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| CoreError::Backend(e.to_string()))?;
+        f.write_all(content)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        f.sync_all()
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        drop(f);
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| CoreError::Backend(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || fsync_dir(&parent))
+                .await
+                .map_err(|e| CoreError::Backend(format!("fsync task panicked: {e}")))?
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+        }
         Ok(hash)
     }
 
@@ -200,11 +233,100 @@ fn put_locked(root: &Path, record: Record, expected: Option<Revision>) -> Result
     }
 
     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| CoreError::Serde(e.to_string()))?;
-    // Atomic write: temp file + rename.
+    // Durable atomic write: write the temp file and `sync_all` it so its bytes
+    // reach disk BEFORE the rename, then fsync the parent directory AFTER the
+    // rename so the new directory entry survives a crash too. `rename` is atomic
+    // against concurrent readers but not against power loss — on ext4 delayed
+    // allocation a crash just after a reported Committed can otherwise leave a
+    // zero-length or truncated record.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| CoreError::Backend(e.to_string()))?;
+    let mut f = std::fs::File::create(&tmp).map_err(|e| CoreError::Backend(e.to_string()))?;
+    f.write_all(&bytes)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    f.sync_all()
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    drop(f);
     std::fs::rename(&tmp, &path).map_err(|e| CoreError::Backend(e.to_string()))?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+    }
     Ok(PutResult::Committed(record.revision))
+}
+
+/// Perform the conditional `delete` under the same per-record advisory lock
+/// `put_locked` uses, so the read→check→remove is atomic against a concurrent
+/// writer. Blocking by design; call from `spawn_blocking`.
+///
+/// `expected == None` removes the record if present (idempotent no-op if
+/// absent). `expected == Some(rev)` removes only if the current revision matches;
+/// a mismatch is a `Conflict`, and an already-absent key is an idempotent
+/// `Deleted` (the revision is already gone — nothing to conflict on). We leave
+/// the sibling `.lock` file in place (it is reused by the next writer).
+fn delete_locked(root: &Path, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+    let path = layout::record_path(root, key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+    }
+
+    // Acquire the exclusive lock; it lives until `lock` drops at function end.
+    let lock_path = path.with_extension("json.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    flock(&lock, FlockOperation::LockExclusive).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+    // Critical section: revision check and removal are now serialized per record.
+    let current = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<Record>(&bytes)
+                .map_err(|e| CoreError::Serde(e.to_string()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(CoreError::Backend(e.to_string())),
+    };
+
+    match (current, &expected) {
+        // Absent: nothing to remove. Idempotent `Deleted` regardless of
+        // `expected` — the revision the caller named is already gone.
+        (None, _) => Ok(DeleteResult::Deleted),
+        // Unconditional, or the expected revision matches: remove the record.
+        (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // A concurrent remover won under the lock hand-off — still absent.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(CoreError::Backend(e.to_string())),
+            }
+            if let Some(parent) = path.parent() {
+                fsync_dir(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
+            }
+            Ok(DeleteResult::Deleted)
+        }
+        // Present but the expected revision differs: surface a Conflict.
+        (Some(cur), _) => Ok(DeleteResult::Conflict(Box::new(Conflict {
+            key: key.clone(),
+            expected,
+            current: cur,
+        }))),
+    }
+}
+
+/// Best-effort fsync of the directory `path`, making a preceding `rename` into
+/// it durable across a crash. A `rename` is atomic against concurrent readers,
+/// but on power loss the new directory entry can still be lost until the parent
+/// directory's own metadata is flushed. Where a platform rejects fsync on a
+/// directory handle (surfaced as `EINVAL`/`InvalidInput`), treat it as a no-op
+/// rather than a write failure.
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    let dir = std::fs::File::open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Walk `<root>/<ns>/<col>/<id>.json` and collect keys matching `prefix`.
@@ -249,7 +371,13 @@ async fn collect_keys(
             {
                 let fname = f.file_name().to_string_lossy().to_string();
                 if let Some(id) = fname.strip_suffix(".json") {
-                    let key = RecordKey::new(ns_name.clone(), col_name.clone(), id.to_string());
+                    // Directory/file names are `segment`-encoded; decode each
+                    // component back to the original key so `list()` round-trips.
+                    let key = RecordKey::new(
+                        gonzalo_core::decode_segment(&ns_name),
+                        gonzalo_core::decode_segment(&col_name),
+                        gonzalo_core::decode_segment(id),
+                    );
                     if prefix.matches(&key) {
                         out.push(key);
                     }
