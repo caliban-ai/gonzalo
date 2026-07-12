@@ -6,6 +6,49 @@
 **Depends on:** gonzalo #5 — native S3 conditional writes (`If-Match`/`If-None-Match`), **shipped in v0.2.0** (the correctness gate this test exercises)
 **Upstream spec:** `caliban-ai/docs/superpowers/specs/2026-07-03-caliban-k8s-system-design.md` §5, "High availability summary", "Dev/test"
 
+## Implementation finding (2026-07-12): Garage is unsuitable; backend is RustFS
+
+Building the soak surfaced a **critical finding**: **Garage does not provide atomic
+`If-Match` conditional writes**, so gonzalo's core invariant (concurrent edits are
+never silently lost) **breaks on Garage**. Evidence:
+
+- gonzalo's own S3 conditional-write conformance
+  (`gonzalo-store-s3` `concurrent_updates_with_same_expected_let_exactly_one_win`)
+  **fails against Garage**: v1.0.1 lets **8/8** concurrent racers commit; v2.1.0
+  lets **3–8** commit (non-deterministic) — the signature of a TOCTOU check-then-set,
+  not an atomic CAS. Expected: exactly **1**.
+- Garage's own [S3-compatibility reference](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/)
+  documents no `If-Match`/`If-None-Match` support for `PutObject`; Garage v2.1.0
+  exposes no consistency/quorum config to change this. It is a fundamental
+  limitation, not a tunable.
+
+**Backend qualification.** The soak is a backend-agnostic conditional-write
+qualifier; running it against candidates gave:
+
+| Backend | Atomic `If-Match` | License | Notes |
+|---|---|---|---|
+| **RustFS** `1.0.0-beta.8` | ✅ deterministic (qualifier 3/3 + full soak) | Apache-2.0 | Rust, MinIO-compatible; **chosen backend** (pre-1.0 beta) |
+| MinIO | ✅ | AGPL | control that proved the harness; **rejected — sustainability** (2025 community gutting) |
+| SeaweedFS | ⚠️ setup-blocked + upstream CAS bugs | Apache-2.0 | S3 auth needs identity config; not pursued |
+| Garage | ❌ non-atomic | AGPL | the finding above |
+| Ceph RGW | not tested | LGPL | heavyweight — against the "modest hardware" goal |
+
+**Decision:** the soak's backend is **RustFS** (`docker-compose.rustfs.yml` +
+`scripts/rustfs-up.sh`) — the only FOSS S3 store that passes, Rust + Apache-2.0,
+drop-in. It is **pre-1.0 (beta)**, so a **Postgres substrate**
+(`gonzalo-store-postgres`, native atomic CAS, aligns with prospero's clustered
+tier) is tracked as the mature long-term HA backend. The Garage setup
+(`docker-compose.garage.yml` + `scripts/garage-up.sh`) is retained only as a
+**reproducer of the finding**.
+
+**Consequence for the k8s epic (#274):** design §5 chose **Garage** as the gonzalo
+HA backend — that choice is **unsound**. Reported back with the recommendation:
+RustFS near-term, a Postgres substrate as the robust foundation.
+
+The Rust harness is backend-agnostic (it reads an S3 endpoint), so nothing in it
+changed across backends. Everywhere below that says "Garage", read "the S3
+backend (RustFS)".
+
 ## Problem
 
 The k8s system design makes an HA claim for the persistence tier:

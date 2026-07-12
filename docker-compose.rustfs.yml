@@ -1,0 +1,41 @@
+# Single-node RustFS (S3-compatible) for the gonzalo HA soak (#52).
+#
+# RustFS is the soak's backend: it provides **atomic** If-Match conditional writes
+# (soak-verified) and is Rust + Apache-2.0 (sustainable). Garage does NOT enforce
+# If-Match atomically (see docs/superpowers/specs/2026-07-11-gonzalo-ha-soak-design.md)
+# and is retained only as a reproducer of that finding.
+#
+# NOTE: RustFS is pre-1.0 (beta) — pinned for reproducibility. A Postgres substrate
+# is tracked as the mature long-term HA backend (k8s epic #274).
+#
+# Brought up on demand by scripts/rustfs-up.sh.
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.8
+    container_name: gonzalo-soak-rustfs
+    restart: "no"
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_CONSOLE_ENABLE: "false"
+    ports:
+      - "127.0.0.1:9010:9000" # S3 API
+    volumes:
+      - rustfs-data:/data
+
+  # One-shot: create the soak bucket over the compose network (works on both
+  # Docker Desktop Mac and Linux CI — no host.docker.internal needed). Exits 0.
+  createbucket:
+    image: minio/mc
+    depends_on:
+      - rustfs
+    entrypoint:
+      - sh
+      - -c
+      - >
+        until mc alias set r http://rustfs:9000 rustfsadmin rustfsadmin >/dev/null 2>&1; do sleep 1; done &&
+        mc mb -p r/soak && echo "gonzalo-soak: bucket ready"
+    restart: "no"
+
+volumes:
+  rustfs-data:

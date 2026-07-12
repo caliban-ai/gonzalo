@@ -2140,6 +2140,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gonzalo-soak"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "gonzalo-core",
+ "gonzalo-store-fs",
+ "gonzalo-store-server",
+ "reqwest",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gonzalo-store-fs"
 version = "0.2.0"
 dependencies = [

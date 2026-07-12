@@ -25,6 +25,7 @@ members = [
     "crates/gonzalo-mcp",
     "crates/gonzalo-parse",
     "crates/gonzalo-cli",
+    "crates/gonzalo-soak",
 ]
 
 # The ANN head-to-head benchmark (hnsw_rs vs usearch, #9/ADR 0014) is excluded

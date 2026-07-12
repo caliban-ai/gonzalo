@@ -1,0 +1,27 @@
+# Single-node Garage (S3-compatible) for the gonzalo HA soak (#52).
+#
+# Not part of the default stack — brought up on demand by scripts/garage-up.sh,
+# which generates garage.toml, applies a layout, and creates the soak bucket+key.
+# Single node is enough: the soak's chaos targets gonzalod replicas, not the
+# object store (Garage's own multi-node durability is out of scope for #52).
+services:
+  garage:
+    image: dxflrs/garage:v2.1.0
+    container_name: gonzalo-soak-garage
+    restart: "no"
+    # Explicit port mappings (not host networking): host networking does not
+    # forward container ports to the host on Docker Desktop for Mac, so the S3
+    # endpoint would be unreachable locally. Port mappings work on both Mac and
+    # Linux CI. Garage binds all interfaces inside the container (see garage.toml).
+    ports:
+      - "127.0.0.1:3900:3900" # S3 API
+      - "127.0.0.1:3903:3903" # admin API
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    command: ["/garage", "server"]
+
+volumes:
+  garage-meta:
+  garage-data:

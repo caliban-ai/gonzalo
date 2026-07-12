@@ -1,0 +1,64 @@
+name: ha-soak
+
+# HA soak (#52): spawn N stateless gonzalod replicas over a shared S3 backend
+# (RustFS) and assert gonzalo's no-lost-update invariant under concurrent load +
+# replica-kill chaos. Kept OUT of the fast `ci` job so a docker/chaos hiccup can't
+# block unrelated PRs; the crate's test also skips-when-unprovisioned, so the
+# normal `cargo test --workspace` stays green without docker.
+#
+# Backend is RustFS (Rust, Apache-2.0), which provides atomic If-Match conditional writes. Garage does
+# NOT (see docs/superpowers/specs/2026-07-11-gonzalo-ha-soak-design.md) and is
+# retained only as a reproducer of that finding.
+on:
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/gonzalo-soak/**"
+      - "crates/gonzalo-store-s3/**"
+      - "crates/gonzalo-server/**"
+      - "docker-compose.rustfs.yml"
+      - "scripts/rustfs-*.sh"
+      - ".github/workflows/ha-soak.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *" # nightly deep soak
+
+concurrency:
+  group: ha-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ha-soak:
+    name: HA soak — gonzalod replicas over RustFS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      # The soak spawns the real gonzalod binary; build it (and the soak) first so
+      # the harness can locate target/debug/gonzalod next to the test executable.
+      - name: Build gonzalod + soak
+        run: |
+          cargo build -p gonzalo-server --bin gonzalod
+          cargo build -p gonzalo-soak --tests
+
+      - name: Start RustFS + export the target
+        run: bash scripts/rustfs-up.sh | sed 's/^export //' >> "$GITHUB_ENV"
+
+      - name: Bounded HA soak gate
+        run: cargo test -p gonzalo-soak --test ha_soak -- --nocapture
+
+      - name: Nightly deep soak
+        if: github.event_name == 'schedule'
+        run: cargo run -p gonzalo-soak -- --rounds 40 --replicas 3 --writers 16
+
+      - name: Tear down RustFS
+        if: always()
+        run: bash scripts/rustfs-down.sh --purge || true
