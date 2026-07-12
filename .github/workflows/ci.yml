@@ -141,3 +141,30 @@ jobs:
       - name: Docs-only change — coverage skipped
         if: needs.check.outputs.code != 'true'
         run: echo "Only docs/markdown/license changed; skipping coverage."
+
+  package-check:
+    name: cargo publish --workspace --dry-run
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # Verifies every publishable crate packages cleanly and that each internal
+      # gonzalo-* dep carries a registry version — the gate that keeps the
+      # tag-triggered publish.yml from failing at upload time. Mirrors caliban's
+      # package-check. publish=false crates (gonzalo-soak) and the excluded
+      # bench are skipped by cargo automatically.
+      - name: Install Rust toolchain
+        if: needs.check.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry & target
+        if: needs.check.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: Verify all crates package cleanly
+        if: needs.check.outputs.code == 'true'
+        run: cargo publish --workspace --dry-run
+      - name: Docs-only change — package-check skipped
+        if: needs.check.outputs.code != 'true'
+        run: echo "Only docs/markdown/license changed; skipping package dry-run."

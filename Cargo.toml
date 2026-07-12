@@ -43,14 +43,14 @@ rust-version = "1.95"
 repository = "https://github.com/caliban-ai/gonzalo"
 
 [workspace.dependencies]
-gonzalo-core   = { path = "crates/gonzalo-core" }
-gonzalo-store-fs = { path = "crates/gonzalo-store-fs" }
-gonzalo-store-git = { path = "crates/gonzalo-store-git" }
+gonzalo-core   = { path = "crates/gonzalo-core", version = "0.3.0" }
+gonzalo-store-fs = { path = "crates/gonzalo-store-fs", version = "0.3.0" }
+gonzalo-store-git = { path = "crates/gonzalo-store-git", version = "0.3.0" }
 git2         = { version = "0.20", default-features = false }
-gonzalo-store-s3 = { path = "crates/gonzalo-store-s3" }
+gonzalo-store-s3 = { path = "crates/gonzalo-store-s3", version = "0.3.0" }
 aws-config   = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3   = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
-gonzalo-proto = { path = "crates/gonzalo-proto" }
+gonzalo-proto = { path = "crates/gonzalo-proto", version = "0.3.0" }
 tonic       = "0.12"
 prost       = "0.13"
 tonic-build = "0.12"
@@ -58,24 +58,24 @@ protoc-bin-vendored = "3"
 axum        = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-gonzalo-server = { path = "crates/gonzalo-server" }
-gonzalo-store-server = { path = "crates/gonzalo-store-server" }
-gonzalo-domain = { path = "crates/gonzalo-domain" }
-gonzalo-vector = { path = "crates/gonzalo-vector" }
-gonzalo-embed = { path = "crates/gonzalo-embed" }
-gonzalo-graph = { path = "crates/gonzalo-graph" }
-gonzalo-graph-sqlite = { path = "crates/gonzalo-graph-sqlite" }
-gonzalo-ticket = { path = "crates/gonzalo-ticket" }
-gonzalo-ticket-github = { path = "crates/gonzalo-ticket-github" }
-gonzalo-ticket-config = { path = "crates/gonzalo-ticket-config" }
-gonzalo-ticket-jira = { path = "crates/gonzalo-ticket-jira" }
-gonzalo-ticket-linear = { path = "crates/gonzalo-ticket-linear" }
-gonzalo-ticket-gitlab = { path = "crates/gonzalo-ticket-gitlab" }
-gonzalo-ticket-asana = { path = "crates/gonzalo-ticket-asana" }
-gonzalo-knowledge = { path = "crates/gonzalo-knowledge" }
-gonzalo-mcp   = { path = "crates/gonzalo-mcp" }
-gonzalo-parse = { path = "crates/gonzalo-parse" }
-gonzalo-cli   = { path = "crates/gonzalo-cli" }
+gonzalo-server = { path = "crates/gonzalo-server", version = "0.3.0" }
+gonzalo-store-server = { path = "crates/gonzalo-store-server", version = "0.3.0" }
+gonzalo-domain = { path = "crates/gonzalo-domain", version = "0.3.0" }
+gonzalo-vector = { path = "crates/gonzalo-vector", version = "0.3.0" }
+gonzalo-embed = { path = "crates/gonzalo-embed", version = "0.3.0" }
+gonzalo-graph = { path = "crates/gonzalo-graph", version = "0.3.0" }
+gonzalo-graph-sqlite = { path = "crates/gonzalo-graph-sqlite", version = "0.3.0" }
+gonzalo-ticket = { path = "crates/gonzalo-ticket", version = "0.3.0" }
+gonzalo-ticket-github = { path = "crates/gonzalo-ticket-github", version = "0.3.0" }
+gonzalo-ticket-config = { path = "crates/gonzalo-ticket-config", version = "0.3.0" }
+gonzalo-ticket-jira = { path = "crates/gonzalo-ticket-jira", version = "0.3.0" }
+gonzalo-ticket-linear = { path = "crates/gonzalo-ticket-linear", version = "0.3.0" }
+gonzalo-ticket-gitlab = { path = "crates/gonzalo-ticket-gitlab", version = "0.3.0" }
+gonzalo-ticket-asana = { path = "crates/gonzalo-ticket-asana", version = "0.3.0" }
+gonzalo-knowledge = { path = "crates/gonzalo-knowledge", version = "0.3.0" }
+gonzalo-mcp   = { path = "crates/gonzalo-mcp", version = "0.3.0" }
+gonzalo-parse = { path = "crates/gonzalo-parse", version = "0.3.0" }
+gonzalo-cli   = { path = "crates/gonzalo-cli", version = "0.3.0" }
 rmcp        = { version = "1.7", features = ["server", "transport-io", "macros"] }
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
