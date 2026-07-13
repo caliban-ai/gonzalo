@@ -17,13 +17,11 @@ tokio         = { workspace = true, features = ["rt", "macros"] }
 tonic         = { workspace = true }
 reqwest       = { workspace = true }
 
-[dev-dependencies]
-gonzalo-server   = { workspace = true }
-gonzalo-store-fs = { workspace = true }
-gonzalo-graph    = { workspace = true }
-gonzalo-core     = { workspace = true, features = ["conformance"] }
-tokio            = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
-tempfile         = { workspace = true }
+# Cross-crate integration tests (client ↔ real gonzalod ↔ store, over HTTP/gRPC)
+# live in the `gonzalo-integration-tests` crate, not here — so this published
+# library carries no dev-dep on the gonzalo-server binary or gonzalo-graph, and
+# its crates.io publish order tracks only its runtime deps (gonzalo#190). The
+# inline unit tests in src/lib.rs need only the normal deps above.
 
 [lints]
 workspace = true
