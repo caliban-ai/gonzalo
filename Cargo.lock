@@ -2064,6 +2064,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gonzalo-integration-tests"
+version = "0.3.0"
+dependencies = [
+ "gonzalo-core",
+ "gonzalo-graph",
+ "gonzalo-server",
+ "gonzalo-store-fs",
+ "gonzalo-store-server",
+ "reqwest",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gonzalo-knowledge"
 version = "0.3.0"
 dependencies = [
@@ -2197,13 +2211,9 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
- "gonzalo-graph",
  "gonzalo-proto",
- "gonzalo-server",
- "gonzalo-store-fs",
  "reqwest",
  "serde_json",
- "tempfile",
  "tokio",
  "tonic",
 ]
