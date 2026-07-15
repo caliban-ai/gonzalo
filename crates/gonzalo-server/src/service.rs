@@ -5,8 +5,8 @@
 //! content-addressed slices on the fly.
 
 use gonzalo_core::{
-    BlobStore, CoreError, DeleteResult, KeyPrefix, Manifest, PutResult, Record, RecordKey, Result,
-    Revision, Store,
+    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, Manifest, PutResult, Record,
+    RecordKey, Result, Revision, Store,
 };
 use gonzalo_graph::{GraphStore, Located, Reference, Symbol, assemble};
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
@@ -26,6 +26,9 @@ pub struct Service {
     /// them). When set and a view's db exists, queries read it instead of
     /// assembling from slices.
     graph_root: Option<PathBuf>,
+    /// Ceiling for a single blob over the transports (bytes). Defaults to
+    /// `DEFAULT_MAX_BLOB_SIZE`; the daemon may raise it from the environment.
+    max_blob_size: usize,
 }
 
 impl Service {
@@ -34,7 +37,38 @@ impl Service {
             store,
             blobs,
             graph_root: None,
+            max_blob_size: gonzalo_proto::DEFAULT_MAX_BLOB_SIZE,
         }
+    }
+
+    /// Override the per-blob size ceiling (bytes) used by the HTTP body limit
+    /// and the gRPC decode limit.
+    pub fn with_max_blob_size(mut self, n: usize) -> Self {
+        self.max_blob_size = n;
+        self
+    }
+
+    /// The per-blob size ceiling (bytes).
+    pub fn max_blob_size(&self) -> usize {
+        self.max_blob_size
+    }
+
+    // --- Content-addressed blobs (BlobStore over the daemon, gonzalo#184) ---
+
+    pub async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+        self.blobs.get_blob(hash).await
+    }
+
+    pub async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+        self.blobs.put_blob(content).await
+    }
+
+    pub async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        self.blobs.list_blobs().await
+    }
+
+    pub async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+        self.blobs.delete_blob(hash).await
     }
 
     /// Serve code-graph queries from persistent SQLite graphs rooted at
@@ -359,6 +393,26 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn blob_methods_delegate_and_default_size_is_64_mib() {
+        let fs = fresh_fs();
+        let svc = Service::new(fs.clone(), fs);
+        assert_eq!(svc.max_blob_size(), gonzalo_proto::DEFAULT_MAX_BLOB_SIZE);
+
+        let hash = svc.put_blob(b"checkpoint pre-image").await.unwrap();
+        assert_eq!(hash, gonzalo_core::ContentHash::of(b"checkpoint pre-image"));
+        assert_eq!(
+            svc.get_blob(&hash).await.unwrap().as_deref(),
+            Some(&b"checkpoint pre-image"[..])
+        );
+        assert_eq!(svc.list_blobs().await.unwrap(), vec![hash.clone()]);
+        svc.delete_blob(&hash).await.unwrap();
+        assert_eq!(svc.get_blob(&hash).await.unwrap(), None);
+
+        let tuned = Service::new(fresh_fs(), fresh_fs()).with_max_blob_size(123);
+        assert_eq!(tuned.max_blob_size(), 123);
     }
 
     #[tokio::test]
