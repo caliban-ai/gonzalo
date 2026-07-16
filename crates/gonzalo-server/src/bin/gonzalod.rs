@@ -12,6 +12,10 @@
 //! - `GONZALO_AUTH_FILE` — TOML principals file for namespace-scoped auth
 //! - `GONZALO_TOKEN`     — single admin token (used when no auth file is set)
 //!
+//! Blob endpoints (`/v1/blobs`) are served for the `fs` and `s3` substrates,
+//! which implement [`BlobStore`](gonzalo_core::BlobStore). Git is not a content-addressed blob store, so a
+//! git-backed deployment does not serve blobs (gonzalo#184).
+//!
 //! Credentials for s3 come from the standard `AWS_*` environment.
 
 use gonzalo_core::{BlobStore, Store};
