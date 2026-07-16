@@ -3,17 +3,25 @@
 
 use crate::Service;
 use crate::auth::{Access, Auth, Principal};
-use gonzalo_core::{DeleteResult, Identity, KeyPrefix, PutResult, Record, RecordKey, Revision};
+use gonzalo_core::{
+    ContentHash, DeleteResult, Identity, KeyPrefix, PutResult, Record, RecordKey, Revision,
+};
 use gonzalo_proto::v1::{
-    DeleteRequest, DeleteResponse, GetRequest, GetResponse, GraphLocatedResponse,
-    GraphNamesResponse, GraphQueryRequest, ListRequest, ListResponse, PutRequest, PutResponse,
-    TicketSyncRequest, TicketSyncResponse,
+    DeleteBlobRequest, DeleteBlobResponse, DeleteRequest, DeleteResponse, GetBlobRequest,
+    GetBlobResponse, GetRequest, GetResponse, GraphLocatedResponse, GraphNamesResponse,
+    GraphQueryRequest, ListBlobsRequest, ListBlobsResponse, ListRequest, ListResponse,
+    PutBlobRequest, PutBlobResponse, PutRequest, PutResponse, TicketSyncRequest,
+    TicketSyncResponse,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };
 use serde::Serialize;
 use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
+
+/// Reserved authz namespace for namespace-agnostic blob ops (ADR 0015), matching
+/// the HTTP transport.
+const BLOB_NS: &str = "_blobs";
 
 /// Adapts [`Service`] to the generated gRPC trait, enforcing namespace-scoped
 /// auth (ADR 0015) per call from the request's bearer metadata.
@@ -297,6 +305,73 @@ impl Gonzalo for GrpcAdapter {
             .map_err(internal)?;
         Ok(Response::new(GraphNamesResponse { names }))
     }
+
+    async fn put_blob(
+        &self,
+        req: Request<PutBlobRequest>,
+    ) -> Result<Response<PutBlobResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Write, BLOB_NS)?;
+        // Verify the content hashes to the advertised value before writing —
+        // same integrity check as the HTTP hash-addressed PUT.
+        let computed = ContentHash::of(&r.content);
+        if computed.0 != r.hash {
+            return Err(Status::invalid_argument(
+                "blob content does not match the advertised hash",
+            ));
+        }
+        let hash = self.service.put_blob(&r.content).await.map_err(internal)?;
+        Ok(Response::new(PutBlobResponse { hash: hash.0 }))
+    }
+
+    async fn get_blob(
+        &self,
+        req: Request<GetBlobRequest>,
+    ) -> Result<Response<GetBlobResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, BLOB_NS)?;
+        let found = self
+            .service
+            .get_blob(&ContentHash(r.hash))
+            .await
+            .map_err(internal)?;
+        let resp = match found {
+            Some(content) => GetBlobResponse {
+                found: true,
+                content,
+            },
+            None => GetBlobResponse {
+                found: false,
+                content: Vec::new(),
+            },
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn list_blobs(
+        &self,
+        req: Request<ListBlobsRequest>,
+    ) -> Result<Response<ListBlobsResponse>, Status> {
+        let (metadata, _ext, _r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, BLOB_NS)?;
+        let hashes = self.service.list_blobs().await.map_err(internal)?;
+        Ok(Response::new(ListBlobsResponse {
+            hashes: hashes.into_iter().map(|h| h.0).collect(),
+        }))
+    }
+
+    async fn delete_blob(
+        &self,
+        req: Request<DeleteBlobRequest>,
+    ) -> Result<Response<DeleteBlobResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Write, BLOB_NS)?;
+        self.service
+            .delete_blob(&ContentHash(r.hash))
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(DeleteBlobResponse {}))
+    }
 }
 
 /// JSON-encode each located item into a `GraphLocatedResponse` (the shared
@@ -321,10 +396,11 @@ pub async fn serve_grpc(
     service: Service,
     auth: Arc<Auth>,
 ) -> Result<(), tonic::transport::Error> {
+    let max_blob = service.max_blob_size();
     let adapter = GrpcAdapter::with_auth(service, auth);
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     tonic::transport::Server::builder()
-        .add_service(GonzaloServer::new(adapter))
+        .add_service(GonzaloServer::new(adapter).max_decoding_message_size(max_blob))
         .serve_with_incoming(incoming)
         .await
 }
@@ -602,6 +678,92 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    // --- blob RPCs (#184) ---
+
+    #[tokio::test]
+    async fn grpc_blob_roundtrip_open() {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(fs.clone(), fs));
+        let content = b"grpc blob body".to_vec();
+        let hash = gonzalo_core::ContentHash::of(&content).0;
+
+        let put = adapter
+            .put_blob(Request::new(PutBlobRequest {
+                hash: hash.clone(),
+                content: content.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(put.hash, hash);
+
+        let got = adapter
+            .get_blob(Request::new(GetBlobRequest { hash: hash.clone() }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.found);
+        assert_eq!(got.content, content);
+
+        let listed = adapter
+            .list_blobs(Request::new(ListBlobsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.hashes, vec![hash.clone()]);
+
+        adapter
+            .delete_blob(Request::new(DeleteBlobRequest { hash: hash.clone() }))
+            .await
+            .unwrap();
+        let gone = adapter
+            .get_blob(Request::new(GetBlobRequest { hash }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!gone.found);
+    }
+
+    #[tokio::test]
+    async fn grpc_put_blob_hash_mismatch_is_invalid_argument() {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(fs.clone(), fs));
+        let err = adapter
+            .put_blob(Request::new(PutBlobRequest {
+                hash: gonzalo_core::ContentHash::of(b"not the body").0,
+                content: b"the body".to_vec(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn grpc_blob_ops_require_blobs_scope() {
+        // `scoped_auth()` grants `memory` only, not `_blobs`.
+        let adapter = fs_adapter(scoped_auth());
+        let content = b"scoped".to_vec();
+        let hash = gonzalo_core::ContentHash::of(&content).0;
+
+        let denied = adapter
+            .put_blob(with_token(
+                PutBlobRequest {
+                    hash: hash.clone(),
+                    content: content.clone(),
+                },
+                "wtok",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        // Admin token succeeds.
+        adapter
+            .put_blob(with_token(PutBlobRequest { hash, content }, "atok"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
