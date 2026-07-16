@@ -8,6 +8,7 @@
 //! - `GONZALO_S3_REGION` — s3 region override (optional)
 //! - `GONZALO_HTTP_ADDR` — HTTP/JSON bind address (default `127.0.0.1:8080`)
 //! - `GONZALO_GRPC_ADDR` — gRPC bind address (default `127.0.0.1:50051`)
+//! - `GONZALO_MAX_BLOB_SIZE` — max bytes per blob over the transports (default 64 MiB)
 //! - `GONZALO_AUTH_FILE` — TOML principals file for namespace-scoped auth
 //! - `GONZALO_TOKEN`     — single admin token (used when no auth file is set)
 //!
@@ -60,6 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut service = Service::new(store, blobs);
+    // Optional per-blob size ceiling (bytes). Defaults to the shared constant;
+    // a malformed value is a hard startup error rather than a silent fallback.
+    let max_blob_size = match std::env::var("GONZALO_MAX_BLOB_SIZE") {
+        Ok(v) if !v.is_empty() => v
+            .parse::<usize>()
+            .map_err(|e| format!("GONZALO_MAX_BLOB_SIZE must be a byte count: {e}"))?,
+        _ => gonzalo_proto::DEFAULT_MAX_BLOB_SIZE,
+    };
+    service = service.with_max_blob_size(max_blob_size);
     if let Some(graph_root) = graph_root {
         service = service.with_graph_root(graph_root);
     }
