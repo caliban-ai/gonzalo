@@ -6,12 +6,13 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store,
-    store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
+    Result, Revision, Store, store::Conflict,
 };
 use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
 use gonzalo_proto::v1::{
-    DeleteRequest, GetRequest, ListRequest, PutRequest, gonzalo_client::GonzaloClient,
+    DeleteBlobRequest, DeleteRequest, GetBlobRequest, GetRequest, ListBlobsRequest, ListRequest,
+    PutBlobRequest, PutRequest, gonzalo_client::GonzaloClient,
 };
 use tonic::transport::Channel;
 
@@ -67,7 +68,8 @@ impl ServerStore {
     async fn grpc_inner(endpoint: String, token: Option<String>) -> Result<Self> {
         let client = GonzaloClient::connect(endpoint)
             .await
-            .map_err(|e| CoreError::Backend(e.to_string()))?;
+            .map_err(|e| CoreError::Backend(e.to_string()))?
+            .max_decoding_message_size(gonzalo_proto::DEFAULT_MAX_BLOB_SIZE);
         Ok(Self {
             backend: Backend::Grpc { client, token },
         })
@@ -78,6 +80,21 @@ impl ServerStore {
         url.path_segments_mut()
             .map_err(|_| CoreError::Backend("base URL cannot be a base".into()))?
             .extend(["v1", "records", &key.namespace, &key.collection, &key.id]);
+        Ok(url)
+    }
+
+    /// `…/v1/blobs` (list) or `…/v1/blobs/{hash}` (one blob) when `hash` is set.
+    fn blobs_url(base: &reqwest::Url, hash: Option<&str>) -> Result<reqwest::Url> {
+        let mut url = base.clone();
+        {
+            let mut seg = url
+                .path_segments_mut()
+                .map_err(|_| CoreError::Backend("base URL cannot be a base".into()))?;
+            seg.extend(["v1", "blobs"]);
+            if let Some(h) = hash {
+                seg.push(h);
+            }
+        }
         Ok(url)
     }
 }
@@ -280,6 +297,135 @@ impl Store for ServerStore {
     }
 }
 
+#[async_trait]
+impl BlobStore for ServerStore {
+    async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+        // The blob is content-addressed: compute the hash locally to address
+        // the request, exactly as the daemon will recompute and verify it.
+        let hash = ContentHash::of(content);
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::blobs_url(base, Some(&hash.0))?;
+                let resp = maybe_auth(client.put(url).body(content.to_vec()), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_blob_put_response(status, &text, hash)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    PutBlobRequest {
+                        hash: hash.0.clone(),
+                        content: content.to_vec(),
+                    },
+                    token,
+                )?;
+                let resp = client.put_blob(req).await.map_err(status)?.into_inner();
+                Ok(ContentHash(resp.hash))
+            }
+        }
+    }
+
+    async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::blobs_url(base, Some(&hash.0))?;
+                let resp = maybe_auth(client.get(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                let resp = resp.error_for_status().map_err(be)?;
+                Ok(Some(resp.bytes().await.map_err(be)?.to_vec()))
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    GetBlobRequest {
+                        hash: hash.0.clone(),
+                    },
+                    token,
+                )?;
+                let resp = client.get_blob(req).await.map_err(status)?.into_inner();
+                Ok(resp.found.then_some(resp.content))
+            }
+        }
+    }
+
+    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::blobs_url(base, None)?;
+                let resp = maybe_auth(client.get(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?
+                    .error_for_status()
+                    .map_err(be)?;
+                Ok(resp.json::<Vec<ContentHash>>().await.map_err(be)?)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(ListBlobsRequest {}, token)?;
+                let resp = client.list_blobs(req).await.map_err(status)?.into_inner();
+                Ok(resp.hashes.into_iter().map(ContentHash).collect())
+            }
+        }
+    }
+
+    async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::blobs_url(base, Some(&hash.0))?;
+                let resp = maybe_auth(client.delete(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                let status = resp.status();
+                if status == reqwest::StatusCode::OK {
+                    return Ok(());
+                }
+                let text = resp.text().await.map_err(be)?;
+                Err(CoreError::Backend(format!(
+                    "daemon returned {status}: {text}"
+                )))
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    DeleteBlobRequest {
+                        hash: hash.0.clone(),
+                    },
+                    token,
+                )?;
+                client.delete_blob(req).await.map_err(status)?;
+                Ok(())
+            }
+        }
+    }
+}
+
 fn delete_outcome_to_result(outcome: DeleteOutcome) -> DeleteResult {
     match outcome {
         DeleteOutcome::Deleted => DeleteResult::Deleted,
@@ -332,6 +478,24 @@ fn classify_put_response(status: reqwest::StatusCode, body: &str) -> Result<PutR
     }
 }
 
+/// Decide a blob `put`'s result from the HTTP response status and body text.
+/// `200 OK` → the (already-known) `hash`; every other status carries a plain
+/// text body surfaced verbatim as `Backend("daemon returned <status>: <body>")`
+/// — notably `413` (too large), `403` (authz), and `400` (hash mismatch) — so
+/// the real failure is never masked (#147).
+fn classify_blob_put_response(
+    status: reqwest::StatusCode,
+    body: &str,
+    hash: ContentHash,
+) -> Result<ContentHash> {
+    match status {
+        reqwest::StatusCode::OK => Ok(hash),
+        other => Err(CoreError::Backend(format!(
+            "daemon returned {other}: {body}"
+        ))),
+    }
+}
+
 fn be<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Backend(e.to_string())
 }
@@ -346,7 +510,7 @@ fn status(s: tonic::Status) -> CoreError {
 mod tests {
     use super::*;
     use gonzalo_core::store::Conflict;
-    use gonzalo_core::{Body, Identity, Meta, Record, RecordKind};
+    use gonzalo_core::{Body, ContentHash, Identity, Meta, Record, RecordKind};
     use reqwest::StatusCode;
     use std::collections::BTreeMap;
 
@@ -441,6 +605,53 @@ mod tests {
             CoreError::Backend(msg) => {
                 assert!(msg.contains("400"), "want status 400 in {msg:?}");
                 assert!(msg.contains(body), "want daemon body in {msg:?}");
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blob_put_ok_returns_the_hash() {
+        let content = b"blob body";
+        let hash = ContentHash::of(content);
+        let result = classify_blob_put_response(StatusCode::OK, "", hash.clone()).unwrap();
+        assert_eq!(result, hash);
+    }
+
+    #[test]
+    fn blob_put_413_surfaces_status_and_body() {
+        let hash = ContentHash::of(b"x");
+        let err = classify_blob_put_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "blob exceeds max size",
+            hash,
+        )
+        .unwrap_err();
+        match err {
+            CoreError::Backend(msg) => {
+                assert!(msg.contains("413"), "want status 413 in {msg:?}");
+                assert!(
+                    msg.contains("blob exceeds max size"),
+                    "want body in {msg:?}"
+                );
+            }
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blob_put_400_mismatch_surfaces_status_and_body() {
+        let hash = ContentHash::of(b"x");
+        let err = classify_blob_put_response(
+            StatusCode::BAD_REQUEST,
+            "blob content does not match the URL hash",
+            hash,
+        )
+        .unwrap_err();
+        match err {
+            CoreError::Backend(msg) => {
+                assert!(msg.contains("400"), "want status 400 in {msg:?}");
+                assert!(msg.contains("does not match"), "want body in {msg:?}");
             }
             other => panic!("expected Backend error, got {other:?}"),
         }
