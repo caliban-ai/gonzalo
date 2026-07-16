@@ -2,7 +2,7 @@
 //! `ServerStore` that passes the shared conformance suite — over BOTH the
 //! HTTP/JSON and gRPC transports.
 
-use gonzalo_core::conformance::run_store_conformance;
+use gonzalo_core::conformance::{run_blob_store_conformance, run_store_conformance};
 use gonzalo_server::{Auth, Principal, Service, serve_grpc, serve_http};
 use gonzalo_store_fs::FsStore;
 use gonzalo_store_server::ServerStore;
@@ -47,6 +47,36 @@ async fn grpc_server_store_passes_conformance() {
         async move { ServerStore::grpc(endpoint).await.unwrap() }
     })
     .await;
+}
+
+/// Stand up a fresh daemon (fresh `FsStore`) over HTTP and return a
+/// `ServerStore` pointing at it. Each call is an independent, empty blob store —
+/// required because the blob conformance suite asserts an empty `list_blobs()`
+/// at the start of one sub-test.
+async fn fresh_http_blob_store() -> ServerStore {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_http(listener, fresh_service().await, open()));
+    ServerStore::http(&format!("http://{addr}")).unwrap()
+}
+
+/// As `fresh_http_blob_store`, over gRPC (waits briefly for the server to accept).
+async fn fresh_grpc_blob_store() -> ServerStore {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_grpc(listener, fresh_service().await, open()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    ServerStore::grpc(format!("http://{addr}")).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_server_store_passes_blob_conformance() {
+    run_blob_store_conformance(fresh_http_blob_store).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_server_store_passes_blob_conformance() {
+    run_blob_store_conformance(fresh_grpc_blob_store).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
