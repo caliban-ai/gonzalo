@@ -4,22 +4,37 @@ use crate::Service;
 use crate::auth::{Access, Auth, Principal};
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode, header},
     middleware::{Next, from_fn},
     response::{IntoResponse, Response},
     routing::get,
 };
-use gonzalo_core::{DeleteResult, Identity, KeyPrefix, PutResult, RecordKey};
+use gonzalo_core::{ContentHash, DeleteResult, Identity, KeyPrefix, PutResult, RecordKey};
 use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
 use serde::Deserialize;
 use std::sync::Arc;
+
+/// Blobs are namespace-agnostic; they authorize against this reserved
+/// namespace (ADR 0015). Admins (`*`) and open mode cover it; a scoped
+/// principal is granted blob access by listing `_blobs` in its read/write set.
+const BLOB_NS: &str = "_blobs";
 
 /// Build the axum router. `auth` governs per-namespace authorization (ADR 0015);
 /// `Auth::Disabled` serves open. The middleware authenticates every non-probe
 /// request (bearer → [`Principal`], or `401`) and hands the principal to the
 /// handlers, which authorize against the target namespace.
 pub fn router(service: Service, auth: Arc<Auth>) -> Router {
+    let max_blob = service.max_blob_size();
+    let blob_routes = Router::new()
+        .route(
+            "/v1/blobs/{hash}",
+            get(get_blob).put(put_blob).delete(delete_blob),
+        )
+        .route("/v1/blobs", get(list_blobs))
+        .layer(DefaultBodyLimit::max(max_blob));
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -34,6 +49,7 @@ pub fn router(service: Service, auth: Arc<Auth>) -> Router {
         .route("/v1/graph/callers", get(graph_callers_of))
         .route("/v1/graph/callees", get(graph_callees))
         .route("/v1/graph/impact", get(graph_impact))
+        .merge(blob_routes)
         .with_state(Arc::new(service));
     app.layer(from_fn(move |mut req: Request, next: Next| {
         let auth = auth.clone();
@@ -207,6 +223,86 @@ async fn list_keys(
     };
     match svc.list(&prefix).await {
         Ok(keys) => (StatusCode::OK, Json(keys)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `GET /v1/blobs/{hash}` — raw blob bytes, or `404`. Authorized `Read` on the
+/// reserved `_blobs` namespace.
+async fn get_blob(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path(hash): Path<String>,
+) -> Response {
+    if !principal.allows(Access::Read, BLOB_NS) {
+        return forbidden(&principal, Access::Read, BLOB_NS);
+    }
+    match svc.get_blob(&ContentHash(hash)).await {
+        Ok(Some(bytes)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `PUT /v1/blobs/{hash}` — store raw body content, write-if-absent. The server
+/// recomputes the content hash and rejects a mismatch with the URL `{hash}`
+/// (`400`) before writing, so the address is authoritative. Authorized `Write`
+/// on `_blobs`. A body over `max_blob_size` is rejected upstream as `413` by the
+/// route's `DefaultBodyLimit`.
+async fn put_blob(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path(hash): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !principal.allows(Access::Write, BLOB_NS) {
+        return forbidden(&principal, Access::Write, BLOB_NS);
+    }
+    let computed = ContentHash::of(&body);
+    if computed.0 != hash {
+        return (
+            StatusCode::BAD_REQUEST,
+            "blob content does not match the URL hash",
+        )
+            .into_response();
+    }
+    match svc.put_blob(&body).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `DELETE /v1/blobs/{hash}` — idempotent delete. Authorized `Write` on `_blobs`.
+async fn delete_blob(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path(hash): Path<String>,
+) -> Response {
+    if !principal.allows(Access::Write, BLOB_NS) {
+        return forbidden(&principal, Access::Write, BLOB_NS);
+    }
+    match svc.delete_blob(&ContentHash(hash)).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `GET /v1/blobs` — JSON array of every stored blob hash. Authorized `Read` on
+/// `_blobs`.
+async fn list_blobs(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    if !principal.allows(Access::Read, BLOB_NS) {
+        return forbidden(&principal, Access::Read, BLOB_NS);
+    }
+    match svc.list_blobs().await {
+        Ok(hashes) => (StatusCode::OK, Json(hashes)).into_response(),
         Err(e) => server_error(e),
     }
 }
@@ -640,5 +736,143 @@ mod tests {
             status_of(svc, open(), "/readyz").await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    // --- blob routes (#184) ---
+
+    #[tokio::test]
+    async fn blob_put_get_list_delete_roundtrip_open() {
+        let (svc, _d) = fs_service();
+        let auth = open();
+        let content = b"remote blob body".to_vec();
+        let hash = gonzalo_core::ContentHash::of(&content).0;
+
+        // PUT the blob at its hash-addressed URL.
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            &format!("/v1/blobs/{hash}"),
+            None,
+            Some(content.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // GET returns the raw bytes.
+        let (s, body) = call(
+            svc.clone(),
+            auth.clone(),
+            "GET",
+            &format!("/v1/blobs/{hash}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body, content);
+
+        // LIST reports the hash.
+        let (s, body) = call(svc.clone(), auth.clone(), "GET", "/v1/blobs", None, None).await;
+        assert_eq!(s, StatusCode::OK);
+        let hashes: Vec<gonzalo_core::ContentHash> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hashes, vec![gonzalo_core::ContentHash::of(&content)]);
+
+        // DELETE removes it; a follow-up GET is 404.
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "DELETE",
+            &format!("/v1/blobs/{hash}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(svc, auth, "GET", &format!("/v1/blobs/{hash}"), None, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn blob_put_rejects_hash_mismatch_with_400() {
+        let (svc, _d) = fs_service();
+        // Address the PUT with a hash that does NOT match the body.
+        let wrong = gonzalo_core::ContentHash::of(b"a different thing").0;
+        let (s, _) = call(
+            svc,
+            open(),
+            "PUT",
+            &format!("/v1/blobs/{wrong}"),
+            None,
+            Some(b"actual body".to_vec()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn blob_put_over_limit_is_413() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fs = Arc::new(FsStore::new(dir.path()));
+        // A tiny limit so a small body trips it.
+        let svc = Service::new(fs.clone(), fs).with_max_blob_size(8);
+        let big = vec![b'x'; 64];
+        let hash = gonzalo_core::ContentHash::of(&big).0;
+        let (s, _) = call(
+            svc,
+            open(),
+            "PUT",
+            &format!("/v1/blobs/{hash}"),
+            None,
+            Some(big),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn blob_ops_require_blobs_namespace_scope() {
+        // `scoped()` grants read/write on `memory` only — not `_blobs`.
+        let (svc, _d) = fs_service();
+        let content = b"scoped blob".to_vec();
+        let hash = gonzalo_core::ContentHash::of(&content).0;
+
+        // Write without `_blobs` scope → 403.
+        let (s, _) = call(
+            svc.clone(),
+            scoped(),
+            "PUT",
+            &format!("/v1/blobs/{hash}"),
+            Some("wtok"),
+            Some(content.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // Read without `_blobs` scope → 403.
+        let (s, _) = call(
+            svc.clone(),
+            scoped(),
+            "GET",
+            "/v1/blobs",
+            Some("wtok"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // Admin (wildcard) may write then read.
+        let (s, _) = call(
+            svc.clone(),
+            scoped(),
+            "PUT",
+            &format!("/v1/blobs/{hash}"),
+            Some("atok"),
+            Some(content),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(svc, scoped(), "GET", "/v1/blobs", Some("atok"), None).await;
+        assert_eq!(s, StatusCode::OK);
     }
 }
