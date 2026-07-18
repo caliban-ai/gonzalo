@@ -1,6 +1,12 @@
 //! Git-backed storage substrate. Each record is a JSON file in a git
 //! worktree; every write is committed, giving an auditable history. Remote
 //! replication via fast-forward `pull`/`push`.
+//!
+//! [`GitStore`] implements [`Store`](gonzalo_core::Store) but **not**
+//! [`BlobStore`](gonzalo_core::BlobStore): git is not a natural content-addressed
+//! blob store. Blob-backed records (e.g. checkpoint pre-images, code-graph
+//! slices) therefore require the `fs`, `s3`, or remote (daemon) substrates, not
+//! git (gonzalo#184).
 
 use async_trait::async_trait;
 use gonzalo_core::{

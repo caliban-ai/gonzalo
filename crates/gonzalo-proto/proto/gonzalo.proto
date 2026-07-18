@@ -17,6 +17,11 @@ service Gonzalo {
   rpc GraphCallersOf(GraphQueryRequest) returns (GraphNamesResponse);
   rpc GraphCallees(GraphQueryRequest) returns (GraphNamesResponse);
   rpc GraphImpact(GraphQueryRequest) returns (GraphNamesResponse);
+  // Content-addressed blobs (gonzalo#184). Bodies ride as raw bytes, not JSON.
+  rpc PutBlob(PutBlobRequest) returns (PutBlobResponse);
+  rpc GetBlob(GetBlobRequest) returns (GetBlobResponse);
+  rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
+  rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse);
 }
 
 message GetRequest {
@@ -103,3 +108,33 @@ message GraphLocatedResponse {
 message GraphNamesResponse {
   repeated string names = 1;
 }
+
+// --- Content-addressed blobs (gonzalo#184) ---
+// Blob content rides as raw bytes. PutBlob carries the expected ContentHash so
+// the server can verify content integrity, mirroring the HTTP hash-addressed
+// PUT.
+message PutBlobRequest {
+  // Expected ContentHash (hex) of `content`; server rejects a mismatch.
+  string hash = 1;
+  bytes content = 2;
+}
+message PutBlobResponse {
+  // The committed ContentHash (hex).
+  string hash = 1;
+}
+message GetBlobRequest {
+  string hash = 1;
+}
+message GetBlobResponse {
+  bool found = 1;
+  bytes content = 2;
+}
+message ListBlobsRequest {}
+message ListBlobsResponse {
+  // Hex ContentHash of each stored blob.
+  repeated string hashes = 1;
+}
+message DeleteBlobRequest {
+  string hash = 1;
+}
+message DeleteBlobResponse {}
