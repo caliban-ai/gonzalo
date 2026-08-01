@@ -43,6 +43,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0016](0016-threeway-merge-stored-ancestry.md) | 3-way merge with content-addressed stored ancestry | accepted |
 | [0017](0017-nonff-pull-content-merge.md) | Non-fast-forward git pull via content-aware merge | accepted |
 | [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted |
+| [0019](0019-s3-backend-qualification-rustfs.md) | Qualified S3 backend for HA: RustFS | accepted |
 
 ## Adding a new ADR
 
