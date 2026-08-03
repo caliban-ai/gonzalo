@@ -9,6 +9,50 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-01
+
+The remote-parity & backend-qualification release. Deletion and blobs — the two
+gaps that kept the daemon substrate behind `fs`/`s3` — close, so a daemon-backed
+consumer now gets the full `Store` + `BlobStore` surface. Alongside them, an HA
+soak harness doubles as a conditional-write qualifier for S3 backends, and its
+first finding disqualifies Garage outright.
+
+### Added
+
+- **`Store::delete`** (#183) — OCC-aware record deletion across every substrate
+  and the daemon, propagated by `Sync`. Local-only semantics; see ADR 0018.
+  (#185)
+- **Blobs over the daemon** (#184) — the content-addressed `BlobStore` is exposed
+  on `gonzalo-server` (HTTP `GET|PUT|DELETE /v1/blobs/{hash}`, `GET /v1/blobs`,
+  plus gRPC), and `ServerStore` implements `BlobStore` over both transports, so a
+  daemon-backed consumer gets the full `Store` + `BlobStore` surface. Blobs
+  previously worked only on `fs`/`s3`. Adds the `GONZALO_MAX_BLOB_SIZE` daemon
+  knob (default 64 MiB). (#192)
+
+### Changed
+
+- **S3 backends are now qualified, and Garage is not among them** (#52) — atomic
+  `If-Match` is a hard requirement for any S3-compatible backend. Garage does not
+  provide it: gonzalo's conditional-write conformance case expects exactly 1 of 8
+  concurrent racers to commit, and Garage let 8/8 through on v1.0.1 and 3–8
+  through non-deterministically on v2.1.0 — the signature of a check-then-set,
+  not an atomic CAS. **Deployments running gonzalo over Garage can silently lose
+  concurrent writes.** RustFS (Apache-2.0) is the qualified backend; MinIO passes
+  the qualifier but is rejected on project sustainability. See ADR 0019. (#186,
+  #205)
+
+Testing: an HA soak harness for stateless `gonzalod` replicas over an
+S3-compatible store — backend-agnostic, doubling as the conditional-write
+qualifier above (#52, #186); cross-crate integration tests extracted into
+`gonzalo-integration-tests` (#190, #191).
+
+Project: a crates.io publishing pipeline for the workspace, triggered on `v*`
+tags (#187, #189).
+
+Docs: competitor capability inventories and parity-gap matrices for mem0, Zep,
+and Letta under `docs/evaluation/` (#193); ADR 0019 recording the S3 backend
+qualification (#205).
+
 ## [0.3.0] - 2026-07-11
 
 The hardening & language-breadth release. A broad correctness and robustness
@@ -177,7 +221,8 @@ milestone (M1–M6).
   ADRs 0001–0009; added CI (fmt/clippy/build/test), a line-coverage gate, the
   Kanban label taxonomy, and board/triage automation.
 
-[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/caliban-ai/gonzalo/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/caliban-ai/gonzalo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caliban-ai/gonzalo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/caliban-ai/gonzalo/releases/tag/v0.1.0
