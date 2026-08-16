@@ -201,13 +201,12 @@ pub trait GraphStore: Send + Sync {
     /// **This is a heuristic, and its false positives are real.** It inherits
     /// every limit of the name-matched extractor underneath:
     ///
-    /// - **Calls inside macro arguments are not recorded at all** (#216). Rust macro
-    ///   bodies parse as token trees, so `assert_eq!(f(), 1)` and
-    ///   `println!("{}", g())` contribute no reference. Anything exercised
-    ///   mainly through assertions therefore looks uncalled — on gonzalo itself
-    ///   this is what makes `Language::from_extension` a false positive.
     /// - A function used only as a value (`map_err(be)`, `and_then(f)`) is a
-    ///   path expression, not a call, so higher-order usage is invisible too.
+    ///   path expression, not a call, so higher-order usage is invisible.
+    /// - Calls inside Rust macro arguments *are* now recorded (#216), but by a
+    ///   token-level heuristic: an identifier followed by a parenthesised token
+    ///   tree. A tuple-struct pattern such as `Some(_)` reads the same way, so
+    ///   macro-derived edges are slightly over-inclusive rather than missing.
     /// - Names are unresolved: an unused `foo` is hidden by any other `foo` that
     ///   is used.
     /// - Conversely a reference from anywhere counts, including from tests and
@@ -773,17 +772,18 @@ fn other() { leaf(); }
     }
 
     #[test]
-    fn unreferenced_flags_symbols_only_called_inside_macros() {
+    fn unreferenced_does_not_flag_symbols_called_inside_macros() {
         let mut s = InMemoryGraphStore::new();
-        // Known blind spot (#216), pinned deliberately: macro bodies parse as
-        // token trees, so the call to `f` is never recorded and `f` is reported
-        // as a candidate despite being used. When #216 lands this test flips.
+        // Was a pinned false positive: macro bodies parse as token trees, so
+        // the call to `f` went unrecorded and `f` was reported as dead. #216
+        // taught the extractor to read calls out of macro arguments, and this
+        // test flipped with it.
         s.insert(
             "src/lib.rs",
             build_rust("fn f() -> u8 { 0 }\nfn g() { assert_eq!(f(), 0); }\n"),
         );
         let page = s.unreferenced(&SymbolFilter::default(), true, 100);
-        assert!(names(&page).contains(&"f"), "documents a false positive");
+        assert!(!names(&page).contains(&"f"), "f is called from g");
     }
 
     #[test]

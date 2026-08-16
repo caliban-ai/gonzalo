@@ -295,6 +295,51 @@ impl Language {
         }
     }
 
+    /// Calls hidden inside an opaque macro-argument node, as `(name, line)`.
+    ///
+    /// Rust macro arguments parse as a `token_tree` of raw tokens rather than
+    /// expressions, so `assert_eq!(f(), 1)` contains no `call_expression` and
+    /// the call to `f` is invisible to [`is_call`](Self::is_call). Since
+    /// assertions are where much of a codebase is exercised, that silently
+    /// removed a large share of the call graph (#216).
+    ///
+    /// Inside a token tree a call is an `identifier` whose immediate next
+    /// sibling is another `token_tree` — `f` followed by `()`. A nested macro
+    /// (`matches!(..)`) has a `!` between the two, so it is naturally excluded.
+    /// Each token tree inspects only its own direct children, and [`walk`]
+    /// recurses into nested trees, so nothing is counted twice.
+    ///
+    /// This is a token-level heuristic, not type resolution: a token tree is not
+    /// type-checked, so a tuple-struct pattern like `Some(_)` reads as a call.
+    /// That matches the base graph, which already records constructors and enum
+    /// variants as calls.
+    fn macro_arg_calls(self, node: Node<'_>, bytes: &[u8]) -> Vec<(String, usize)> {
+        if self != Self::Rust || node.kind() != "token_tree" {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() != "identifier" {
+                continue;
+            }
+            let Some(next) = child.next_sibling() else {
+                continue;
+            };
+            // Only a parenthesised tree is an argument list; `vec![..]`'s own
+            // brackets belong to the macro, not to a call.
+            if next.kind() != "token_tree"
+                || !next.utf8_text(bytes).is_ok_and(|t| t.starts_with('('))
+            {
+                continue;
+            }
+            if let Some(name) = node_text(child, bytes) {
+                out.push((name.to_string(), child.start_position().row + 1));
+            }
+        }
+        out
+    }
+
     /// The called name from a call node's `function` field.
     fn call_name(self, func: Node<'_>, bytes: &[u8]) -> Option<String> {
         match self {
@@ -643,6 +688,15 @@ fn walk(
         });
     }
 
+    // Calls the grammar hides inside an opaque macro-argument node (#216).
+    for (name, line) in language.macro_arg_calls(node, bytes) {
+        graph.references.push(Reference {
+            name,
+            from: enclosing.clone(),
+            line,
+        });
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk(language, child, bytes, enclosing.as_deref(), graph);
@@ -687,6 +741,148 @@ fn main() {
             .find(|r| r.name == "helper")
             .expect("helper call recorded");
         assert_eq!(call.from.as_deref(), Some("main"));
+    }
+
+    // ---- calls inside macro arguments (#216) ------------------------------
+
+    /// Names referenced in `src`, for the macro-argument cases below.
+    fn rust_ref_names(src: &str) -> Vec<String> {
+        build_rust(src)
+            .references
+            .iter()
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn rust_records_a_call_inside_assert_eq() {
+        // Rust macro bodies parse as token trees, so this call used to vanish —
+        // the dominant false positive behind `unreferenced` (#216).
+        let names = rust_ref_names("fn g() { assert_eq!(f(), 1); }");
+        assert!(names.contains(&"f".to_string()), "got {names:?}");
+    }
+
+    #[test]
+    fn rust_records_calls_inside_common_macros() {
+        for (src, want) in [
+            ("fn g() { println!(\"{}\", h()); }", "h"),
+            ("fn g() { let v = vec![mk()]; }", "mk"),
+            ("fn g() { panic!(\"{}\", why()); }", "why"),
+            ("fn g() { write!(w, \"{}\", val()); }", "val"),
+        ] {
+            let names = rust_ref_names(src);
+            assert!(names.contains(&want.to_string()), "{want} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn rust_records_a_qualified_call_inside_a_macro_by_last_segment() {
+        // The real #216 repro: `Language::from_extension` is called only from
+        // assertions, so it looked uncalled.
+        let names =
+            rust_ref_names("fn g() { assert_eq!(Language::from_extension(\"rs\"), None); }");
+        assert!(names.contains(&"from_extension".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn rust_records_nested_calls_inside_a_macro() {
+        let names = rust_ref_names("fn g() { assert_eq!(outer(inner()), 1); }");
+        assert!(names.contains(&"outer".to_string()), "{names:?}");
+        assert!(names.contains(&"inner".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn rust_records_a_macro_arg_call_once() {
+        let names = rust_ref_names("fn g() { assert_eq!(f(), 1); }");
+        assert_eq!(
+            names.iter().filter(|n| *n == "f").count(),
+            1,
+            "nested token trees must not double-count: {names:?}"
+        );
+    }
+
+    #[test]
+    fn rust_macro_arg_calls_carry_the_enclosing_function() {
+        let g = build_rust("fn outer_fn() { assert_eq!(f(), 1); }");
+        let r = g.references.iter().find(|r| r.name == "f").expect("f");
+        assert_eq!(r.from.as_deref(), Some("outer_fn"));
+    }
+
+    #[test]
+    fn rust_does_not_treat_a_nested_macro_name_as_a_call() {
+        // `matches!` is a macro, not a function: the `!` between the identifier
+        // and the token tree is what distinguishes them.
+        let names = rust_ref_names("fn g() { assert!(matches!(a, Some(_))); }");
+        assert!(!names.contains(&"matches".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn rust_does_not_invent_calls_from_plain_macro_arguments() {
+        // Bare identifiers and literals are not calls — only an identifier
+        // immediately followed by a parenthesised token tree is.
+        let names = rust_ref_names("fn g() { println!(\"{}\", x); }");
+        assert!(!names.contains(&"x".to_string()), "{names:?}");
+        let names = rust_ref_names("fn g() { let v = vec![1, 2, 3]; }");
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn rust_still_records_ordinary_calls_alongside_macro_ones() {
+        let names = rust_ref_names("fn g() { plain(); assert_eq!(inside(), 1); }");
+        assert!(names.contains(&"plain".to_string()), "{names:?}");
+        assert!(names.contains(&"inside".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn rust_macro_arg_call_line_is_one_based() {
+        let g = build_rust("fn g() {\n    assert_eq!(f(), 1);\n}");
+        let r = g.references.iter().find(|r| r.name == "f").expect("f");
+        assert_eq!(r.line, 2);
+    }
+
+    // ---- grammar audit for the same opaque-node hole (#216) ----------------
+
+    #[test]
+    fn c_records_macro_invocations_at_the_call_site() {
+        // A C macro *use* is indistinguishable from a call to the grammar, so
+        // it and its neighbours are recorded — no Rust-style hole here.
+        let g = build(
+            Language::C,
+            "#define M() foo()\nvoid g(void) { M(); bar(); }",
+        );
+        let names: Vec<&str> = g.references.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"M"));
+        assert!(names.contains(&"bar"));
+    }
+
+    #[test]
+    fn c_does_not_record_calls_inside_a_define_body() {
+        // The one analogous hole the audit found: a `#define` body is a single
+        // opaque `preproc_arg` token, not an expression tree, so `foo()` here is
+        // invisible. Unlike Rust's token tree there are no child nodes to read,
+        // so recovering it means lexing macro text — deliberately out of scope.
+        // Pinned so the gap is discoverable rather than silent.
+        let g = build(Language::C, "#define M() foo()\nvoid g(void) { M(); }");
+        let names: Vec<&str> = g.references.iter().map(|r| r.name.as_str()).collect();
+        assert!(!names.contains(&"foo"), "known gap: {names:?}");
+    }
+
+    #[test]
+    fn elixir_records_calls_inside_a_quote_block() {
+        // `quote do: foo()` parses as real expressions — no hole.
+        let g = build(
+            Language::Elixir,
+            "defmodule A do\n  def g do\n    quote do: foo()\n  end\nend",
+        );
+        let names: Vec<&str> = g.references.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"foo"), "{names:?}");
+    }
+
+    #[test]
+    fn ruby_records_calls_inside_a_block() {
+        let g = build(Language::Ruby, "def g\n  define_method(:x) { foo() }\nend");
+        let names: Vec<&str> = g.references.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"foo"), "{names:?}");
     }
 
     #[test]
