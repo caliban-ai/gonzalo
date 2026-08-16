@@ -243,6 +243,22 @@ impl Service {
         Ok(self.view(repo, view_id).await?.list(filter, limit))
     }
 
+    /// Dead-code candidates in the view: symbols with no inbound reference,
+    /// heuristic — see [`GraphStore::unreferenced`] for the blind spots.
+    pub async fn graph_unreferenced(
+        &self,
+        repo: &str,
+        view_id: &str,
+        filter: &SymbolFilter,
+        exclude_tests: bool,
+        limit: usize,
+    ) -> Result<Page<Located<Symbol>>> {
+        Ok(self
+            .view(repo, view_id)
+            .await?
+            .unreferenced(filter, exclude_tests, limit))
+    }
+
     /// Structural diff of two views of `repo` (`view_a` → `view_b`): symbols and
     /// references added or removed.
     pub async fn graph_diff(

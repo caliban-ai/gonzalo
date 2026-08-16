@@ -20,6 +20,17 @@ the patch version for fixes.
   default `GraphStore` methods, so every store implementation inherits them.
   Results are bounded and report `total` + `truncated` rather than silently
   cutting.
+- **`unreferenced` dead-code candidates** (#214) — a fourth aggregate tool
+  listing symbols with no inbound reference, filtered by the same
+  `path_prefix`/`kind`/`name_contains` and bounded the same way. `exclude_tests`
+  (default on) drops members of a `mod tests`/`mod test` block by line range and
+  anything under a `tests/` directory; on gonzalo itself that is the difference
+  between 515 hits and 40. Deliberately errs toward silence — a reference from
+  anywhere counts, including from tests and from the symbol itself. Its false
+  positives are documented in the tool description, the rustdoc, and a pinned
+  test: calls inside macro arguments are not recorded at all (`assert_eq!(f(),
+  1)` registers nothing), and a function passed as a value is a path expression
+  rather than a call, so both look uncalled.
 
 ## [0.4.0] - 2026-08-01
 

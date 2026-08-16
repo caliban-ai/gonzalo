@@ -9,9 +9,11 @@
 //! - **Per-symbol** — `search`/`node`/`callers`/`callees`/`impact`/`explore`
 //!   answer questions about a name the caller already has, and `diff` compares
 //!   two views.
-//! - **Whole-view** — `overview`/`top`/`list` answer questions *about the graph*
-//!   (what is here, what is heavily referenced, what is ambiguous) so a caller
-//!   can orient without knowing a symbol name first.
+//! - **Whole-view** — `overview`/`top`/`list`/`unreferenced` answer questions
+//!   *about the graph* (what is here, what is heavily referenced, what is
+//!   ambiguous, what nothing calls) so a caller can orient without knowing a
+//!   symbol name first. `unreferenced` is explicitly heuristic; its tool
+//!   description carries the caveats.
 //!
 //! The tool logic lives in plain methods ([`GonzaloMcp::tools`],
 //! [`GonzaloMcp::dispatch`]) so it is unit-testable without an rmcp
@@ -117,6 +119,19 @@ impl GonzaloMcp {
                  substring. Answers \"what is in this crate\" rather than \"where is this name\".",
                 list_schema(),
             ),
+            Tool::new(
+                "unreferenced",
+                "Symbols with no inbound reference — dead-code CANDIDATES, not dead code. This is \
+                 a heuristic over a name-matched graph and it does produce false positives. \
+                 Calls inside macro arguments are not recorded at all (`assert_eq!(f(), 1)` \
+                 registers nothing), so anything exercised mainly through assertions looks \
+                 uncalled; a function used only as a value (higher-order usage, e.g. \
+                 `map_err(be)`) is likewise invisible; and an unused name is hidden by any \
+                 same-named symbol that is used. References from tests and from the symbol itself \
+                 do count, so test-only and recursive-only functions are never reported. Confirm \
+                 every hit against the source before acting on it.",
+                unreferenced_schema(),
+            ),
         ]
     }
 
@@ -150,7 +165,7 @@ impl GonzaloMcp {
         }
 
         // The aggregate tools select a view but take no symbol name.
-        if matches!(name, "overview" | "top" | "list") {
+        if matches!(name, "overview" | "top" | "list" | "unreferenced") {
             let (repo, view) = match selector_args(&arguments) {
                 Ok(t) => t,
                 Err(msg) => return Ok(tool_error(msg)),
@@ -238,7 +253,26 @@ impl GonzaloMcp {
                 };
                 self.result(self.service.graph_list(repo, view, &filter, limit).await)
             }
-            // Unreachable: the caller already matched on these three names.
+            "unreferenced" => {
+                let filter = match filter_args(arguments) {
+                    Ok(f) => f,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let exclude_tests = match bool_arg(arguments, "exclude_tests", true) {
+                    Ok(b) => b,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let limit = match usize_arg(arguments, "limit", DEFAULT_LIST_LIMIT) {
+                    Ok(n) => n,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                self.result(
+                    self.service
+                        .graph_unreferenced(repo, view, &filter, exclude_tests, limit)
+                        .await,
+                )
+            }
+            // Unreachable: the caller already matched on these four names.
             _ => Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -389,6 +423,49 @@ fn list_schema() -> Arc<Map<String, Value>> {
     Arc::new(schema.as_object().expect("object schema").clone())
 }
 
+/// Input schema for `unreferenced`: the `list` filters plus the test-scope
+/// toggle.
+fn unreferenced_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
+            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "path_prefix": {
+                "type": "string",
+                "description": "only symbols whose path starts with this (scopes to a crate or \
+                                directory)"
+            },
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "function", "struct", "enum", "trait", "impl", "module",
+                    "const", "static", "type_alias", "class", "interface"
+                ],
+                "description": "only symbols of this kind; `function` is usually what you want"
+            },
+            "name_contains": {
+                "type": "string",
+                "description": "only symbols whose name contains this substring"
+            },
+            "exclude_tests": {
+                "type": "boolean",
+                "description": "drop symbols inside a `mod tests`/`mod test` block or under a \
+                                tests/ directory (default true); without it the result is mostly \
+                                test helpers"
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "maximum candidates to return (default 100)"
+            }
+        },
+        "required": ["repo", "view_id"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
 /// A minimal object schema for the argument-free `status` tool.
 fn status_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({ "type": "object", "additionalProperties": false });
@@ -432,6 +509,19 @@ fn usize_arg(
             .as_u64()
             .map(|n| n as usize)
             .ok_or_else(|| format!("argument '{key}' must be a non-negative integer, got {v}")),
+    }
+}
+
+/// Extract an optional boolean argument, or `default` if absent.
+fn bool_arg(
+    arguments: &Option<Map<String, Value>>,
+    key: &str,
+    default: bool,
+) -> Result<bool, String> {
+    match arguments.as_ref().and_then(|m| m.get(key)) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(v) => Err(format!("argument '{key}' must be a boolean, got {v}")),
     }
 }
 
@@ -558,12 +648,18 @@ mod tests {
 
     /// A server whose store already holds view `r`/`main` with two slices.
     async fn seeded_server() -> GonzaloMcp {
-        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
-        let mut manifest = Manifest::new();
-        for (path, src) in [
+        seeded_with(&[
             ("lib.rs", "fn helper() {}"),
             ("main.rs", "fn main() { helper(); }"),
-        ] {
+        ])
+        .await
+    }
+
+    /// A server whose store holds view `r`/`main` assembled from `slices`.
+    async fn seeded_with(slices: &[(&str, &str)]) -> GonzaloMcp {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let mut manifest = Manifest::new();
+        for &(path, src) in slices {
             let hash = fs
                 .put_blob(&build_rust(src).to_slice_bytes())
                 .await
@@ -620,8 +716,18 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "status", "search", "node", "callers", "callees", "impact", "explore", "diff",
-                "overview", "top", "list",
+                "status",
+                "search",
+                "node",
+                "callers",
+                "callees",
+                "impact",
+                "explore",
+                "diff",
+                "overview",
+                "top",
+                "list",
+                "unreferenced",
             ]
         );
     }
@@ -779,11 +885,119 @@ mod tests {
     #[tokio::test]
     async fn aggregate_tools_require_a_view_selector() {
         let s = seeded_server().await;
-        for tool in ["overview", "top", "list"] {
+        for tool in ["overview", "top", "list", "unreferenced"] {
             let result = s.dispatch(tool, None).await.unwrap();
             assert_eq!(result.is_error, Some(true), "{tool} should reject no args");
             assert!(result_text(&result).contains("repo"));
         }
+    }
+
+    /// A view with a used function, an unused one, and a `mod tests` block.
+    const DEAD_SRC: &str = "fn helper() {}\n\
+                            fn main() { helper(); }\n\
+                            fn orphan() {}\n\
+                            #[cfg(test)]\n\
+                            mod tests {\n    \
+                                fn t_only() {}\n\
+                            }\n";
+
+    async fn call_on(server: &GonzaloMcp, tool: &str, extra: Value) -> Value {
+        let result = server
+            .dispatch(tool, view_args_with("r", "main", extra))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "tool {tool} errored");
+        serde_json::from_str(&result_text(&result)).unwrap()
+    }
+
+    fn item_names(v: &Value) -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["item"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unreferenced_tool_reports_only_uncalled_symbols() {
+        let v = call("unreferenced", serde_json::json!({})).await;
+        // The seeded view is `helper` (called from main) + `main` (called by
+        // nothing), so only `main` is a candidate.
+        assert_eq!(item_names(&v), vec!["main"]);
+        assert_eq!(v["items"][0]["path"], "main.rs");
+    }
+
+    #[tokio::test]
+    async fn unreferenced_tool_excludes_test_scopes_by_default() {
+        let s = seeded_with(&[("lib.rs", DEAD_SRC)]).await;
+        let v = call_on(&s, "unreferenced", serde_json::json!({})).await;
+        let names = item_names(&v);
+        assert!(names.contains(&"orphan".to_string()));
+        assert!(!names.contains(&"t_only".to_string()));
+    }
+
+    #[tokio::test]
+    async fn unreferenced_tool_can_include_test_scopes() {
+        let s = seeded_with(&[("lib.rs", DEAD_SRC)]).await;
+        let v = call_on(
+            &s,
+            "unreferenced",
+            serde_json::json!({ "exclude_tests": false }),
+        )
+        .await;
+        assert!(item_names(&v).contains(&"t_only".to_string()));
+    }
+
+    #[tokio::test]
+    async fn unreferenced_tool_applies_the_symbol_filter() {
+        let s = seeded_with(&[("lib.rs", DEAD_SRC)]).await;
+        let v = call_on(&s, "unreferenced", serde_json::json!({ "kind": "struct" })).await;
+        assert_eq!(v["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn unreferenced_tool_reports_truncation() {
+        let s = seeded_with(&[("lib.rs", "fn a() {} fn b() {} fn c() {}")]).await;
+        let v = call_on(&s, "unreferenced", serde_json::json!({ "limit": 2 })).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn unreferenced_tool_rejects_a_non_boolean_exclude_tests() {
+        let s = seeded_server().await;
+        let result = s
+            .dispatch(
+                "unreferenced",
+                view_args_with("r", "main", serde_json::json!({ "exclude_tests": "yes" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("exclude_tests"));
+    }
+
+    #[test]
+    fn unreferenced_tool_description_states_the_heuristic_blind_spot() {
+        let tool = GonzaloMcp::tools()
+            .into_iter()
+            .find(|t| t.name == "unreferenced")
+            .expect("unreferenced is advertised");
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("heuristic"),
+            "must not present candidates as proof: {description}"
+        );
+        assert!(
+            description.contains("higher-order"),
+            "must name the higher-order-usage blind spot: {description}"
+        );
+        assert!(
+            description.contains("macro"),
+            "must name the macro-argument blind spot, the dominant false positive: {description}"
+        );
     }
 
     #[tokio::test]
