@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
-    WatchConfig, gc, get, index_with_gc, list, migrate, status, sync_stores, ticket_move,
-    ticket_sync, watch,
+    IndexFilter, WatchConfig, gc, get, index_with_gc_filtered, list, migrate, status, sync_stores,
+    ticket_move, ticket_sync, watch,
 };
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
@@ -95,6 +95,12 @@ enum Commands {
         /// In `--watch`, seconds between self-healing full reconciles.
         #[arg(long, default_value_t = 300)]
         reconcile_secs: u64,
+        /// Index this repo-relative path even though a built-in rule would skip
+        /// it (vendored code you do want in the graph). Repeatable; matched on
+        /// whole path components. Cannot override `.gitignore` — a view must
+        /// stay reproducible from the commit alone.
+        #[arg(long = "include", value_name = "PATH")]
+        include: Vec<String>,
     },
     /// Garbage-collect orphaned code-graph slices, marking against every live
     /// view's manifest across all repos.
@@ -250,7 +256,9 @@ async fn main() -> Result<()> {
             watch: watch_mode,
             debounce_ms,
             reconcile_secs,
+            include,
         } => {
+            let filter = IndexFilter::new(&include);
             if watch_mode {
                 let config = WatchConfig {
                     debounce: Duration::from_millis(debounce_ms),
@@ -261,7 +269,8 @@ async fn main() -> Result<()> {
                 watch(&root, &src, &repo, &view, config, gc).await?;
                 return Ok(());
             }
-            let (summary, swept) = index_with_gc(&root, &src, &repo, &view, gc).await?;
+            let (summary, swept) =
+                index_with_gc_filtered(&root, &src, &repo, &view, gc, &filter).await?;
             println!(
                 "driver:   {}",
                 if summary.incremental {
@@ -275,6 +284,10 @@ async fn main() -> Result<()> {
             println!("modified: {}", summary.modified);
             println!("deleted:  {}", summary.deleted);
             println!("skipped:  {}", summary.skipped);
+            println!(
+                "ignored:  {} files, {} dirs not descended",
+                summary.ignored.files, summary.ignored.dirs
+            );
             if let Some(swept) = swept {
                 println!("gc.freed:    {}", swept.freed);
                 println!("gc.retained: {}", swept.retained);

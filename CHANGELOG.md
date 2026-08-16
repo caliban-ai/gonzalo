@@ -9,6 +9,28 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The indexer no longer walks vendored bundles or gitignored build output**
+  (#209). `is_indexable` skipped only `target`, `.git`, and dotted components, so
+  half of a real repo's graph was not that repo's code. Membership now lives in
+  one place (`IndexFilter`), shared by the full walk and the git-incremental
+  driver so they cannot disagree: dependency/output directories (`node_modules`,
+  `vendor`, `dist`, `build`, `site-packages`, `third_party`) and generated files
+  (`*.min.js`, `*.min.css`, `*.bundle.js`, `*-lock.json`) are dropped on both
+  paths, and the full walk additionally honours `.gitignore`.
+
+  Re-indexing `caliban-ai/caliban` drops it from 16 986 symbols to 8 501 (-50.0%)
+  with **zero** symbols from `book/**` or any `*.min.js`; the largest file in the
+  view is now `caliban/src/tui/events.rs` (142 symbols) rather than a 4 231-symbol
+  copy of `mermaid.min.js`. This also removes a reproducibility hole — indexing
+  gitignored output made the graph depend on whether anyone had run a build.
+
+  `gonzalo index` now reports what it excluded (`ignored: N files, M dirs not
+  descended`), and `--include <path>` re-admits a vendored path that a built-in
+  rule would drop. `--include` deliberately cannot override `.gitignore`, so no
+  flag can make a view irreproducible.
+
 ### Added
 
 - **Aggregate code-graph queries** (#214) — three MCP tools that answer questions
