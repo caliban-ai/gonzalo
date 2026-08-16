@@ -9,6 +9,18 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **Aggregate code-graph queries** (#214) — three MCP tools that answer questions
+  about a view rather than about a symbol name the caller already has:
+  `overview` (file/symbol/reference counts, a breakdown by kind and language, and
+  the largest files), `top` (rank by `fan_in`, `fan_out`, or `definitions` — a
+  `definitions` score above 1 marks an ambiguous name), and `list` (enumerate
+  symbols filtered by `path_prefix`, `kind`, and `name_contains`). Backed by new
+  default `GraphStore` methods, so every store implementation inherits them.
+  Results are bounded and report `total` + `truncated` rather than silently
+  cutting.
+
 ## [0.4.0] - 2026-08-01
 
 The remote-parity & backend-qualification release. Deletion and blobs — the two

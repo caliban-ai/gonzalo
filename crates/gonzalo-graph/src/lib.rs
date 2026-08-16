@@ -13,7 +13,10 @@ pub mod store;
 pub use assembly::assemble;
 pub use builder::{Language, build, build_rust};
 pub use diff::{GraphDiff, diff};
-pub use model::{CodeGraph, Located, Reference, Symbol, SymbolKind};
+pub use model::{
+    CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
+    SymbolKind, ViewOverview,
+};
 pub use resolve::{Resolution, ResolvedReference, resolve_references_to, resolved_callers_of};
 pub use store::{GraphStore, InMemoryGraphStore};
 

@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 gonzalo-core     = { workspace = true }
+gonzalo-graph    = { workspace = true }
 gonzalo-server   = { workspace = true }
 gonzalo-store-fs = { workspace = true }
 rmcp             = { workspace = true }
@@ -18,8 +19,7 @@ serde            = { workspace = true }
 serde_json       = { workspace = true }
 
 [dev-dependencies]
-gonzalo-graph = { workspace = true }
-tempfile      = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
