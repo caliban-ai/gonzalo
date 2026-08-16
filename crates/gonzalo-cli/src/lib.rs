@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod walk;
+pub use walk::{IgnoredCounts, IndexFilter};
+
 mod watch;
 pub use watch::{WatchConfig, watch};
 
@@ -170,6 +173,10 @@ pub struct IndexSummary {
     /// Files skipped because an isolated parse worker crashed or hung on them
     /// (only possible when parsing through the pool).
     pub skipped: usize,
+    /// Paths excluded from the view by an [`IndexFilter`] rule — vendored or
+    /// generated files, dependency/output directories, and gitignored trees
+    /// (#209). Distinct from `skipped`, which is a parse failure.
+    pub ignored: IgnoredCounts,
     /// Whether this run used the git-diff-driven incremental driver (only the
     /// changed set re-parsed) rather than the full tree walk.
     pub incremental: bool,
@@ -228,6 +235,20 @@ async fn parse_file(
 /// view even if an incremental run ever missed a change. Slices orphaned by
 /// deletions are left for a separate GC pass (which must see all live views).
 pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<IndexSummary> {
+    index_with(root, src, repo, view, &IndexFilter::default()).await
+}
+
+/// [`index`], with control over which paths enter the view.
+///
+/// `filter` carries any `--include` overrides; the built-in vendored/generated
+/// rules and `.gitignore` apply either way (#209).
+pub async fn index_with(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    filter: &IndexFilter,
+) -> Result<IndexSummary> {
     let store = FsStore::new(root);
 
     // Parse through a crash-isolated worker pool when a worker binary is
@@ -270,12 +291,20 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
     // commits, so a concurrent-writer Conflict (below) leaves the graph
     // untouched rather than advanced ahead of a manifest that never landed (#153).
     let mut staging = GraphStaging::default();
-    let (desired, files, skipped, incremental) = match incremental_changed {
+    let (desired, files, skipped, ignored, incremental) = match incremental_changed {
         Some(changed) => {
-            build_desired_incremental(&store, &mut staging, pool.as_ref(), src, &current, &changed)
-                .await?
+            build_desired_incremental(
+                &store,
+                &mut staging,
+                pool.as_ref(),
+                src,
+                &current,
+                &changed,
+                filter,
+            )
+            .await?
         }
-        None => build_desired_full(&store, &mut staging, pool.as_ref(), src).await?,
+        None => build_desired_full(&store, &mut staging, pool.as_ref(), src, filter).await?,
     };
 
     // Reconcile against the current manifest and stage removed paths for the
@@ -339,6 +368,7 @@ pub async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<In
         modified: recon.modified.len(),
         deleted: recon.deleted.len(),
         skipped,
+        ignored,
         incremental,
     })
 }
@@ -369,16 +399,25 @@ impl GraphStaging {
     }
 }
 
-/// Full-walk desired set: parse every supported source file under `src`.
+/// Full-walk desired set: parse every supported source file under `src` that
+/// `filter` admits.
 async fn build_desired_full(
     store: &FsStore,
     staging: &mut GraphStaging,
     pool: Option<&ParserPool>,
     src: &Path,
-) -> Result<(BTreeMap<String, ContentHash>, usize, usize, bool)> {
+    filter: &IndexFilter,
+) -> Result<(
+    BTreeMap<String, ContentHash>,
+    usize,
+    usize,
+    IgnoredCounts,
+    bool,
+)> {
     let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
     let mut skipped = 0usize;
-    for (path, language) in source_files(src)? {
+    let (sources, ignored) = walk::source_files(src, filter)?;
+    for (path, language) in sources {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let rel = path
@@ -395,7 +434,7 @@ async fn build_desired_full(
         desired.insert(rel, hash);
     }
     let files = desired.len();
-    Ok((desired, files, skipped, false))
+    Ok((desired, files, skipped, ignored, false))
 }
 
 /// Incremental desired set: start from the current manifest and apply only the
@@ -409,13 +448,29 @@ async fn build_desired_incremental(
     src: &Path,
     current: &Manifest,
     changed: &gonzalo_store_git::ChangedPaths,
-) -> Result<(BTreeMap<String, ContentHash>, usize, usize, bool)> {
+    filter: &IndexFilter,
+) -> Result<(
+    BTreeMap<String, ContentHash>,
+    usize,
+    usize,
+    IgnoredCounts,
+    bool,
+)> {
     let mut desired = current.entries.clone();
     let mut files = 0usize;
     let mut skipped = 0usize;
+    // Gitignored paths never reach here — `git2`'s diff omits them — so only the
+    // path-only rules apply, and only files are ever counted.
+    let mut ignored = IgnoredCounts::default();
 
     for rel in changed.added.iter().chain(changed.modified.iter()) {
-        if !is_indexable(rel) {
+        if !filter.is_indexable(rel) {
+            // A path that a previous, laxer walk admitted must also be dropped
+            // from the view, not merely skipped, or the two drivers disagree.
+            if desired.remove(rel).is_some() {
+                staging.removes.push(rel.clone());
+            }
+            ignored.files += 1;
             continue;
         }
         let Some(language) = Path::new(rel)
@@ -452,50 +507,7 @@ async fn build_desired_incremental(
         }
     }
 
-    Ok((desired, files, skipped, true))
-}
-
-/// Whether a repo-relative path is eligible for indexing — mirrors the
-/// full-walk skip of `target`, `.git`, and hidden directories so the git driver
-/// and the full walk agree on which paths belong to a view.
-fn is_indexable(rel: &str) -> bool {
-    !rel.split('/')
-        .any(|part| part == "target" || part == ".git" || part.starts_with('.'))
-}
-
-/// Supported source files under `dir` with their [`Language`], sorted by path,
-/// skipping `target`, `.git`, and hidden directories (build artifacts and VCS
-/// internals are not source). Files whose extension maps to no language are
-/// skipped.
-fn source_files(dir: &Path) -> Result<Vec<(PathBuf, Language)>> {
-    let mut out = Vec::new();
-    source_files_inner(dir, &mut out)?;
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
-
-fn source_files_inner(dir: &Path, out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if ft.is_dir() {
-            if name == "target" || name == ".git" || name.starts_with('.') {
-                continue;
-            }
-            source_files_inner(&entry.path(), out)?;
-        } else if ft.is_file() {
-            let path = entry.path();
-            if let Some(language) = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .and_then(Language::from_extension)
-            {
-                out.push((path, language));
-            }
-        }
-    }
-    Ok(())
+    Ok((desired, files, skipped, ignored, true))
 }
 
 // ─── gc ────────────────────────────────────────────────────────────────────
@@ -553,7 +565,19 @@ pub async fn index_with_gc(
     view: &str,
     gc_after: bool,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
-    let summary = index(root, src, repo, view).await?;
+    index_with_gc_filtered(root, src, repo, view, gc_after, &IndexFilter::default()).await
+}
+
+/// [`index_with_gc`], with control over which paths enter the view (#209).
+pub async fn index_with_gc_filtered(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    gc_after: bool,
+    filter: &IndexFilter,
+) -> Result<(IndexSummary, Option<GcSummary>)> {
+    let summary = index_with(root, src, repo, view, filter).await?;
     let swept = if gc_after {
         Some(gc(root).await?)
     } else {
@@ -1088,10 +1112,15 @@ mod tests {
         let mut graph = SqliteGraphStore::open(&db_path).unwrap();
 
         let mut staging = GraphStaging::default();
-        let (desired, files, _skipped, incremental) =
-            build_desired_full(&store, &mut staging, None, src.path())
-                .await
-                .unwrap();
+        let (desired, files, _skipped, _ignored, incremental) = build_desired_full(
+            &store,
+            &mut staging,
+            None,
+            src.path(),
+            &IndexFilter::default(),
+        )
+        .await
+        .unwrap();
         assert!(!incremental);
         assert_eq!(files, 1);
         assert_eq!(desired.len(), 1);
@@ -1217,6 +1246,42 @@ mod tests {
         let g =
             SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
         assert_eq!(g.definitions("a")[0].path, "a.rs");
+    }
+
+    // ── index: view membership (#209) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn index_excludes_vendored_bundles_from_the_view() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        write_file(src.path(), "mermaid.min.js", "var a=1,e=2,t=3;");
+
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.files, 1, "only the hand-written source");
+        assert_eq!(summary.ignored.files, 1, "the minified bundle, reported");
+
+        let graph =
+            SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
+        assert!(
+            graph.all_symbols().iter().all(|s| s.path == "a.rs"),
+            "no symbol may come from a vendored bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_can_be_told_to_keep_a_vendored_path() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        write_file(src.path(), "keep.min.js", "function f(){}");
+
+        let filter = IndexFilter::new(&["keep.min.js".to_string()]);
+        let summary = index_with(root.path(), src.path(), "r", "main", &filter)
+            .await
+            .unwrap();
+        assert_eq!(summary.files, 2, "the override re-admits it");
+        assert_eq!(summary.ignored.files, 0);
     }
 
     #[tokio::test]

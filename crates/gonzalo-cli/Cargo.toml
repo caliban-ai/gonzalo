@@ -22,11 +22,11 @@ anyhow = "1"
 tokio  = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 serde_json = { workspace = true }
 notify = "8"
+git2   = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
-git2     = { workspace = true }
 
 [[bin]]
 name = "gonzalo"
