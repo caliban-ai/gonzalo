@@ -3,14 +3,21 @@
 //! [`GonzaloMcp`] implements rmcp's [`ServerHandler`] over a
 //! [`Service`](gonzalo_server::Service): agents spawn the `gonzalo-mcp` binary
 //! (stdio) and call tools that answer from the local store. It exposes a
-//! view-independent `status` tool plus the code-graph queries
-//! (`search`/`node`/`callers`/`callees`/`impact`/`explore`), each taking a
-//! `(repo, view_id)` view selector.
+//! view-independent `status` tool plus two families of code-graph query, each
+//! taking a `(repo, view_id)` view selector:
+//!
+//! - **Per-symbol** — `search`/`node`/`callers`/`callees`/`impact`/`explore`
+//!   answer questions about a name the caller already has, and `diff` compares
+//!   two views.
+//! - **Whole-view** — `overview`/`top`/`list` answer questions *about the graph*
+//!   (what is here, what is heavily referenced, what is ambiguous) so a caller
+//!   can orient without knowing a symbol name first.
 //!
 //! The tool logic lives in plain methods ([`GonzaloMcp::tools`],
 //! [`GonzaloMcp::dispatch`]) so it is unit-testable without an rmcp
 //! [`RequestContext`]; the trait methods are thin adapters over them.
 
+use gonzalo_graph::{Ranking, SymbolFilter, SymbolKind};
 use gonzalo_server::Service;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -44,8 +51,9 @@ impl GonzaloMcp {
         &self.service
     }
 
-    /// The tools this server advertises: a view-independent `status` plus the
-    /// code-graph queries, each taking a `(repo, view_id)` view selector.
+    /// The tools this server advertises: a view-independent `status`, the
+    /// per-symbol code-graph queries, and the whole-view aggregates — all the
+    /// graph tools taking a `(repo, view_id)` view selector.
     pub fn tools() -> Vec<Tool> {
         vec![
             Tool::new(
@@ -89,6 +97,26 @@ impl GonzaloMcp {
                  going from `view_a` to `view_b`.",
                 diff_schema(),
             ),
+            Tool::new(
+                "overview",
+                "Summarize a whole view without needing a symbol name: file/symbol/reference \
+                 counts, a breakdown by kind and language, and the largest files. Start here when \
+                 orienting in an unfamiliar repo.",
+                overview_schema(),
+            ),
+            Tool::new(
+                "top",
+                "Rank a view's symbols: `fan_in` (most referenced), `fan_out` (calls the most \
+                 names), or `definitions` (defined in the most places — a score above 1 means the \
+                 name is ambiguous and traversals through it are unreliable).",
+                top_schema(),
+            ),
+            Tool::new(
+                "list",
+                "Enumerate a view's symbols, optionally filtered by path prefix, kind, and name \
+                 substring. Answers \"what is in this crate\" rather than \"where is this name\".",
+                list_schema(),
+            ),
         ]
     }
 
@@ -119,6 +147,15 @@ impl GonzaloMcp {
                 Err(msg) => return Ok(tool_error(msg)),
             };
             return self.result(self.service.graph_diff(&repo, &view_a, &view_b).await);
+        }
+
+        // The aggregate tools select a view but take no symbol name.
+        if matches!(name, "overview" | "top" | "list") {
+            let (repo, view) = match selector_args(&arguments) {
+                Ok(t) => t,
+                Err(msg) => return Ok(tool_error(msg)),
+            };
+            return self.aggregate(name, &repo, &view, &arguments).await;
         }
 
         // An unknown tool is `method_not_found` regardless of arguments — decided
@@ -159,6 +196,50 @@ impl GonzaloMcp {
         match outcome {
             Ok(value) => Ok(success_json(&value)),
             Err(e) => Ok(tool_error(e.to_string())),
+        }
+    }
+
+    /// Dispatch the view-wide aggregate tools, which take a `(repo, view_id)`
+    /// selector plus their own optional arguments rather than a symbol name.
+    async fn aggregate(
+        &self,
+        name: &str,
+        repo: &str,
+        view: &str,
+        arguments: &Option<Map<String, Value>>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match name {
+            "overview" => {
+                let largest = match usize_arg(arguments, "largest", DEFAULT_TOP_LIMIT) {
+                    Ok(n) => n,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                self.result(self.service.graph_overview(repo, view, largest).await)
+            }
+            "top" => {
+                let ranking = match ranking_arg(arguments) {
+                    Ok(r) => r,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let limit = match usize_arg(arguments, "limit", DEFAULT_TOP_LIMIT) {
+                    Ok(n) => n,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                self.result(self.service.graph_top(repo, view, ranking, limit).await)
+            }
+            "list" => {
+                let filter = match filter_args(arguments) {
+                    Ok(f) => f,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let limit = match usize_arg(arguments, "limit", DEFAULT_LIST_LIMIT) {
+                    Ok(n) => n,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                self.result(self.service.graph_list(repo, view, &filter, limit).await)
+            }
+            // Unreachable: the caller already matched on these three names.
+            _ => Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>()),
         }
     }
 
@@ -221,6 +302,93 @@ fn diff_schema() -> Arc<Map<String, Value>> {
     Arc::new(schema.as_object().expect("object schema").clone())
 }
 
+/// Default number of entries returned by `overview.largest_files` and `top`.
+const DEFAULT_TOP_LIMIT: usize = 20;
+/// Default number of symbols returned by `list`.
+const DEFAULT_LIST_LIMIT: usize = 100;
+
+/// Input schema for `overview`: a view selector plus an optional cap on the
+/// `largest_files` listing.
+fn overview_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
+            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "largest": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "how many of the largest files to list (default 20); the counts \
+                                themselves are never truncated"
+            }
+        },
+        "required": ["repo", "view_id"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
+/// Input schema for `top`: a view selector, the required ranking, and a limit.
+fn top_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
+            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "by": {
+                "type": "string",
+                "enum": ["fan_in", "fan_out", "definitions"],
+                "description": "fan_in = most referenced; fan_out = calls the most distinct \
+                                names; definitions = defined in the most paths (>1 is ambiguous)"
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "maximum entries to return (default 20)"
+            }
+        },
+        "required": ["repo", "view_id", "by"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
+/// Input schema for `list`: a view selector plus conjunctive filters.
+fn list_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
+            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "path_prefix": {
+                "type": "string",
+                "description": "only symbols whose path starts with this (scopes to a crate or \
+                                directory)"
+            },
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "function", "struct", "enum", "trait", "impl", "module",
+                    "const", "static", "type_alias", "class", "interface"
+                ],
+                "description": "only symbols of this kind"
+            },
+            "name_contains": {
+                "type": "string",
+                "description": "only symbols whose name contains this substring"
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "maximum symbols to return (default 100)"
+            }
+        },
+        "required": ["repo", "view_id"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
 /// A minimal object schema for the argument-free `status` tool.
 fn status_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({ "type": "object", "additionalProperties": false });
@@ -244,6 +412,87 @@ fn view_args(arguments: &Option<Map<String, Value>>) -> Result<(String, String, 
         str_arg(arguments, "view_id")?,
         str_arg(arguments, "name")?,
     ))
+}
+
+/// Extract the required `(repo, view_id)` selector, for tools that address a
+/// whole view rather than a symbol in it.
+fn selector_args(arguments: &Option<Map<String, Value>>) -> Result<(String, String), String> {
+    Ok((str_arg(arguments, "repo")?, str_arg(arguments, "view_id")?))
+}
+
+/// Extract an optional non-negative integer argument, or `default` if absent.
+fn usize_arg(
+    arguments: &Option<Map<String, Value>>,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
+    match arguments.as_ref().and_then(|m| m.get(key)) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("argument '{key}' must be a non-negative integer, got {v}")),
+    }
+}
+
+/// Extract the required `by` ranking for `top`.
+fn ranking_arg(arguments: &Option<Map<String, Value>>) -> Result<Ranking, String> {
+    let raw = str_arg(arguments, "by")?;
+    match raw.as_str() {
+        "fan_in" => Ok(Ranking::FanIn),
+        "fan_out" => Ok(Ranking::FanOut),
+        "definitions" => Ok(Ranking::Definitions),
+        other => Err(format!(
+            "unknown ranking '{other}': expected one of fan_in, fan_out, definitions"
+        )),
+    }
+}
+
+/// Build the `list` filter from its optional arguments.
+fn filter_args(arguments: &Option<Map<String, Value>>) -> Result<SymbolFilter, String> {
+    let mut filter = SymbolFilter::default();
+    if let Some(prefix) = opt_str_arg(arguments, "path_prefix")? {
+        filter = filter.path_prefix(prefix);
+    }
+    if let Some(needle) = opt_str_arg(arguments, "name_contains")? {
+        filter = filter.name_contains(needle);
+    }
+    if let Some(raw) = opt_str_arg(arguments, "kind")? {
+        filter = filter.kind(parse_kind(&raw)?);
+    }
+    Ok(filter)
+}
+
+/// Extract an optional string argument, erroring if present but not a string.
+fn opt_str_arg(
+    arguments: &Option<Map<String, Value>>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match arguments.as_ref().and_then(|m| m.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(v) => Err(format!("argument '{key}' must be a string, got {v}")),
+    }
+}
+
+/// Parse a [`SymbolKind`] from its lowercase wire name.
+fn parse_kind(raw: &str) -> Result<SymbolKind, String> {
+    [
+        SymbolKind::Function,
+        SymbolKind::Struct,
+        SymbolKind::Enum,
+        SymbolKind::Trait,
+        SymbolKind::Impl,
+        SymbolKind::Module,
+        SymbolKind::Const,
+        SymbolKind::Static,
+        SymbolKind::TypeAlias,
+        SymbolKind::Class,
+        SymbolKind::Interface,
+    ]
+    .into_iter()
+    .find(|k| k.as_str() == raw)
+    .ok_or_else(|| format!("unknown kind '{raw}'"))
 }
 
 /// Extract the required `(repo, view_a, view_b)` selector for `diff`.
@@ -372,8 +621,169 @@ mod tests {
             names,
             vec![
                 "status", "search", "node", "callers", "callees", "impact", "explore", "diff",
+                "overview", "top", "list",
             ]
         );
+    }
+
+    // ---- aggregate / structural tools (#214) ------------------------------
+
+    /// `(repo, view_id)` plus whatever extra arguments a tool takes.
+    fn view_args_with(repo: &str, view: &str, extra: Value) -> Option<Map<String, Value>> {
+        let mut map = serde_json::json!({ "repo": repo, "view_id": view })
+            .as_object()
+            .unwrap()
+            .clone();
+        for (k, v) in extra.as_object().expect("object") {
+            map.insert(k.clone(), v.clone());
+        }
+        Some(map)
+    }
+
+    async fn call(tool: &str, extra: Value) -> Value {
+        let s = seeded_server().await;
+        let result = s
+            .dispatch(tool, view_args_with("r", "main", extra))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "tool {tool} errored");
+        serde_json::from_str(&result_text(&result)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn overview_tool_reports_the_shape_of_the_view() {
+        // The seeded view is lib.rs (`helper`) + main.rs (`main` calling helper).
+        let v = call("overview", serde_json::json!({})).await;
+        assert_eq!(v["files"], 2);
+        assert_eq!(v["symbols"], 2);
+        assert_eq!(v["references"], 1);
+        assert_eq!(v["by_kind"]["function"], 2);
+        assert_eq!(v["by_language"]["rust"], 2);
+        assert_eq!(v["largest_files"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn overview_bounds_the_largest_files_listing() {
+        let v = call("overview", serde_json::json!({ "largest": 1 })).await;
+        assert_eq!(v["largest_files"].as_array().unwrap().len(), 1);
+        assert_eq!(v["files"], 2, "the count itself is not truncated");
+    }
+
+    #[tokio::test]
+    async fn top_tool_ranks_by_fan_in() {
+        let v = call("top", serde_json::json!({ "by": "fan_in" })).await;
+        let helper = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "helper")
+            .expect("helper is referenced once");
+        assert_eq!(helper["score"], 1);
+        assert_eq!(helper["paths"], serde_json::json!(["lib.rs"]));
+    }
+
+    #[tokio::test]
+    async fn top_tool_ranks_by_definitions_for_the_ambiguity_report() {
+        let v = call("top", serde_json::json!({ "by": "definitions" })).await;
+        // Nothing is ambiguous in this view: every name has exactly one home.
+        assert!(
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["score"] == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn top_tool_reports_truncation() {
+        // Two names are defined in the seeded view (`helper`, `main`), so a
+        // limit of 1 must report that something was left out.
+        let v = call(
+            "top",
+            serde_json::json!({ "by": "definitions", "limit": 1 }),
+        )
+        .await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn top_tool_rejects_an_unknown_ranking() {
+        let s = seeded_server().await;
+        let result = s
+            .dispatch(
+                "top",
+                view_args_with("r", "main", serde_json::json!({ "by": "sideways" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("sideways"));
+    }
+
+    #[tokio::test]
+    async fn top_tool_requires_the_ranking_argument() {
+        let s = seeded_server().await;
+        let result = s
+            .dispatch("top", view_args_with("r", "main", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("by"));
+    }
+
+    #[tokio::test]
+    async fn list_tool_filters_by_kind() {
+        let v = call("list", serde_json::json!({ "kind": "function" })).await;
+        assert_eq!(v["total"], 2);
+        assert!(
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|l| l["item"]["kind"] == "function")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tool_filters_by_path_prefix() {
+        let v = call("list", serde_json::json!({ "path_prefix": "lib" })).await;
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["path"], "lib.rs");
+    }
+
+    #[tokio::test]
+    async fn list_tool_reports_truncation() {
+        let v = call("list", serde_json::json!({ "limit": 1 })).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn list_tool_rejects_an_unknown_kind() {
+        let s = seeded_server().await;
+        let result = s
+            .dispatch(
+                "list",
+                view_args_with("r", "main", serde_json::json!({ "kind": "gizmo" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("gizmo"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_tools_require_a_view_selector() {
+        let s = seeded_server().await;
+        for tool in ["overview", "top", "list"] {
+            let result = s.dispatch(tool, None).await.unwrap();
+            assert_eq!(result.is_error, Some(true), "{tool} should reject no args");
+            assert!(result_text(&result).contains("repo"));
+        }
     }
 
     #[tokio::test]

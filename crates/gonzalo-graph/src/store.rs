@@ -4,8 +4,22 @@
 //! it was assembled under, so location-bearing queries return [`Located`]
 //! results while the stored [`Symbol`]/[`Reference`] stay path-free.
 
-use crate::model::{CodeGraph, Located, Reference, Symbol};
+use crate::builder::Language;
+use crate::model::{
+    CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
+    ViewOverview,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// The language bucket for `path`, by extension. Unrecognized or extensionless
+/// paths bucket under `"unknown"` so counts always sum to the symbol total.
+fn language_of(path: &str) -> &'static str {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(Language::from_extension)
+        .map_or("unknown", Language::as_str)
+}
 
 /// Structural queries over an assembled view (a set of path-keyed slices).
 pub trait GraphStore: Send + Sync {
@@ -53,6 +67,127 @@ pub trait GraphStore: Send + Sync {
         }
         visited.remove(name);
         visited.into_iter().collect()
+    }
+
+    /// The aggregate shape of the whole view: counts, a breakdown by kind and
+    /// by language, and the `largest` files by symbol count.
+    ///
+    /// Answers "what is in this view" without the caller having to know a
+    /// symbol name first. Like [`impact`](Self::impact) this runs server-side
+    /// over the assembled graph; only the summary is returned.
+    fn overview(&self, largest: usize) -> ViewOverview {
+        let symbols = self.all_symbols();
+        let references = self.all_references();
+
+        let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
+        let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
+        for located in &symbols {
+            *by_kind
+                .entry(located.item.kind.as_str().to_string())
+                .or_default() += 1;
+            *by_language
+                .entry(language_of(&located.path).to_string())
+                .or_default() += 1;
+            *per_file.entry(located.path.as_str()).or_default() += 1;
+        }
+
+        // A file contributes to the view if it holds symbols *or* references.
+        let files: BTreeSet<&str> = symbols
+            .iter()
+            .map(|l| l.path.as_str())
+            .chain(references.iter().map(|l| l.path.as_str()))
+            .collect();
+
+        // Descending by symbol count, then by path so ties are deterministic.
+        let mut largest_files: Vec<FileSummary> = per_file
+            .into_iter()
+            .map(|(path, symbols)| FileSummary {
+                path: path.to_string(),
+                symbols,
+            })
+            .collect();
+        largest_files.sort_by(|a, b| b.symbols.cmp(&a.symbols).then_with(|| a.path.cmp(&b.path)));
+        largest_files.truncate(largest);
+
+        ViewOverview {
+            files: files.len(),
+            symbols: symbols.len(),
+            references: references.len(),
+            by_kind,
+            by_language,
+            largest_files,
+        }
+    }
+
+    /// The top `limit` symbol names by `ranking`, descending.
+    ///
+    /// [`Ranking::Definitions`] is the ambiguity report: any name scoring above
+    /// 1 is defined in several places, so every name-matched traversal through
+    /// it merges unrelated subgraphs.
+    fn top(&self, ranking: Ranking, limit: usize) -> Page<RankedSymbol> {
+        let mut definitions: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let symbols = self.all_symbols();
+        for located in &symbols {
+            definitions
+                .entry(located.item.name.as_str())
+                .or_default()
+                .insert(located.path.as_str());
+        }
+
+        let references = self.all_references();
+        let mut scores: BTreeMap<&str, usize> = BTreeMap::new();
+        match ranking {
+            Ranking::Definitions => {
+                for (name, paths) in &definitions {
+                    scores.insert(name, paths.len());
+                }
+            }
+            Ranking::FanIn => {
+                for located in &references {
+                    *scores.entry(located.item.name.as_str()).or_default() += 1;
+                }
+            }
+            Ranking::FanOut => {
+                let mut callees: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+                for located in &references {
+                    if let Some(from) = located.item.from.as_deref() {
+                        callees.entry(from).or_default().insert(&located.item.name);
+                    }
+                }
+                for (name, called) in &callees {
+                    scores.insert(name, called.len());
+                }
+            }
+        }
+
+        // Descending by score, then by name so ties are deterministic.
+        let mut ranked: Vec<RankedSymbol> = scores
+            .into_iter()
+            .map(|(name, score)| RankedSymbol {
+                name: name.to_string(),
+                score,
+                paths: definitions
+                    .get(name)
+                    .map(|paths| paths.iter().map(|p| p.to_string()).collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+        Page::new(ranked, limit)
+    }
+
+    /// Symbols matching `filter`, in path order, bounded by `limit`.
+    ///
+    /// The enumeration counterpart to [`definitions`](Self::definitions):
+    /// answers "what is in this crate" rather than "where is this name".
+    fn list(&self, filter: &SymbolFilter, limit: usize) -> Page<Located<Symbol>> {
+        let matched: Vec<Located<Symbol>> = self
+            .all_symbols()
+            .into_iter()
+            .filter(|located| filter.matches(located))
+            .collect();
+        Page::new(matched, limit)
     }
 }
 
@@ -169,7 +304,8 @@ impl GraphStore for InMemoryGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::build_rust;
+    use crate::builder::{build, build_rust};
+    use crate::model::SymbolKind;
 
     const SRC: &str = r#"
 fn helper() {}
@@ -282,5 +418,185 @@ fn other() { leaf(); }
         // a<->b mutually recurse; impact must terminate and not report the seed.
         assert_eq!(s.impact("a"), vec!["b".to_string()]);
         assert_eq!(s.impact("b"), vec!["a".to_string()]);
+    }
+
+    // ---- aggregate / structural queries (#214) ----------------------------
+
+    /// A small multi-path, multi-language view: `new` is defined in two crates
+    /// (the ambiguity #207 turns on), `helper` is called twice from one site,
+    /// and one file is deliberately larger than the others.
+    fn view() -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "crates/a/src/lib.rs",
+            build_rust(
+                "struct A; struct A2; fn new() -> A { A } \
+                 fn run() { new(); helper(); helper(); }",
+            ),
+        );
+        s.insert("crates/b/src/lib.rs", build_rust("fn new() -> u8 { 0 }"));
+        s.insert(
+            "scripts/tool.py",
+            build(Language::Python, "def main():\n    pass\n"),
+        );
+        s
+    }
+
+    #[test]
+    fn overview_counts_files_symbols_and_references() {
+        let o = view().overview(10);
+        assert_eq!(o.files, 3);
+        assert_eq!(o.symbols, view().all_symbols().len());
+        assert_eq!(o.references, view().all_references().len());
+    }
+
+    #[test]
+    fn overview_breaks_down_by_kind() {
+        let o = view().overview(10);
+        // Two structs in a/lib.rs; functions in every file.
+        assert_eq!(o.by_kind.get("struct"), Some(&2));
+        assert!(o.by_kind.get("function").is_some_and(|n| *n >= 3));
+    }
+
+    #[test]
+    fn overview_breaks_down_by_language_from_the_path_extension() {
+        let o = view().overview(10);
+        assert!(o.by_language.contains_key("rust"));
+        assert!(o.by_language.contains_key("python"));
+        // Every symbol lands in exactly one language bucket.
+        assert_eq!(o.by_language.values().sum::<usize>(), o.symbols);
+    }
+
+    #[test]
+    fn overview_buckets_unrecognized_extensions_as_unknown() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("build.zzz", build_rust("fn f() {}"));
+        let o = s.overview(10);
+        assert_eq!(o.by_language.get("unknown"), Some(&1));
+        assert_eq!(o.by_language.values().sum::<usize>(), o.symbols);
+    }
+
+    #[test]
+    fn overview_ranks_largest_files_by_symbol_count() {
+        let o = view().overview(10);
+        assert_eq!(o.largest_files[0].path, "crates/a/src/lib.rs");
+        assert!(o.largest_files[0].symbols >= o.largest_files[1].symbols);
+    }
+
+    #[test]
+    fn overview_bounds_largest_files_to_the_requested_limit() {
+        let o = view().overview(1);
+        assert_eq!(o.largest_files.len(), 1);
+        // The count itself is never truncated, only the per-file listing.
+        assert_eq!(o.files, 3);
+    }
+
+    #[test]
+    fn top_by_definitions_surfaces_names_defined_in_several_paths() {
+        let page = view().top(Ranking::Definitions, 10);
+        let new = page
+            .items
+            .iter()
+            .find(|r| r.name == "new")
+            .expect("`new` is defined twice");
+        assert_eq!(new.score, 2);
+        assert_eq!(
+            new.paths,
+            vec![
+                "crates/a/src/lib.rs".to_string(),
+                "crates/b/src/lib.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn top_by_fan_in_ranks_by_reference_count() {
+        let page = view().top(Ranking::FanIn, 10);
+        let helper = page
+            .items
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("`helper` is called twice");
+        assert_eq!(helper.score, 2);
+    }
+
+    #[test]
+    fn top_by_fan_out_ranks_by_distinct_callees() {
+        let page = view().top(Ranking::FanOut, 10);
+        let run = page
+            .items
+            .iter()
+            .find(|r| r.name == "run")
+            .expect("`run` calls new and helper");
+        assert_eq!(run.score, 2);
+    }
+
+    #[test]
+    fn top_is_ordered_by_descending_score() {
+        let page = view().top(Ranking::FanIn, 10);
+        let scores: Vec<usize> = page.items.iter().map(|r| r.score).collect();
+        let mut sorted = scores.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(scores, sorted);
+    }
+
+    #[test]
+    fn top_bounds_results_and_reports_truncation() {
+        let page = view().top(Ranking::FanIn, 1);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.truncated);
+        assert!(page.total > 1);
+    }
+
+    #[test]
+    fn list_filters_by_path_prefix() {
+        let page = view().list(&SymbolFilter::default().path_prefix("crates/b"), 100);
+        assert!(!page.items.is_empty());
+        assert!(page.items.iter().all(|l| l.path == "crates/b/src/lib.rs"));
+    }
+
+    #[test]
+    fn list_filters_by_kind() {
+        let page = view().list(&SymbolFilter::default().kind(SymbolKind::Struct), 100);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.items.iter().all(|l| l.item.kind == SymbolKind::Struct));
+    }
+
+    #[test]
+    fn list_filters_by_name_substring() {
+        let page = view().list(&SymbolFilter::default().name_contains("ru"), 100);
+        assert!(page.items.iter().any(|l| l.item.name == "run"));
+        assert!(page.items.iter().all(|l| l.item.name.contains("ru")));
+    }
+
+    #[test]
+    fn list_combines_filters_conjunctively() {
+        let page = view().list(
+            &SymbolFilter::default()
+                .path_prefix("crates/a")
+                .kind(SymbolKind::Struct),
+            100,
+        );
+        assert_eq!(page.items.len(), 2);
+        assert!(
+            page.items
+                .iter()
+                .all(|l| l.path.starts_with("crates/a") && l.item.kind == SymbolKind::Struct)
+        );
+    }
+
+    #[test]
+    fn list_bounds_results_and_reports_truncation() {
+        let page = view().list(&SymbolFilter::default(), 1);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.truncated);
+        assert_eq!(page.total, view().all_symbols().len());
+    }
+
+    #[test]
+    fn list_without_filters_returns_everything_untruncated() {
+        let page = view().list(&SymbolFilter::default(), 1000);
+        assert!(!page.truncated);
+        assert_eq!(page.items.len(), view().all_symbols().len());
     }
 }

@@ -8,7 +8,10 @@ use gonzalo_core::{
     BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, Manifest, PutResult, Record,
     RecordKey, Result, Revision, Store,
 };
-use gonzalo_graph::{GraphStore, Located, Reference, Symbol, assemble};
+use gonzalo_graph::{
+    GraphStore, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
+    ViewOverview, assemble,
+};
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
 use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::Connection;
@@ -205,6 +208,39 @@ impl Service {
     /// Transitive caller closure of `name` (impact of changing it).
     pub async fn graph_impact(&self, repo: &str, view_id: &str, name: &str) -> Result<Vec<String>> {
         Ok(self.view(repo, view_id).await?.impact(name))
+    }
+
+    /// Aggregate shape of the view: counts, breakdowns by kind and language,
+    /// and the `largest` files by symbol count.
+    pub async fn graph_overview(
+        &self,
+        repo: &str,
+        view_id: &str,
+        largest: usize,
+    ) -> Result<ViewOverview> {
+        Ok(self.view(repo, view_id).await?.overview(largest))
+    }
+
+    /// Top `limit` symbol names in the view by `ranking`.
+    pub async fn graph_top(
+        &self,
+        repo: &str,
+        view_id: &str,
+        ranking: Ranking,
+        limit: usize,
+    ) -> Result<Page<RankedSymbol>> {
+        Ok(self.view(repo, view_id).await?.top(ranking, limit))
+    }
+
+    /// Symbols in the view matching `filter`, bounded by `limit`.
+    pub async fn graph_list(
+        &self,
+        repo: &str,
+        view_id: &str,
+        filter: &SymbolFilter,
+        limit: usize,
+    ) -> Result<Page<Located<Symbol>>> {
+        Ok(self.view(repo, view_id).await?.list(filter, limit))
     }
 
     /// Structural diff of two views of `repo` (`view_a` → `view_b`): symbols and

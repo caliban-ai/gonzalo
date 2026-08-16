@@ -59,6 +59,30 @@ impl Language {
         }
     }
 
+    /// Lowercase name, used as a stable key when bucketing symbols by language.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::CSharp => "csharp",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Bash => "bash",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+            Self::Lua => "lua",
+            Self::Scala => "scala",
+            Self::Elixir => "elixir",
+        }
+    }
+
     fn ts_language(self) -> tree_sitter::Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),

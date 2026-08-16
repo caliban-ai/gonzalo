@@ -2,6 +2,7 @@
 //! gonzalo record and shared/synced like any other data.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// What kind of Rust item a symbol is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -20,6 +21,26 @@ pub enum SymbolKind {
     Class,
     /// An interface (TypeScript `interface`, and similar constructs).
     Interface,
+}
+
+impl SymbolKind {
+    /// Lowercase name, used as a stable key when bucketing symbols by kind.
+    /// Matches the `snake_case` serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Trait => "trait",
+            Self::Impl => "impl",
+            Self::Module => "module",
+            Self::Const => "const",
+            Self::Static => "static",
+            Self::TypeAlias => "type_alias",
+            Self::Class => "class",
+            Self::Interface => "interface",
+        }
+    }
 }
 
 /// A defined symbol with its in-file location (1-based line numbers).
@@ -78,5 +99,121 @@ impl CodeGraph {
     /// Deserialize a slice from its blob bytes.
     pub fn from_slice_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
+    }
+}
+
+/// A file and the number of symbols defined in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSummary {
+    pub path: String,
+    pub symbols: usize,
+}
+
+/// The aggregate shape of a whole view — what is here, rather than facts about
+/// one symbol. `by_kind` and `by_language` are keyed by the lowercase names from
+/// [`SymbolKind::as_str`] and [`Language::as_str`](crate::Language::as_str);
+/// symbols in files with an unrecognized extension bucket under `"unknown"`, so
+/// `by_language` always sums to `symbols`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewOverview {
+    /// Distinct paths contributing symbols or references.
+    pub files: usize,
+    pub symbols: usize,
+    pub references: usize,
+    pub by_kind: BTreeMap<String, usize>,
+    pub by_language: BTreeMap<String, usize>,
+    /// Files with the most symbols, descending. Bounded by the caller's limit;
+    /// `files` above is the untruncated count.
+    pub largest_files: Vec<FileSummary>,
+}
+
+/// A symbol name ranked by some score, with the paths that define it. `paths`
+/// is empty when the name is referenced but never defined in this view (a call
+/// into a dependency, or a name the parser saw but no slice declares).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedSymbol {
+    pub name: String,
+    pub score: usize,
+    pub paths: Vec<String>,
+}
+
+/// What [`GraphStore::top`](crate::GraphStore::top) ranks by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ranking {
+    /// Number of references to the name — how heavily it is called.
+    FanIn,
+    /// Number of distinct names called from within it.
+    FanOut,
+    /// Number of definitions of the name. A score above 1 means the name is
+    /// ambiguous, which is what makes name-matched traversal unreliable.
+    Definitions,
+}
+
+/// A conjunctive filter for [`GraphStore::list`](crate::GraphStore::list) — every
+/// set field must match. All fields unset matches every symbol.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolFilter {
+    pub path_prefix: Option<String>,
+    pub kind: Option<SymbolKind>,
+    pub name_contains: Option<String>,
+}
+
+impl SymbolFilter {
+    /// Restrict to symbols whose path starts with `prefix` (scopes to a crate
+    /// or directory).
+    #[must_use]
+    pub fn path_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.path_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Restrict to one [`SymbolKind`].
+    #[must_use]
+    pub fn kind(mut self, kind: SymbolKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    /// Restrict to symbols whose name contains `needle`.
+    #[must_use]
+    pub fn name_contains(mut self, needle: impl Into<String>) -> Self {
+        self.name_contains = Some(needle.into());
+        self
+    }
+
+    /// Whether `located` satisfies every set field.
+    pub fn matches(&self, located: &Located<Symbol>) -> bool {
+        self.path_prefix
+            .as_ref()
+            .is_none_or(|p| located.path.starts_with(p.as_str()))
+            && self.kind.is_none_or(|k| located.item.kind == k)
+            && self
+                .name_contains
+                .as_ref()
+                .is_none_or(|n| located.item.name.contains(n.as_str()))
+    }
+}
+
+/// A bounded slice of a larger result set. `total` is the untruncated match
+/// count, so a caller can always tell what it did not see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+impl<T> Page<T> {
+    /// Take at most `limit` of `items`, recording the pre-truncation total.
+    pub fn new(items: Vec<T>, limit: usize) -> Self {
+        let total = items.len();
+        let mut items = items;
+        items.truncate(limit);
+        Self {
+            truncated: items.len() < total,
+            items,
+            total,
+        }
     }
 }
