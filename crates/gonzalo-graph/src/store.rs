@@ -7,7 +7,7 @@
 use crate::builder::Language;
 use crate::model::{
     CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
-    ViewOverview,
+    SymbolKind, ViewOverview,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -189,6 +189,87 @@ pub trait GraphStore: Send + Sync {
             .collect();
         Page::new(matched, limit)
     }
+
+    /// Symbols with no inbound reference anywhere in the view — dead-code
+    /// *candidates*, in path then line order.
+    ///
+    /// With `exclude_tests` (the useful default) symbols inside a test scope are
+    /// dropped: members of a `mod tests` / `mod test` block, by line range, and
+    /// anything under a `tests/` directory. On gonzalo itself that filter is the
+    /// difference between 515 hits and 40 — without it the result is ~92% noise.
+    ///
+    /// **This is a heuristic, and its false positives are real.** It inherits
+    /// every limit of the name-matched extractor underneath:
+    ///
+    /// - **Calls inside macro arguments are not recorded at all** (#216). Rust macro
+    ///   bodies parse as token trees, so `assert_eq!(f(), 1)` and
+    ///   `println!("{}", g())` contribute no reference. Anything exercised
+    ///   mainly through assertions therefore looks uncalled — on gonzalo itself
+    ///   this is what makes `Language::from_extension` a false positive.
+    /// - A function used only as a value (`map_err(be)`, `and_then(f)`) is a
+    ///   path expression, not a call, so higher-order usage is invisible too.
+    /// - Names are unresolved: an unused `foo` is hidden by any other `foo` that
+    ///   is used.
+    /// - Conversely a reference from anywhere counts, including from tests and
+    ///   from the symbol itself, so recursive-only and test-only functions are
+    ///   *not* reported even though they may be dead.
+    ///
+    /// Treat every result as a lead to confirm, never as proof.
+    fn unreferenced(
+        &self,
+        filter: &SymbolFilter,
+        exclude_tests: bool,
+        limit: usize,
+    ) -> Page<Located<Symbol>> {
+        let referenced: BTreeSet<String> = self
+            .all_references()
+            .into_iter()
+            .map(|located| located.item.name)
+            .collect();
+
+        let symbols = self.all_symbols();
+        // Line ranges of `mod tests` blocks, per path, so members can be
+        // excluded by containment rather than by name.
+        let test_scopes: Vec<(String, usize, usize)> = symbols
+            .iter()
+            .filter(|l| l.item.kind == SymbolKind::Module && is_test_scope_name(&l.item.name))
+            .map(|l| (l.path.clone(), l.item.start_line, l.item.end_line))
+            .collect();
+
+        let in_test_scope = |located: &Located<Symbol>| {
+            in_tests_dir(&located.path)
+                || test_scopes.iter().any(|(path, start, end)| {
+                    *path == located.path
+                        && located.item.start_line >= *start
+                        && located.item.end_line <= *end
+                })
+        };
+
+        let mut matched: Vec<Located<Symbol>> = symbols
+            .into_iter()
+            .filter(|located| !referenced.contains(&located.item.name))
+            .filter(|located| filter.matches(located))
+            .filter(|located| !exclude_tests || !in_test_scope(located))
+            .collect();
+
+        matched.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| a.item.start_line.cmp(&b.item.start_line))
+        });
+        Page::new(matched, limit)
+    }
+}
+
+/// Whether a module name marks a test scope (Rust's `mod tests` convention).
+fn is_test_scope_name(name: &str) -> bool {
+    name == "tests" || name == "test"
+}
+
+/// Whether `path` lies under a `tests/` directory. Compares whole path
+/// components, so `contests/entry.rs` does not match.
+fn in_tests_dir(path: &str) -> bool {
+    path.split('/').any(|part| part == "tests")
 }
 
 /// An in-memory [`GraphStore`], one slice per path.
@@ -598,5 +679,160 @@ fn other() { leaf(); }
         let page = view().list(&SymbolFilter::default(), 1000);
         assert!(!page.truncated);
         assert_eq!(page.items.len(), view().all_symbols().len());
+    }
+
+    // ---- unreferenced / dead-code candidates (#214) -----------------------
+
+    /// A view with one genuinely-unused production function (`orphan`), one
+    /// used one (`used`), and a `mod tests` whose members are unused outside
+    /// the module — the 92%-noise population the filter exists to remove.
+    fn dead() -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "src/lib.rs",
+            build_rust(
+                "fn used() {}\n\
+                 fn caller() { used(); }\n\
+                 fn orphan() {}\n\
+                 #[cfg(test)]\n\
+                 mod tests {\n    \
+                     fn t_helper() {}\n    \
+                     fn t_only() {}\n\
+                 }\n",
+            ),
+        );
+        s
+    }
+
+    fn names(page: &Page<Located<Symbol>>) -> Vec<&str> {
+        page.items.iter().map(|l| l.item.name.as_str()).collect()
+    }
+
+    #[test]
+    fn unreferenced_finds_symbols_with_no_inbound_reference() {
+        let page = dead().unreferenced(&SymbolFilter::default(), true, 100);
+        assert!(names(&page).contains(&"orphan"));
+        assert!(!names(&page).contains(&"used"));
+    }
+
+    #[test]
+    fn unreferenced_excludes_mod_tests_members_by_default() {
+        let page = dead().unreferenced(&SymbolFilter::default(), true, 100);
+        // Both live inside `mod tests`' line range, so neither is a candidate.
+        assert!(!names(&page).contains(&"t_helper"));
+        assert!(!names(&page).contains(&"t_only"));
+        // The module symbol itself is a test scope, not a candidate.
+        assert!(!names(&page).contains(&"tests"));
+    }
+
+    #[test]
+    fn unreferenced_keeps_test_members_when_not_excluding() {
+        let page = dead().unreferenced(&SymbolFilter::default(), false, 100);
+        assert!(names(&page).contains(&"t_only"));
+        assert!(names(&page).contains(&"orphan"));
+    }
+
+    #[test]
+    fn unreferenced_excludes_files_under_a_tests_directory() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "tests/it.rs",
+            build_rust("fn only_in_integration_test() {}"),
+        );
+        s.insert("src/lib.rs", build_rust("fn orphan() {}"));
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        assert_eq!(names(&page), vec!["orphan"]);
+    }
+
+    #[test]
+    fn unreferenced_does_not_treat_a_tests_substring_as_a_directory() {
+        let mut s = InMemoryGraphStore::new();
+        // `contests` merely contains "tests"; it is not a test directory.
+        s.insert("contests/entry.rs", build_rust("fn orphan() {}"));
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        assert_eq!(names(&page), vec!["orphan"]);
+    }
+
+    #[test]
+    fn unreferenced_counts_a_reference_from_anywhere_including_tests() {
+        let mut s = InMemoryGraphStore::new();
+        // `prod` is called only from a test — conservatively still "referenced",
+        // so it is never reported as dead.
+        s.insert(
+            "src/lib.rs",
+            build_rust(
+                "fn prod() {}\n\
+                 #[cfg(test)]\n\
+                 mod tests {\n    \
+                     fn t() { prod(); }\n\
+                 }\n",
+            ),
+        );
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        assert!(!names(&page).contains(&"prod"));
+    }
+
+    #[test]
+    fn unreferenced_flags_symbols_only_called_inside_macros() {
+        let mut s = InMemoryGraphStore::new();
+        // Known blind spot (#216), pinned deliberately: macro bodies parse as
+        // token trees, so the call to `f` is never recorded and `f` is reported
+        // as a candidate despite being used. When #216 lands this test flips.
+        s.insert(
+            "src/lib.rs",
+            build_rust("fn f() -> u8 { 0 }\nfn g() { assert_eq!(f(), 0); }\n"),
+        );
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        assert!(names(&page).contains(&"f"), "documents a false positive");
+    }
+
+    #[test]
+    fn unreferenced_does_not_flag_recursive_functions() {
+        let mut s = InMemoryGraphStore::new();
+        // A self-reference counts, so a recursive-only function is a false
+        // negative rather than a confidently-wrong dead-code report.
+        s.insert("src/lib.rs", build_rust("fn recur() { recur(); }"));
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        assert!(!names(&page).contains(&"recur"));
+    }
+
+    #[test]
+    fn unreferenced_applies_the_symbol_filter() {
+        let page =
+            dead().unreferenced(&SymbolFilter::default().kind(SymbolKind::Struct), true, 100);
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn unreferenced_results_carry_their_path() {
+        let page = dead().unreferenced(&SymbolFilter::default(), true, 100);
+        assert!(page.items.iter().all(|l| l.path == "src/lib.rs"));
+    }
+
+    #[test]
+    fn unreferenced_bounds_results_and_reports_truncation() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("src/lib.rs", build_rust("fn a() {} fn b() {} fn c() {}"));
+        let page = s.unreferenced(&SymbolFilter::default(), true, 2);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.truncated);
+        assert_eq!(page.total, 3);
+    }
+
+    #[test]
+    fn unreferenced_is_ordered_by_path_then_line() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("src/b.rs", build_rust("fn z() {}"));
+        s.insert("src/a.rs", build_rust("fn y() {}\nfn x() {}"));
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        let seen: Vec<(&str, &str)> = page
+            .items
+            .iter()
+            .map(|l| (l.path.as_str(), l.item.name.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("src/a.rs", "y"), ("src/a.rs", "x"), ("src/b.rs", "z")]
+        );
     }
 }
