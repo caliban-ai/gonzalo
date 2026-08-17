@@ -11,6 +11,30 @@ the patch version for fixes.
 
 ### Fixed
 
+- **Calls inside Rust macro arguments are now recorded as references** (#216).
+  Macro arguments parse as a `token_tree` of raw tokens rather than expressions,
+  so `assert_eq!(f(), 1)` contained no `call_expression` and the call to `f` was
+  never seen. Because assertions are where much of a codebase is exercised, this
+  silently removed a large share of the call graph: `callers`, `callees`,
+  `impact` and `top by=fan_in` all undercounted, and `unreferenced` reported
+  live functions as dead.
+
+  Re-indexing gonzalo itself, with an identical file set (1 852 symbols both
+  runs), references go from 10 247 to **12 196 — +1 949 edges, +19.0%**.
+  `Language::from_extension`, the symbol that exposed the bug, goes from 0
+  recorded references to 28.
+
+  Detection is token-level: an identifier whose immediate next sibling is a
+  parenthesised token tree. A nested macro has a `!` between the two and is
+  excluded. It is deliberately over- rather than under-inclusive — a tuple-struct
+  pattern like `Some(_)` reads as a call — which matches a graph that already
+  records constructors and enum variants as calls.
+
+  The other 17 grammars were audited for the same opaque-node hole. Only C/C++
+  has one: a `#define` body is a single opaque `preproc_arg` token with no child
+  nodes to read. It is left in place and pinned by a test so the gap is
+  discoverable rather than silent.
+
 - **The indexer no longer walks vendored bundles or gitignored build output**
   (#209). `is_indexable` skipped only `target`, `.git`, and dotted components, so
   half of a real repo's graph was not that repo's code. Membership now lives in

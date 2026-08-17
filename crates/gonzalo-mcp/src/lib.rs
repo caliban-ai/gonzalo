@@ -122,14 +122,13 @@ impl GonzaloMcp {
             Tool::new(
                 "unreferenced",
                 "Symbols with no inbound reference — dead-code CANDIDATES, not dead code. This is \
-                 a heuristic over a name-matched graph and it does produce false positives. \
-                 Calls inside macro arguments are not recorded at all (`assert_eq!(f(), 1)` \
-                 registers nothing), so anything exercised mainly through assertions looks \
-                 uncalled; a function used only as a value (higher-order usage, e.g. \
-                 `map_err(be)`) is likewise invisible; and an unused name is hidden by any \
-                 same-named symbol that is used. References from tests and from the symbol itself \
-                 do count, so test-only and recursive-only functions are never reported. Confirm \
-                 every hit against the source before acting on it.",
+                 a heuristic over a name-matched graph and it does produce false positives. A \
+                 function used only as a value (higher-order usage, e.g. `map_err(be)`) is a path \
+                 expression rather than a call, so it registers nothing and will be reported \
+                 wrongly; and an unused name is hidden by any same-named symbol that is used. \
+                 References from tests and from the symbol itself do count, so test-only and \
+                 recursive-only functions are never reported. Confirm every hit against the \
+                 source before acting on it.",
                 unreferenced_schema(),
             ),
         ]
@@ -993,10 +992,6 @@ mod tests {
         assert!(
             description.contains("higher-order"),
             "must name the higher-order-usage blind spot: {description}"
-        );
-        assert!(
-            description.contains("macro"),
-            "must name the macro-argument blind spot, the dominant false positive: {description}"
         );
     }
 
