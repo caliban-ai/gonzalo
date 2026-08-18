@@ -38,6 +38,7 @@ surfacing, plus capability layers — all consumed through the `gonzalo` facade
 | `gonzalo-ticket-config` | multi-connection ticket config (`tickets.toml`) + provider registry → `Box<dyn TicketSource>` |
 | `gonzalo-knowledge` `[knowledge]` | knowledge store: `KnowledgeStore` over records + vector by `RecordKey` (ADR 0011) |
 | `gonzalo-proto` / `gonzalo-server` | daemon: gRPC + HTTP/JSON over one service, optional bearer auth (`gonzalod` bin); `TicketSync` RPC + `POST /v1/tickets/sync` |
+| `gonzalo-mcp` | MCP server exposing the code graph to agents over stdio — see [the MCP guide](docs/guide/src/mcp.md) |
 | `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync`, `ticket sync`/`list`/`get` |
 
 Every storage substrate passes a shared conformance suite shipped by
