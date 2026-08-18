@@ -11,6 +11,22 @@ the patch version for fixes.
 
 ### Fixed
 
+- **An incremental re-index now prunes paths a laxer run admitted** (#209
+  follow-up). The filter added in #218 only applied to newly walked or changed
+  files, so an *existing* view kept its vendored bundles forever: a bundle never
+  changes, so it never appears in the git diff and was never reconsidered — and
+  once a base commit is recorded there is no full walk to clean it up. Upgrading
+  therefore fixed new views only, which is the case least in need of fixing.
+
+  The carried-forward set is now re-checked against the current rules, including
+  `.gitignore` — necessary because `docs/guide/book/` is build output excluded by
+  ignore rules rather than by any directory-name rule, so a path-only prune left
+  it behind.
+
+  Re-indexing the existing `caliban-ai/caliban` view: 17 162 symbols → **8 549**,
+  with vendored symbols going 8 618 → **0** and the largest file becoming
+  `caliban/src/tui/events.rs` (142) instead of a copy of `mermaid.min.js`.
+
 - **An unknown `repo`/`view_id` is now an error, not an empty result** (#210).
   Every graph query returned `[]` with `isError: false` when the selector named
   no indexed view, so a one-character typo in `view_id` was indistinguishable

@@ -463,6 +463,20 @@ async fn build_desired_incremental(
     // path-only rules apply, and only files are ever counted.
     let mut ignored = IgnoredCounts::default();
 
+    // Re-apply the filter to paths carried forward from the previous run, not
+    // just to changed ones. A view indexed under laxer rules keeps its vendored
+    // bundles forever otherwise: `mermaid.min.js` never changes, so it never
+    // appears in the diff, so an incremental run never reconsiders it — and once
+    // a base commit is recorded there is no full walk to clean it up. Making the
+    // carried-forward set self-healing is what lets an existing view benefit
+    // from #209 rather than only newly created ones.
+    let stale = walk::stale_entries(src, filter, desired.keys().map(String::as_str));
+    for rel in stale {
+        desired.remove(&rel);
+        staging.removes.push(rel);
+        ignored.files += 1;
+    }
+
     for rel in changed.added.iter().chain(changed.modified.iter()) {
         if !filter.is_indexable(rel) {
             // A path that a previous, laxer walk admitted must also be dropped
@@ -1267,6 +1281,61 @@ mod tests {
             graph.all_symbols().iter().all(|s| s.path == "a.rs"),
             "no symbol may come from a vendored bundle"
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_reindex_prunes_paths_a_laxer_run_admitted() {
+        // The upgrade path: a view indexed before the filter existed still holds
+        // vendored bundles. They never change, so they never appear in the git
+        // diff, and once a base commit is recorded there is no full walk — so
+        // without pruning the carried-forward set they would persist forever.
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        write_file(src.path(), "vendor.min.js", "var a=1,e=2;");
+
+        // Index once with a filter that admits the bundle, standing in for the
+        // pre-#209 behaviour.
+        let lax = IndexFilter::new(&["vendor.min.js".to_string()]);
+        let first = index_with(root.path(), src.path(), "r", "main", &lax)
+            .await
+            .unwrap();
+        assert_eq!(first.files, 2, "the bundle is in the view to begin with");
+
+        // Re-index with the default rules. The bundle is unchanged, so only the
+        // carried-forward prune can remove it.
+        let second = index_with(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &IndexFilter::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.deleted, 1, "the bundle is dropped from the view");
+        assert_eq!(second.ignored.files, 1);
+
+        let graph =
+            SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
+        assert!(
+            graph.all_symbols().iter().all(|s| s.path == "a.rs"),
+            "no vendored symbol may survive the re-index"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_reindex_keeps_paths_the_filter_still_admits() {
+        // The prune must not eat ordinary carried-forward files.
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        write_file(src.path(), "b.rs", "fn b() {}");
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        let second = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(second.deleted, 0, "nothing legitimate is pruned");
+        assert_eq!(second.ignored.files, 0);
     }
 
     #[tokio::test]
