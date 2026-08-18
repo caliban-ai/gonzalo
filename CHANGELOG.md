@@ -25,6 +25,16 @@ the patch version for fixes.
 
 ### Added
 
+- **A guide chapter for the MCP server** (#208) — `docs/guide/src/mcp.md`, covering
+  install → index → register → verify → keep fresh, a tool reference grouped by the
+  question each tool answers, and the capability boundaries. It leads with the thing
+  nothing in the repo stated: the server only *reads*, `gonzalo index` writes, so an
+  unindexed setup answers every query forever with no indication why. It also records
+  the traps found while wiring the server up for real — `GONZALO_ROOT` not expanding
+  `~` (#211), `~/.cargo/bin` missing from the non-interactive shells an MCP client
+  spawns, and needing to reconnect the server to pick up a newly installed binary —
+  plus a troubleshooting table keyed by symptom.
+
 - **`views` discovery tool and a view count in `status`** (#210). `views` lists
   every indexed `(repo, view_id)` with its file count and the commit it was
   indexed at, which makes the server self-describing rather than dependent on
