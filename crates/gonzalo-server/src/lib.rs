@@ -12,4 +12,4 @@ pub use auth::{Access, Auth, Principal};
 pub use config::StoreConfig;
 pub use grpc::{GrpcAdapter, serve_grpc};
 pub use http::{router, serve_http};
-pub use service::Service;
+pub use service::{Service, ViewSummary};

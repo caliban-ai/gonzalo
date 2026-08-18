@@ -18,6 +18,18 @@ use gonzalo_ticket_config::Connection;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// One indexed view, as reported by [`Service::graph_views`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewSummary {
+    pub repo: String,
+    pub view_id: String,
+    /// Paths in the view's manifest.
+    pub files: usize,
+    /// The commit this view was last indexed at, when `gonzalo index` recorded
+    /// one. Compare against the checkout's HEAD to detect a stale view.
+    pub base_commit: Option<String>,
+}
+
 /// Wraps a `Store` (records) and a `BlobStore` (content-addressed slices) and
 /// exposes their operations to the daemon transports. The daemon backs both
 /// with the same `FsStore`.
@@ -141,17 +153,76 @@ impl Service {
     // preferring the view's persistent SQLite graph and falling back to
     // on-the-fly slice assembly.
 
-    /// Load a view's manifest, or an empty manifest if the view has none yet —
-    /// an unknown/empty view simply yields empty query results.
+    /// Load a view's manifest, or [`CoreError::NotFound`] if the view has none.
+    ///
+    /// This used to return an empty manifest for an unknown view, which made a
+    /// misconfigured selector indistinguishable from a query that found nothing
+    /// (#210) — a typo in `view_id` produced a confident, wrong "nothing calls
+    /// this" rather than an error the caller could notice.
     async fn load_manifest(&self, repo: &str, view_id: &str) -> Result<Manifest> {
-        match self.store.get(&Manifest::key(repo, view_id)).await? {
+        let key = Manifest::key(repo, view_id);
+        match self.store.get(&key).await? {
             Some(record) => Manifest::from_body(&record.body),
-            None => Ok(Manifest::new()),
+            None => Err(CoreError::NotFound(key)),
         }
+    }
+
+    /// Whether `(repo, view_id)` names a view that exists — a persistent graph
+    /// under `graph_root`, or a manifest record in the store.
+    pub async fn view_exists(&self, repo: &str, view_id: &str) -> Result<bool> {
+        if let Some(root) = &self.graph_root
+            && view_db_path(root, repo, view_id).exists()
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .store
+            .get(&Manifest::key(repo, view_id))
+            .await?
+            .is_some())
+    }
+
+    /// Every indexed view, for discovery. Cheap by design — this is the call an
+    /// agent makes first, so it reads manifests (and the recorded base commit)
+    /// rather than loading each view's graph. Use `overview` for symbol counts.
+    pub async fn graph_views(&self) -> Result<Vec<ViewSummary>> {
+        let prefix = KeyPrefix {
+            namespace: None,
+            collection: Some(Manifest::collection().to_string()),
+        };
+        let mut out = Vec::new();
+        for key in self.store.list(&prefix).await? {
+            let Some(record) = self.store.get(&key).await? else {
+                continue; // listed then removed — skip rather than fail discovery
+            };
+            let manifest = Manifest::from_body(&record.body)?;
+            out.push(ViewSummary {
+                files: manifest.entries.len(),
+                base_commit: self.recorded_base(&key.namespace, &key.id),
+                repo: key.namespace,
+                view_id: key.id,
+            });
+        }
+        out.sort_by(|a, b| a.repo.cmp(&b.repo).then_with(|| a.view_id.cmp(&b.view_id)));
+        Ok(out)
+    }
+
+    /// The commit a view was last indexed at, recorded by `gonzalo index`
+    /// alongside the view's graph. Lets a caller detect a stale view by
+    /// comparing against the checkout's HEAD — the quieter form of #210, where
+    /// results are plausible but describe code that has moved on.
+    fn recorded_base(&self, repo: &str, view_id: &str) -> Option<String> {
+        let root = self.graph_root.as_ref()?;
+        let base = view_db_path(root, repo, view_id).with_extension("base");
+        let sha = std::fs::read_to_string(base).ok()?;
+        let sha = sha.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     /// A queryable graph for `(repo, view_id)`: the persistent SQLite graph if
     /// one has been indexed under `graph_root`, else assembled from slices.
+    ///
+    /// Errors with [`CoreError::NotFound`] when the selector names no view.
     async fn view(&self, repo: &str, view_id: &str) -> Result<Box<dyn GraphStore>> {
         if let Some(root) = &self.graph_root {
             let db = view_db_path(root, repo, view_id);
@@ -367,13 +438,9 @@ mod tests {
             vec!["main".to_string()]
         );
 
-        // A view without an indexed db falls back to assembly (empty here).
-        assert!(
-            svc.graph_impact("r", "absent", "x")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // A view with neither an indexed db nor a manifest is unresolvable, and
+        // now says so rather than falling back to an empty assembly (#210).
+        assert!(svc.graph_impact("r", "absent", "x").await.is_err());
     }
 
     #[tokio::test]
@@ -430,21 +497,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_view_yields_empty_results() {
+    async fn unknown_view_is_an_error_not_an_empty_result() {
+        // Inverted from `unknown_view_yields_empty_results`: returning `[]` for
+        // an unresolvable selector made a typo indistinguishable from a genuine
+        // miss, so callers reported "nothing calls this" as fact (#210).
         let fs = fresh_fs();
         let svc = Service::new(fs.clone(), fs);
+        for res in [
+            svc.graph_definitions("r", "absent", "x").await.err(),
+            svc.graph_impact("r", "absent", "x").await.err(),
+        ] {
+            let err = res.expect("an unknown view must error");
+            assert!(
+                matches!(&err, CoreError::NotFound(k) if k.namespace == "r" && k.id == "absent"),
+                "the error must name the selector: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_symbol_in_a_known_view_is_still_empty() {
+        // The other half: only the *selector* became an error. A real miss in a
+        // real view must stay an ordinary empty result.
+        let fs = fresh_fs();
+        seed_view(&fs, "r", "main", &[("lib.rs", "fn helper() {}")]).await;
+        let svc = Service::new(fs.clone(), fs);
         assert!(
-            svc.graph_definitions("r", "absent", "x")
+            svc.graph_definitions("r", "main", "nonexistent")
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            svc.graph_impact("r", "absent", "x")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+    }
+
+    #[tokio::test]
+    async fn graph_views_lists_indexed_views() {
+        let fs = fresh_fs();
+        seed_view(&fs, "r", "main", &[("lib.rs", "fn helper() {}")]).await;
+        seed_view(&fs, "other", "dev", &[("a.rs", "fn a() {}")]).await;
+        let svc = Service::new(fs.clone(), fs);
+
+        let views = svc.graph_views().await.unwrap();
+        let pairs: Vec<(&str, &str)> = views
+            .iter()
+            .map(|v| (v.repo.as_str(), v.view_id.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("other", "dev"), ("r", "main")], "sorted");
+        assert_eq!(views[1].files, 1);
+    }
+
+    #[tokio::test]
+    async fn view_exists_distinguishes_known_from_unknown() {
+        let fs = fresh_fs();
+        seed_view(&fs, "r", "main", &[("lib.rs", "fn helper() {}")]).await;
+        let svc = Service::new(fs.clone(), fs);
+        assert!(svc.view_exists("r", "main").await.unwrap());
+        assert!(!svc.view_exists("r", "mian").await.unwrap());
+        assert!(!svc.view_exists("nope", "main").await.unwrap());
     }
 
     #[tokio::test]
