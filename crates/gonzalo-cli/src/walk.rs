@@ -137,6 +137,28 @@ pub fn source_files(
     Ok((out, ignored))
 }
 
+/// Of `paths`, those the current rules would no longer admit under the tree at
+/// `root` — applying both the path-only rules and, when `root` is a git
+/// repository, `.gitignore`.
+///
+/// This is what makes an existing view self-healing when the rules tighten. The
+/// incremental driver carries unchanged paths forward untouched, and a vendored
+/// bundle never changes, so it never appears in a git diff and is never
+/// reconsidered. Gitignore has to be part of the check: `docs/guide/book/` is
+/// build output excluded by `.gitignore` rather than by any directory-name rule,
+/// so a path-only prune leaves it behind.
+pub fn stale_entries<'a>(
+    root: &Path,
+    filter: &IndexFilter,
+    paths: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let repo = git2::Repository::open(root).ok();
+    paths
+        .filter(|rel| !filter.is_indexable(rel) || git_ignores(repo.as_ref(), rel))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Whether git considers `rel` ignored. Errors are treated as "not ignored" so a
 /// malformed ignore file cannot silently empty a view.
 fn git_ignores(repo: Option<&git2::Repository>, rel: &str) -> bool {
@@ -385,6 +407,44 @@ mod tests {
         // The vendored path is re-admitted; the gitignored one is not, because
         // reproducibility must not be defeatable by a flag.
         assert_eq!(rels(&files, dir.path()), vec!["vendor/mylib/core.js"]);
+    }
+
+    // ---- pruning entries a laxer run admitted -----------------------------
+
+    #[test]
+    fn stale_entries_finds_paths_the_builtin_rules_now_reject() {
+        let dir = TempDir::new().unwrap();
+        let paths = ["src/lib.rs", "docs/mermaid.min.js", "node_modules/x/i.js"];
+        let stale = stale_entries(dir.path(), &filter(), paths.into_iter());
+        assert_eq!(stale, vec!["docs/mermaid.min.js", "node_modules/x/i.js"]);
+    }
+
+    #[test]
+    fn stale_entries_finds_gitignored_paths_too() {
+        // `docs/guide/book/` is mdbook output: excluded by .gitignore, and by no
+        // directory-name rule. A path-only prune would leave it in the view.
+        let dir = TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        write(dir.path(), ".gitignore", "docs/guide/book/\n");
+        let paths = ["src/lib.rs", "docs/guide/book/highlight.js"];
+        let stale = stale_entries(dir.path(), &filter(), paths.into_iter());
+        assert_eq!(stale, vec!["docs/guide/book/highlight.js"]);
+    }
+
+    #[test]
+    fn stale_entries_keeps_paths_that_are_still_admitted() {
+        let dir = TempDir::new().unwrap();
+        let paths = ["src/lib.rs", "crates/a/src/main.rs"];
+        assert!(stale_entries(dir.path(), &filter(), paths.into_iter()).is_empty());
+    }
+
+    #[test]
+    fn stale_entries_respects_an_include_override() {
+        let dir = TempDir::new().unwrap();
+        let f = IndexFilter::new(&["vendor/mylib".to_string()]);
+        let paths = ["vendor/mylib/core.js", "vendor/other/core.js"];
+        let stale = stale_entries(dir.path(), &f, paths.into_iter());
+        assert_eq!(stale, vec!["vendor/other/core.js"]);
     }
 
     #[test]
