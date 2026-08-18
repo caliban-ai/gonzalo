@@ -3,9 +3,14 @@
 //! [`GonzaloMcp`] implements rmcp's [`ServerHandler`] over a
 //! [`Service`](gonzalo_server::Service): agents spawn the `gonzalo-mcp` binary
 //! (stdio) and call tools that answer from the local store. It exposes a
-//! view-independent `status` tool plus two families of code-graph query, each
-//! taking a `(repo, view_id)` view selector:
+//! view-independent `status` and `views` tools plus two families of code-graph
+//! query, each taking a `(repo, view_id)` view selector:
 //!
+//! - **Discovery** — `views` lists the indexed `(repo, view_id)` pairs and
+//!   `status` reports how many exist. A selector naming no indexed view is a
+//!   tool *error* that lists the real ones, never an empty result: the two are
+//!   otherwise indistinguishable, and an agent reads `[]` as "nothing calls
+//!   this" rather than "you asked the wrong question" (#210).
 //! - **Per-symbol** — `search`/`node`/`callers`/`callees`/`impact`/`explore`
 //!   answer questions about a name the caller already has, and `diff` compares
 //!   two views.
@@ -120,6 +125,14 @@ impl GonzaloMcp {
                 list_schema(),
             ),
             Tool::new(
+                "views",
+                "List every indexed view as (repo, view_id) with its file count and the commit it \
+                 was indexed at. Call this first: `repo` and `view_id` must match a view produced \
+                 by `gonzalo index`, and this is the only way to discover the valid values. \
+                 Compare `base_commit` against the checkout's HEAD to spot a stale view.",
+                status_schema(),
+            ),
+            Tool::new(
                 "unreferenced",
                 "Symbols with no inbound reference — dead-code CANDIDATES, not dead code. This is \
                  a heuristic over a name-matched graph and it does produce false positives. A \
@@ -134,9 +147,25 @@ impl GonzaloMcp {
         ]
     }
 
-    /// The `status` payload: server health plus the configured store root.
-    pub fn status_json(&self) -> serde_json::Value {
-        serde_json::json!({ "status": "ok", "root": self.root })
+    /// The `status` payload: server health, the configured store root, and how
+    /// many views are indexed.
+    ///
+    /// The view count is the point (#210): `status` is the tool an agent reaches
+    /// for to self-check, and reporting only `ok` meant a server pointed at an
+    /// empty or wrong store looked perfectly healthy.
+    pub async fn status_json(&self) -> serde_json::Value {
+        match self.service.graph_views().await {
+            Ok(views) => serde_json::json!({
+                "status": "ok",
+                "root": self.root,
+                "views": views.len(),
+            }),
+            Err(e) => serde_json::json!({
+                "status": "degraded",
+                "root": self.root,
+                "error": e.to_string(),
+            }),
+        }
     }
 
     /// Dispatch a tool call by name, independent of the rmcp transport so it can
@@ -150,8 +179,13 @@ impl GonzaloMcp {
         // `status` takes no view selector.
         if name == "status" {
             return Ok(CallToolResult::success(vec![Content::text(
-                self.status_json().to_string(),
+                self.status_json().await.to_string(),
             )]));
+        }
+
+        // `views` is the discovery tool — it takes no selector by definition.
+        if name == "views" {
+            return self.result(self.service.graph_views().await);
         }
 
         // `diff` selects two views instead of one view + a name.
@@ -160,6 +194,11 @@ impl GonzaloMcp {
                 Ok(t) => t,
                 Err(msg) => return Ok(tool_error(msg)),
             };
+            for view in [&view_a, &view_b] {
+                if let Some(err) = self.unknown_view_error(&repo, view).await {
+                    return Ok(err);
+                }
+            }
             return self.result(self.service.graph_diff(&repo, &view_a, &view_b).await);
         }
 
@@ -169,6 +208,9 @@ impl GonzaloMcp {
                 Ok(t) => t,
                 Err(msg) => return Ok(tool_error(msg)),
             };
+            if let Some(err) = self.unknown_view_error(&repo, &view).await {
+                return Ok(err);
+            }
             return self.aggregate(name, &repo, &view, &arguments).await;
         }
 
@@ -188,6 +230,12 @@ impl GonzaloMcp {
             Err(msg) => return Ok(tool_error(msg)),
         };
 
+        // An unresolvable selector is an error, never an empty result (#210):
+        // otherwise a typo in `view_id` reads as "nothing calls this".
+        if let Some(err) = self.unknown_view_error(&repo, &view).await {
+            return Ok(err);
+        }
+
         match name {
             "search" => self.result(self.service.graph_definitions(&repo, &view, &sym).await),
             "callers" => self.result(self.service.graph_callers_of(&repo, &view, &sym).await),
@@ -198,6 +246,35 @@ impl GonzaloMcp {
             // Unreachable: the known-tool guard above already returned for any
             // other name.
             _ => Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>()),
+        }
+    }
+
+    /// A tool error when `(repo, view_id)` names no indexed view, or `None` when
+    /// the selector resolves.
+    ///
+    /// The message names the unresolved selector *and* lists the views that do
+    /// exist, so a caller that guessed wrong can correct itself in one round
+    /// trip instead of concluding the code is not there (#210).
+    async fn unknown_view_error(&self, repo: &str, view: &str) -> Option<CallToolResult> {
+        match self.service.view_exists(repo, view).await {
+            Ok(true) => None,
+            Ok(false) => {
+                let known = match self.service.graph_views().await {
+                    Ok(views) if !views.is_empty() => views
+                        .iter()
+                        .map(|v| format!("{}/{}", v.repo, v.view_id))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Ok(_) => "none — run `gonzalo index` first".to_string(),
+                    Err(e) => format!("<could not list views: {e}>"),
+                };
+                Some(tool_error(format!(
+                    "no indexed view '{repo}/{view}'. This is a selector error, not an empty \
+                     result. Indexed views: {known}. Call `views` to list them."
+                )))
+            }
+            // A store failure is reported as itself rather than as "no view".
+            Err(e) => Some(tool_error(e.to_string())),
         }
     }
 
@@ -310,8 +387,16 @@ fn view_query_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
-            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "repo": {
+                "type": "string",
+                "description": "repository of an INDEXED view, e.g. acme/widgets — must match one \
+                                reported by `views`, not an arbitrary name"
+            },
+            "view_id": {
+                "type": "string",
+                "description": "view id of an INDEXED view, e.g. main — must match one reported \
+                                by `views`"
+            },
             "name": { "type": "string", "description": "symbol name to query" }
         },
         "required": ["repo", "view_id", "name"],
@@ -325,9 +410,15 @@ fn diff_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "repo": { "type": "string", "description": "repository identifier" },
-            "view_a": { "type": "string", "description": "the base view id" },
-            "view_b": { "type": "string", "description": "the view id to compare against the base" }
+            "repo": {
+                "type": "string",
+                "description": "repository of two INDEXED views — must match `views` output"
+            },
+            "view_a": { "type": "string", "description": "the base view id (must be indexed)" },
+            "view_b": {
+                "type": "string",
+                "description": "the view id to compare against the base (must be indexed)"
+            }
         },
         "required": ["repo", "view_a", "view_b"],
         "additionalProperties": false
@@ -346,8 +437,16 @@ fn overview_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
-            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "repo": {
+                "type": "string",
+                "description": "repository of an INDEXED view, e.g. acme/widgets — must match one \
+                                reported by `views`, not an arbitrary name"
+            },
+            "view_id": {
+                "type": "string",
+                "description": "view id of an INDEXED view, e.g. main — must match one reported \
+                                by `views`"
+            },
             "largest": {
                 "type": "integer",
                 "minimum": 0,
@@ -366,8 +465,16 @@ fn top_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
-            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "repo": {
+                "type": "string",
+                "description": "repository of an INDEXED view, e.g. acme/widgets — must match one \
+                                reported by `views`, not an arbitrary name"
+            },
+            "view_id": {
+                "type": "string",
+                "description": "view id of an INDEXED view, e.g. main — must match one reported \
+                                by `views`"
+            },
             "by": {
                 "type": "string",
                 "enum": ["fan_in", "fan_out", "definitions"],
@@ -391,8 +498,16 @@ fn list_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
-            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "repo": {
+                "type": "string",
+                "description": "repository of an INDEXED view, e.g. acme/widgets — must match one \
+                                reported by `views`, not an arbitrary name"
+            },
+            "view_id": {
+                "type": "string",
+                "description": "view id of an INDEXED view, e.g. main — must match one reported \
+                                by `views`"
+            },
             "path_prefix": {
                 "type": "string",
                 "description": "only symbols whose path starts with this (scopes to a crate or \
@@ -428,8 +543,16 @@ fn unreferenced_schema() -> Arc<Map<String, Value>> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
-            "repo": { "type": "string", "description": "repository identifier, e.g. acme/widgets" },
-            "view_id": { "type": "string", "description": "view id, e.g. main" },
+            "repo": {
+                "type": "string",
+                "description": "repository of an INDEXED view, e.g. acme/widgets — must match one \
+                                reported by `views`, not an arbitrary name"
+            },
+            "view_id": {
+                "type": "string",
+                "description": "view id of an INDEXED view, e.g. main — must match one reported \
+                                by `views`"
+            },
             "path_prefix": {
                 "type": "string",
                 "description": "only symbols whose path starts with this (scopes to a crate or \
@@ -726,6 +849,7 @@ mod tests {
                 "overview",
                 "top",
                 "list",
+                "views",
                 "unreferenced",
             ]
         );
@@ -879,6 +1003,171 @@ mod tests {
             .unwrap();
         assert_eq!(result.is_error, Some(true));
         assert!(result_text(&result).contains("gizmo"));
+    }
+
+    // ---- unknown view vs empty result (#210) -------------------------------
+
+    /// Every tool that takes a view selector, with valid arguments except the
+    /// view id.
+    const VIEW_SCOPED: &[&str] = &[
+        "search",
+        "node",
+        "callers",
+        "callees",
+        "impact",
+        "explore",
+        "overview",
+        "top",
+        "list",
+        "unreferenced",
+    ];
+
+    fn args_for(tool: &str, repo: &str, view: &str) -> Option<Map<String, Value>> {
+        let mut m = serde_json::json!({ "repo": repo, "view_id": view })
+            .as_object()
+            .unwrap()
+            .clone();
+        // Per-tool required extras.
+        if matches!(
+            tool,
+            "search" | "node" | "callers" | "callees" | "impact" | "explore"
+        ) {
+            m.insert("name".into(), Value::String("helper".into()));
+        }
+        if tool == "top" {
+            m.insert("by".into(), Value::String("fan_in".into()));
+        }
+        Some(m)
+    }
+
+    #[tokio::test]
+    async fn an_unknown_view_id_is_an_error_not_an_empty_result() {
+        let s = seeded_server().await;
+        for tool in VIEW_SCOPED {
+            let result = s.dispatch(tool, args_for(tool, "r", "mian")).await.unwrap();
+            assert_eq!(result.is_error, Some(true), "{tool} must reject 'mian'");
+            let text = result_text(&result);
+            assert!(
+                text.contains("r/mian"),
+                "{tool} must name the selector: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_repo_is_an_error_not_an_empty_result() {
+        let s = seeded_server().await;
+        for tool in VIEW_SCOPED {
+            let result = s
+                .dispatch(tool, args_for(tool, "does-not-exist", "main"))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{tool} must reject the repo");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_view_error_lists_the_views_that_exist() {
+        let s = seeded_server().await;
+        let result = s
+            .dispatch("search", args_for("search", "r", "mian"))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(
+            text.contains("r/main"),
+            "must point at the real view: {text}"
+        );
+        assert!(
+            text.contains("views"),
+            "must name the discovery tool: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_symbol_in_a_valid_view_is_still_an_empty_result() {
+        // The other half of #210: the two cases must be distinguishable, so a
+        // genuine miss must NOT become an error.
+        let s = seeded_server().await;
+        let result = s
+            .dispatch("search", args_for("search", "r", "main"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let result = s
+            .dispatch(
+                "callers",
+                Some(
+                    serde_json::json!({ "repo": "r", "view_id": "main", "name": "nonexistent" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "a real miss is not an error");
+        assert_eq!(
+            serde_json::from_str::<Value>(&result_text(&result)).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_an_unknown_view_on_either_side() {
+        let s = seeded_server().await;
+        for (a, b) in [("main", "nope"), ("nope", "main")] {
+            let result = s
+                .dispatch(
+                    "diff",
+                    Some(
+                        serde_json::json!({ "repo": "r", "view_a": a, "view_b": b })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "diff {a}->{b}");
+            assert!(result_text(&result).contains("r/nope"));
+        }
+    }
+
+    #[tokio::test]
+    async fn views_tool_lists_indexed_views() {
+        let s = seeded_server().await;
+        let result = s.dispatch("views", None).await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let v: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["repo"], "r");
+        assert_eq!(v[0]["view_id"], "main");
+        assert_eq!(v[0]["files"], 2, "lib.rs + main.rs");
+    }
+
+    #[tokio::test]
+    async fn views_tool_is_empty_on_a_fresh_store() {
+        let s = server("test-root");
+        let result = s.dispatch("views", None).await.unwrap();
+        let v: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert!(v.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_number_of_indexed_views() {
+        let s = seeded_server().await;
+        let v: Value =
+            serde_json::from_str(&result_text(&s.dispatch("status", None).await.unwrap())).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["views"], 1, "an empty store must be distinguishable");
+
+        let empty = server("test-root");
+        let v: Value =
+            serde_json::from_str(&result_text(&empty.dispatch("status", None).await.unwrap()))
+                .unwrap();
+        assert_eq!(v["views"], 0);
     }
 
     #[tokio::test]
@@ -1056,10 +1345,10 @@ mod tests {
         assert!(removed.contains(&"gone"));
     }
 
-    #[test]
-    fn status_reports_ok_and_configured_root() {
+    #[tokio::test]
+    async fn status_reports_ok_and_configured_root() {
         let s = server("/tmp/some-root");
-        let payload = s.status_json();
+        let payload = s.status_json().await;
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["root"], "/tmp/some-root");
     }

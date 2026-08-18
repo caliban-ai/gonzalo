@@ -11,6 +11,30 @@ the patch version for fixes.
 
 ### Fixed
 
+- **An unknown `repo`/`view_id` is now an error, not an empty result** (#210).
+  Every graph query returned `[]` with `isError: false` when the selector named
+  no indexed view, so a one-character typo in `view_id` was indistinguishable
+  from a symbol that genuinely is not there — an agent read it as "nothing calls
+  this" and reported a wrong answer as fact. `Service::view` now fails with
+  `NotFound`, and the MCP layer turns that into a tool error naming the
+  unresolved selector *and* listing the views that do exist, so a caller can
+  correct itself in one round trip. A real miss inside a real view still returns
+  `[]`, so the two cases are finally distinguishable.
+
+  `diff` gets the same check on both `view_a` and `view_b`.
+
+### Added
+
+- **`views` discovery tool and a view count in `status`** (#210). `views` lists
+  every indexed `(repo, view_id)` with its file count and the commit it was
+  indexed at, which makes the server self-describing rather than dependent on
+  out-of-band documentation; comparing `base_commit` against the checkout's HEAD
+  also surfaces a stale view, the quieter form of the same problem. `status` now
+  reports how many views are indexed, so the natural health-check call actually
+  detects a server pointed at an empty or wrong store. The `repo`/`view_id`
+  schema descriptions now say they must match an indexed view and point at
+  `views`.
+
 - **Calls inside Rust macro arguments are now recorded as references** (#216).
   Macro arguments parse as a `token_tree` of raw tokens rather than expressions,
   so `assert_eq!(f(), 1)` contained no `call_expression` and the call to `f` was
