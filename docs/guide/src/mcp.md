@@ -62,6 +62,8 @@ ignored:  2 files, 9 dirs not descended
 - `driver` — `full walk` the first time; afterwards a git-diff-driven **incremental**
   pass that re-parses only what changed. A no-op re-index is well under a second.
 - `skipped` — files a parse worker crashed or hung on.
+- `driver` also goes back to `full walk` on its own when gonzalo's extraction format
+  changes, so a parser improvement reaches files that did not themselves change.
 - `ignored` — files and directories deliberately left out of the view: dependency and
   build-output directories, generated bundles (`*.min.js` and friends), and anything
   `.gitignore`d. Use `--include <path>` to re-admit a vendored path you *do* want
@@ -181,11 +183,12 @@ traversal through it merges unrelated subgraphs.
 return roughly half the repository for one seed; it now keys on `(name, defining path)`
 and refuses to traverse an ambiguous reference, reporting the count in
 `ambiguous_edges` instead ([#207](https://github.com/caliban-ai/gonzalo/issues/207)).
-Read that count: non-zero means the true set may be larger than what you got. It is
-still an over-estimate — a name defined exactly once resolves confidently even when the
-call meant a std method of the same name
-([#223](https://github.com/caliban-ai/gonzalo/issues/223)) — so treat the closure as a
-lead list and confirm the load-bearing edges with `callers`.
+Read that count: non-zero means the true set may be larger than what you got. Method calls
+(`x.foo()`) on a receiver whose type is unknown are not attributed at all and are
+counted in `receiver_unknown_edges`, which stops a std method being credited to a
+same-named project function
+([#223](https://github.com/caliban-ai/gonzalo/issues/223)). Treat the closure as a lead
+list and confirm the load-bearing edges with `callers`.
 
 **`callers` on a type is always empty.** Only call expressions are edges, so types,
 traits, and structs have no inbound edges. Empty there means "not applicable", not
