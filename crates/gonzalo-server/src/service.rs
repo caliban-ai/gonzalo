@@ -9,8 +9,8 @@ use gonzalo_core::{
     RecordKey, Result, Revision, Store,
 };
 use gonzalo_graph::{
-    GraphStore, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
-    ViewOverview, assemble,
+    GraphStore, ImpactReport, Located, Page, RankedSymbol, Ranking, Reference, Symbol,
+    SymbolFilter, ViewOverview, assemble, resolved_impact,
 };
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
 use gonzalo_ticket::IngestSummary;
@@ -277,8 +277,41 @@ impl Service {
     }
 
     /// Transitive caller closure of `name` (impact of changing it).
-    pub async fn graph_impact(&self, repo: &str, view_id: &str, name: &str) -> Result<Vec<String>> {
-        Ok(self.view(repo, view_id).await?.impact(name))
+    /// Symbols transitively affected if `name` changes, following only call
+    /// edges that resolve to a specific definition.
+    ///
+    /// Uses [`resolved_impact`] rather than the name-matched
+    /// [`GraphStore::impact`], which merged unrelated subgraphs through shared
+    /// identifiers (#207). Edges that cannot be attributed are counted in the
+    /// report instead of being traversed or silently dropped.
+    pub async fn graph_impact(
+        &self,
+        repo: &str,
+        view_id: &str,
+        name: &str,
+        max_depth: Option<usize>,
+    ) -> Result<ImpactReport> {
+        let view = self.view(repo, view_id).await?;
+        Ok(resolved_impact(view.as_ref(), name, max_depth))
+    }
+
+    /// [`graph_impact`](Self::graph_impact) flattened to distinct caller names.
+    ///
+    /// The daemon transports speak a shared name-list shape for `callers_of`,
+    /// `callees` and `impact`, so they take this projection. They still get the
+    /// resolution-gated walk — only the `ambiguous_edges` and per-node paths are
+    /// dropped, which is why the MCP surface returns the full report.
+    pub async fn graph_impact_names(
+        &self,
+        repo: &str,
+        view_id: &str,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        let report = self.graph_impact(repo, view_id, name, None).await?;
+        let mut names: Vec<String> = report.reached.into_iter().map(|n| n.name).collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     /// Aggregate shape of the view: counts, breakdowns by kind and language,
@@ -440,7 +473,7 @@ mod tests {
 
         // A view with neither an indexed db nor a manifest is unresolvable, and
         // now says so rather than falling back to an empty assembly (#210).
-        assert!(svc.graph_impact("r", "absent", "x").await.is_err());
+        assert!(svc.graph_impact("r", "absent", "x", None).await.is_err());
     }
 
     #[tokio::test]
@@ -471,7 +504,7 @@ mod tests {
             vec!["helper".to_string()]
         );
         assert_eq!(
-            svc.graph_impact("r", "main", "helper").await.unwrap(),
+            svc.graph_impact_names("r", "main", "helper").await.unwrap(),
             vec!["main".to_string()]
         );
         assert_eq!(
@@ -505,7 +538,7 @@ mod tests {
         let svc = Service::new(fs.clone(), fs);
         for res in [
             svc.graph_definitions("r", "absent", "x").await.err(),
-            svc.graph_impact("r", "absent", "x").await.err(),
+            svc.graph_impact("r", "absent", "x", None).await.err(),
         ] {
             let err = res.expect("an unknown view must error");
             assert!(
