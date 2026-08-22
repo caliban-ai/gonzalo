@@ -11,6 +11,27 @@ the patch version for fixes.
 
 ### Fixed
 
+- **`impact` no longer merges unrelated code through shared identifiers** (#207).
+  The closure walked the name-matched caller graph, so one hop into a name with
+  several definitions absorbed every subgraph sharing that identifier. The walk
+  now keys nodes on `(name, defining path)` and consults the resolver for every
+  edge: an `Ambiguous` reference is counted and dropped rather than traversed.
+
+  On the gonzalo view, seeded at `build_rust`: **356 → 178** reached names, with
+  10 ambiguous edges reported rather than followed. Seeds that were already sharp
+  are unchanged (`resolve_references_to`: 5 → 5).
+
+  The result is now a report rather than a name list — every node carries the path
+  defining it, `ambiguous_edges` says how many edges could not be attributed (so a
+  non-zero count means the true set may be larger), and `truncated` reports a walk
+  stopped by the new optional `max_depth`. The daemon's HTTP and gRPC transports
+  keep their existing name-list shape and so get the precision fix without the
+  report fields.
+
+  Of the remaining 178, 17 are still provably false and trace to a single
+  `UniqueGlobal` over-attribution — std's `Iterator::chain` resolving to a
+  same-named test fixture. That is a distinct defect, filed as #223.
+
 - **An incremental re-index now prunes paths a laxer run admitted** (#209
   follow-up). The filter added in #218 only applied to newly walked or changed
   files, so an *existing* view kept its vendored bundles forever: a bundle never

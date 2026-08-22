@@ -300,7 +300,7 @@ impl Gonzalo for GrpcAdapter {
         self.authorize(&metadata, Access::Read, &r.repo)?;
         let names = self
             .service
-            .graph_impact(&r.repo, &r.view_id, &r.name)
+            .graph_impact_names(&r.repo, &r.view_id, &r.name)
             .await
             .map_err(internal)?;
         Ok(Response::new(GraphNamesResponse { names }))
