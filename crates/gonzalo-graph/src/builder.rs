@@ -4,7 +4,7 @@
 //! Scala, and Elixir are supported, and a new grammar is a matter of adding its
 //! node-kind mappings.
 
-use crate::model::{CodeGraph, Reference, Symbol, SymbolKind};
+use crate::model::{CodeGraph, RefKind, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
@@ -292,6 +292,71 @@ impl Language {
             Self::Kotlin | Self::Swift | Self::Scala => node_kind == "call_expression",
             Self::Lua => node_kind == "function_call",
             Self::Elixir => node_kind == "call",
+        }
+    }
+
+    /// Whether a call reaches its callee through a receiver expression, so the
+    /// callee belongs to a value whose type the graph does not know.
+    ///
+    /// `x.foo()` is [`RefKind::Method`]; `foo()` and path calls like
+    /// `a::b::foo()` are [`RefKind::Free`]. The distinction is what stops the
+    /// resolver attributing a std or dependency method to a same-named free
+    /// function that happens to be the view's only definition (#223).
+    ///
+    /// Languages whose grammar does not surface a receiver here fall through to
+    /// `Free`, which is the behaviour they had before this existed — no worse,
+    /// just not yet improved.
+    fn callee_kind(self, call: Node<'_>) -> RefKind {
+        // A few grammars mark a method call on the call node itself.
+        let by_call_node = match self {
+            Self::Php => matches!(
+                call.kind(),
+                "member_call_expression" | "nullsafe_member_call_expression"
+            ),
+            // `obj.m()` carries an `object`; a bare `m()` does not.
+            Self::Java => call.child_by_field_name("object").is_some(),
+            // Ruby's `call` names its receiver explicitly.
+            Self::Ruby => call.child_by_field_name("receiver").is_some(),
+            _ => false,
+        };
+        if by_call_node {
+            return RefKind::Method;
+        }
+
+        // Otherwise the shape is visible on the callee expression.
+        let callee = match self {
+            Self::Kotlin | Self::Swift => call.named_child(0),
+            Self::Lua => call.child_by_field_name("name"),
+            _ => call.child_by_field_name("function"),
+        };
+        let Some(callee) = callee else {
+            return RefKind::Free;
+        };
+        // Note what is deliberately absent: Rust `scoped_identifier`, C++
+        // `qualified_identifier` and Go's package-qualified `selector_expression`
+        // are paths, not receivers. Go cannot tell `pkg.Func()` from `x.Method()`
+        // at this level, so it stays Free rather than guessing.
+        let member_like = matches!(
+            (self, callee.kind()),
+            (
+                Self::Rust | Self::Scala | Self::C | Self::Cpp,
+                "field_expression"
+            ) | (Self::Python, "attribute")
+                | (
+                    Self::JavaScript | Self::TypeScript | Self::Tsx,
+                    "member_expression"
+                )
+                | (Self::CSharp, "member_access_expression")
+                | (Self::Kotlin | Self::Swift, "navigation_expression")
+                | (
+                    Self::Lua,
+                    "dot_index_expression" | "method_index_expression"
+                )
+        );
+        if member_like {
+            RefKind::Method
+        } else {
+            RefKind::Free
         }
     }
 
@@ -685,6 +750,7 @@ fn walk(
             name,
             from: enclosing.clone(),
             line: node.start_position().row + 1,
+            kind: language.callee_kind(node),
         });
     }
 
@@ -694,6 +760,8 @@ fn walk(
             name,
             from: enclosing.clone(),
             line,
+            // A token-tree call is a bare `ident(` by construction (#216).
+            kind: RefKind::Free,
         });
     }
 

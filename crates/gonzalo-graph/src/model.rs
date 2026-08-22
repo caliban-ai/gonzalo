@@ -68,6 +68,56 @@ pub struct Reference {
     pub name: String,
     pub from: Option<String>,
     pub line: usize,
+    /// How the callee was written at the call site. Defaults to
+    /// [`RefKind::Free`] and is omitted from the serialized slice when free, so
+    /// a file of plain calls keeps the byte-identical slice — and therefore the
+    /// same content hash — it had before this field existed.
+    #[serde(default, skip_serializing_if = "RefKind::is_free")]
+    pub kind: RefKind,
+}
+
+/// The syntactic shape of a call site.
+///
+/// A name alone cannot distinguish `chain()` from `x.chain()`, and conflating
+/// them makes the resolver attribute a std or dependency method to a same-named
+/// free function that happens to be the only one in the view (#223). Recording
+/// the shape keeps that judgement possible at resolution time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefKind {
+    /// A plain call — `foo()` — or a path call such as `a::b::foo()`.
+    #[default]
+    Free,
+    /// A call through a receiver whose type is unknown — `x.foo()`. The callee
+    /// belongs to whatever `x` is, which the graph does not know, so it may well
+    /// be defined outside the view entirely.
+    Method,
+}
+
+impl RefKind {
+    /// Whether this is the default, [`Free`](RefKind::Free) shape.
+    pub fn is_free(&self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    /// Lowercase name, matching the `snake_case` serde representation. Used as
+    /// the stored value in the persistent graph.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Method => "method",
+        }
+    }
+
+    /// Parse from [`as_str`](RefKind::as_str). Anything unrecognized — including
+    /// a row written before the column existed — reads as `Free`, the
+    /// pre-existing behaviour.
+    pub fn from_str_or_free(raw: &str) -> Self {
+        match raw {
+            "method" => Self::Method,
+            _ => Self::Free,
+        }
+    }
 }
 
 /// A query result carried with the assembly path it was found under. The path
