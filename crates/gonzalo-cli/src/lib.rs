@@ -6,7 +6,7 @@ use gonzalo_core::{
     BlobStore, Body, ContentHash, Identity, KeyPrefix, Manifest, Meta, PutResult, Record,
     RecordKey, RecordKind, Revision, Store,
 };
-use gonzalo_graph::{CodeGraph, GraphStore, Language, build};
+use gonzalo_graph::{CodeGraph, EXTRACTION_VERSION, GraphStore, Language, build};
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
 use gonzalo_parse::ParserPool;
 use gonzalo_store_fs::FsStore;
@@ -278,10 +278,20 @@ pub async fn index_with(
     // Choose the driver: incremental when `src` is a git repo root, a base was
     // recorded, and the diff against it is readable; otherwise a full walk.
     let base_path = db_path.with_extension("base");
+    // A view built by a parser that recorded different things must be rebuilt
+    // in full: the incremental driver carries unchanged slices forward, so
+    // without this an existing view keeps pre-upgrade extraction forever.
+    let version_path = db_path.with_extension("fmt");
+    let recorded_version: Option<u32> = std::fs::read_to_string(&version_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let format_changed = recorded_version != Some(EXTRACTION_VERSION);
+
     let recorded_base = std::fs::read_to_string(&base_path)
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .filter(|_| !format_changed);
     let incremental_changed = recorded_base
         .as_deref()
         .and_then(|base| gonzalo_store_git::changed_paths(src, base).ok());
@@ -360,6 +370,12 @@ pub async fn index_with(
             std::fs::create_dir_all(parent).ok();
         }
         std::fs::write(&base_path, sha).ok();
+    }
+    // Record the extraction format this view was built with, so the next run can
+    // tell whether an incremental pass is still valid.
+    if let Some(parent) = version_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+        std::fs::write(&version_path, EXTRACTION_VERSION.to_string()).ok();
     }
 
     Ok(IndexSummary {
@@ -1166,6 +1182,41 @@ mod tests {
         let sig = git2::Signature::now("t", "t@localhost").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_format_change_forces_a_full_walk() {
+        // Without this, an existing view keeps pre-upgrade extraction forever:
+        // the incremental driver carries unchanged slices forward untouched, so
+        // a parser improvement never reaches files that did not change (#223).
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        git_init_commit(src.path());
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        // A second run would normally take the incremental path...
+        let fmt = view_db_path(&root.path().join("graphs"), "r", "main").with_extension("fmt");
+        assert_eq!(
+            std::fs::read_to_string(&fmt).unwrap(),
+            EXTRACTION_VERSION.to_string()
+        );
+        assert!(
+            index(root.path(), src.path(), "r", "main")
+                .await
+                .unwrap()
+                .incremental
+        );
+
+        // ...but not when the view was built by an older extraction format.
+        std::fs::write(&fmt, "1").unwrap();
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert!(!summary.incremental, "a format change must rebuild in full");
+        assert_eq!(
+            std::fs::read_to_string(&fmt).unwrap(),
+            EXTRACTION_VERSION.to_string(),
+            "and must record the version it rebuilt with"
+        );
     }
 
     #[tokio::test]

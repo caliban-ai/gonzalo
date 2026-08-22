@@ -13,7 +13,7 @@
 //! `Connection` is `Send` but not `Sync`, and `GraphStore` requires `Sync`);
 //! read concurrency via a connection pool is a follow-on.
 
-use gonzalo_graph::{CodeGraph, GraphStore, Located, Reference, Symbol};
+use gonzalo_graph::{CodeGraph, GraphStore, Located, RefKind, Reference, Symbol};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS refs (
     path    TEXT    NOT NULL,
     name    TEXT    NOT NULL,
     from_fn TEXT,
-    line    INTEGER NOT NULL
+    line    INTEGER NOT NULL,
+    kind    TEXT    NOT NULL DEFAULT 'free'
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
@@ -63,9 +64,26 @@ impl SqliteGraphStore {
 
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Bring an existing database up to the current schema.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves an older `refs` table untouched, so a
+    /// database written before `refs.kind` existed needs the column added
+    /// explicitly. Rows already there default to `free`, which is exactly the
+    /// shape they were assumed to have (#223).
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let has_kind = conn
+            .prepare("SELECT 1 FROM pragma_table_info('refs') WHERE name = 'kind'")?
+            .exists([])?;
+        if !has_kind {
+            conn.execute_batch("ALTER TABLE refs ADD COLUMN kind TEXT NOT NULL DEFAULT 'free'")?;
+        }
+        Ok(())
     }
 
     /// Remove all rows for `path` (a file dropped from the view). Complements
@@ -147,8 +165,8 @@ impl GraphStore for SqliteGraphStore {
         }
         for r in &graph.references {
             tx.execute(
-                "INSERT INTO refs (path, name, from_fn, line) VALUES (?1, ?2, ?3, ?4)",
-                params![path, r.name, r.from, r.line as i64],
+                "INSERT INTO refs (path, name, from_fn, line, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![path, r.name, r.from, r.line as i64, r.kind.as_str()],
             )
             .expect("insert reference");
         }
@@ -191,7 +209,7 @@ impl GraphStore for SqliteGraphStore {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
             .prepare(
-                "SELECT path, name, from_fn, line FROM refs
+                "SELECT path, name, from_fn, line, kind FROM refs
                  WHERE name = ?1 ORDER BY path, line",
             )
             .expect("prepare references_to");
@@ -203,6 +221,7 @@ impl GraphStore for SqliteGraphStore {
                         name: row.get(1)?,
                         from: row.get::<_, Option<String>>(2)?,
                         line: row.get::<_, i64>(3)? as usize,
+                        kind: RefKind::from_str_or_free(&row.get::<_, String>(4)?),
                     },
                 })
             })
@@ -258,7 +277,7 @@ impl GraphStore for SqliteGraphStore {
     fn all_references(&self) -> Vec<Located<Reference>> {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
-            .prepare("SELECT path, name, from_fn, line FROM refs ORDER BY path, line")
+            .prepare("SELECT path, name, from_fn, line, kind FROM refs ORDER BY path, line")
             .expect("prepare all_references");
         let rows = stmt
             .query_map([], |row| {
@@ -268,6 +287,7 @@ impl GraphStore for SqliteGraphStore {
                         name: row.get(1)?,
                         from: row.get::<_, Option<String>>(2)?,
                         line: row.get::<_, i64>(3)? as usize,
+                        kind: RefKind::from_str_or_free(&row.get::<_, String>(4)?),
                     },
                 })
             })

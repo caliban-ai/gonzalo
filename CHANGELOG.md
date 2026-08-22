@@ -11,6 +11,46 @@ the patch version for fixes.
 
 ### Fixed
 
+- **A method call no longer claims a same-named free function** (#223).
+  `Resolution::UniqueGlobal` attributed a reference to the sole definition of
+  that name in the view — including when the name was really a std or dependency
+  *method*. In gonzalo, `.chain(ours_obj.keys())` in `gonzalo-core` resolved to
+  `fn chain()`, a test fixture in `gonzalo-graph`, a crate `gonzalo-core` does
+  not depend on.
+
+  References now record the shape of the call site (`RefKind::{Free, Method}`),
+  and a cross-file method call resolves to the new
+  `Resolution::ReceiverUnknown` rather than guessing. Measured over gonzalo's
+  own source: of the 388 cross-file method calls that used to resolve
+  `UniqueGlobal`, **294 pointed at a different crate** — `push`, `filter`,
+  `send`, `bytes`, `next` and friends. Same-file method calls still resolve
+  `Local`, and free and path calls (`foo()`, `a::b::foo()`) are unaffected.
+
+  Effect on `impact` (#207), same 122-file source both runs:
+
+  | seed | before | after |
+  |---|---:|---:|
+  | `build_rust` | 185 | **126** |
+  | `assemble` | 60 | **23** |
+  | `resolve_references_to` | 6 | 6 |
+
+  The 24 provably-false `gonzalo-core` nodes in the `build_rust` closure are now
+  **0**. Dropped edges are reported as `receiver_unknown_edges`, counted
+  separately from `ambiguous_edges` because the cause differs: not "too many
+  candidates" but "cannot claim any candidate".
+
+  `RefKind` is omitted from the serialized slice when free, so a file of plain
+  calls keeps its existing content hash.
+
+### Added
+
+- **`EXTRACTION_VERSION`, and a full walk when it changes** (#223). The
+  incremental driver carries unchanged slices forward untouched, so a parser
+  improvement never reached files that did not change — an existing view stayed
+  permanently half-upgraded. `gonzalo index` now records the extraction format
+  alongside the view and rebuilds in full when it differs, which is what lets
+  #216's and #223's parsing changes actually reach an established view.
+
 - **`impact` no longer merges unrelated code through shared identifiers** (#207).
   The closure walked the name-matched caller graph, so one hop into a name with
   several definitions absorbed every subgraph sharing that identifier. The walk
