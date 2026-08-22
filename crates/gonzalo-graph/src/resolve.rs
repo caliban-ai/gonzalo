@@ -14,7 +14,7 @@
 //! [`GraphStore`]'s query methods, so it works over any backend and adds no
 //! trait surface. Import-following resolution is a further step.
 
-use crate::{GraphStore, Located, Reference};
+use crate::{GraphStore, Located, RefKind, Reference};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -27,6 +27,13 @@ pub enum Resolution {
     UniqueGlobal,
     /// Several definitions and none in the reference's file — not resolved.
     Ambiguous,
+    /// A method call (`x.foo()`) whose receiver type is unknown, so no
+    /// definition in the view can be claimed even if exactly one exists.
+    ///
+    /// Distinct from [`Unresolved`](Resolution::Unresolved): definitions of the
+    /// name may well be present, but attributing the call to one of them would
+    /// assert a receiver type the graph does not know (#223).
+    ReceiverUnknown,
     /// No definition of the name in the view — a dangling reference.
     Unresolved,
 }
@@ -57,11 +64,24 @@ pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<Resolved
         .into_iter()
         .map(|located| {
             let (target, resolution) = if def_paths.contains(&located.path) {
+                // A definition in the caller's own file wins for either shape:
+                // `self.foo()` next to `fn foo` is the one thing about a
+                // receiver we can reasonably assume.
                 (Some(located.path.clone()), Resolution::Local)
+            } else if def_paths.is_empty() {
+                // Nothing of this name anywhere: "not in the view" is the more
+                // informative answer than "receiver unknown", and it is true
+                // whatever the call shape.
+                (None, Resolution::Unresolved)
+            } else if located.item.kind == RefKind::Method {
+                // `x.foo()` belongs to whatever `x` is. Measured on gonzalo,
+                // 294 of the 388 cross-file method calls that used to resolve
+                // `UniqueGlobal` pointed at a *different crate* — `push`,
+                // `filter`, `send`, `next` and friends, i.e. std methods
+                // attributed to a same-named project function (#223).
+                (None, Resolution::ReceiverUnknown)
             } else if def_paths.len() == 1 {
                 (def_paths.iter().next().cloned(), Resolution::UniqueGlobal)
-            } else if def_paths.is_empty() {
-                (None, Resolution::Unresolved)
             } else {
                 (None, Resolution::Ambiguous)
             };
@@ -103,11 +123,16 @@ pub struct ImpactNode {
 pub struct ImpactReport {
     /// Symbols transitively affected, sorted, excluding the seed.
     pub reached: Vec<ImpactNode>,
-    /// Call edges that could not be attributed to a specific definition and so
-    /// were **not** followed. Reported rather than hidden: silently truncating a
-    /// closure is its own kind of lie, and a non-zero count here means the true
-    /// impact set may be larger than `reached`.
+    /// Call edges dropped because the name has several definitions and none is
+    /// local. Reported rather than hidden: silently truncating a closure is its
+    /// own kind of lie, and a non-zero count here means the true impact set may
+    /// be larger than `reached`.
     pub ambiguous_edges: usize,
+    /// Call edges dropped because they are method calls on a receiver of unknown
+    /// type ([`Resolution::ReceiverUnknown`]). Counted separately from
+    /// `ambiguous_edges` because the cause differs: not "too many candidates"
+    /// but "cannot claim any candidate" (#223).
+    pub receiver_unknown_edges: usize,
     /// Whether the walk stopped at `max_depth` with unexplored frontier left.
     ///
     /// This means "the set may be incomplete", not "more definitely exists":
@@ -170,6 +195,7 @@ pub fn resolved_impact(
                 match resolved.resolution {
                     // Unattributable: report it, do not traverse it.
                     Resolution::Ambiguous => report.ambiguous_edges += 1,
+                    Resolution::ReceiverUnknown => report.receiver_unknown_edges += 1,
                     // Resolves elsewhere, or nowhere — not an edge into `node`.
                     _ if resolved.target.as_deref() != Some(node.path.as_str()) => {}
                     _ => {
@@ -264,6 +290,95 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].resolution, Resolution::Unresolved);
         assert_eq!(resolved[0].target, None);
+    }
+
+    // ---- method calls do not claim a same-named free function (#223) ------
+
+    /// The exact shape found in the wild: a std method (`Iterator::chain`)
+    /// called in one crate, and a same-named test fixture that is the view's
+    /// only definition of `chain`.
+    fn std_method_collision() -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "crates/core/src/merge.rs",
+            build_rust("fn merge() { let _ = ours.keys().chain(theirs.keys()); }"),
+        );
+        s.insert(
+            "crates/graph/src/store.rs",
+            build_rust("fn chain() -> u8 { 0 }"),
+        );
+        s
+    }
+
+    #[test]
+    fn a_method_call_does_not_resolve_to_a_same_named_free_function() {
+        let s = std_method_collision();
+        let r = resolve_references_to(&s, "chain");
+        let call = r
+            .iter()
+            .find(|r| r.reference.path.contains("merge.rs"))
+            .expect("the .chain() call is recorded");
+        assert_eq!(call.resolution, Resolution::ReceiverUnknown);
+        assert_eq!(call.target, None, "must not claim the test fixture");
+    }
+
+    #[test]
+    fn the_collision_no_longer_bridges_the_impact_closure() {
+        // Before: `chain` resolved UniqueGlobal, so seeding at the fixture
+        // dragged `merge` — in a crate that cannot depend on this one — in.
+        let report = resolved_impact(&std_method_collision(), "chain", None);
+        assert!(
+            !names_of(&report).contains(&"merge"),
+            "must not cross into the other crate: {report:?}"
+        );
+        assert_eq!(report.receiver_unknown_edges, 1, "and must say so");
+    }
+
+    #[test]
+    fn a_free_call_still_resolves_unique_global() {
+        // The fix must not disarm ordinary resolution.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn only() {}"));
+        s.insert("b.rs", build_rust("fn cb() { only(); }"));
+        let r = resolve_references_to(&s, "only");
+        assert_eq!(r[0].resolution, Resolution::UniqueGlobal);
+        assert_eq!(r[0].target.as_deref(), Some("a.rs"));
+    }
+
+    #[test]
+    fn a_method_call_still_resolves_locally() {
+        // `self.helper()` beside `fn helper` is the one receiver assumption
+        // worth making, so same-file method calls keep resolving.
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "a.rs",
+            build_rust("fn helper() {}\nfn caller() { self.helper(); }"),
+        );
+        let r = resolve_references_to(&s, "helper");
+        let call = r.iter().find(|r| r.reference.item.from.is_some()).unwrap();
+        assert_eq!(call.resolution, Resolution::Local);
+        assert_eq!(call.target.as_deref(), Some("a.rs"));
+    }
+
+    #[test]
+    fn a_path_call_is_not_treated_as_a_method_call() {
+        // `a::b::foo()` is a path, not a receiver — it stays resolvable.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn parse() {}"));
+        s.insert("b.rs", build_rust("fn cb() { util::parse(); }"));
+        let r = resolve_references_to(&s, "parse");
+        let call = r.iter().find(|r| r.reference.path == "b.rs").unwrap();
+        assert_eq!(call.resolution, Resolution::UniqueGlobal);
+    }
+
+    #[test]
+    fn receiver_unknown_is_distinct_from_unresolved() {
+        // A name with no definition at all is still Unresolved — the two mean
+        // different things and must stay distinguishable.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn c() { x.ghost(); }"));
+        let r = resolve_references_to(&s, "ghost");
+        assert_eq!(r[0].resolution, Resolution::Unresolved);
     }
 
     // ---- resolution-gated impact closure (#207) ---------------------------
