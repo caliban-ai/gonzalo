@@ -93,28 +93,26 @@ The publisher handles the limit and partial failures:
    done
    ```
 
-## First publish (many new crates) — run locally
+## Historical — the 0.3.0 bootstrap
 
-Because of the rate limit, the very first publish is best run from your machine,
-where the ~10-minute waits cost nothing (a GitHub runner would bill the idle
-time). The workspace is already at `0.3.0` and the `v0.3.0` tag already exists
-(it cut the container image), so **no new tag is needed** — just authenticate
-and run the resumable publisher against the current `0.3.0` checkout of `main`:
+> Completed. Kept for the rate-limit technique, which still applies whenever a
+> release introduces a batch of **new** crate names. Nothing here describes the
+> current state of the workspace; for a normal release see the next section.
+
+Because of the new-crate rate limit, the initial publish of all 24 crates was run
+from a workstation rather than a runner, where the ~10-minute waits cost nothing
+(a GitHub runner would bill the idle time). No new tag was needed — the `v0.3.0`
+tag already existed, having cut the container image — so the bootstrap was just:
 
 ```sh
-git checkout main && git pull --ff-only    # be on the 0.3.0 commit
-cargo login                                # paste a publish-new token
-scripts/publish.sh                         # 24 crates → paced, resumable
+git checkout main && git pull --ff-only
+cargo login                                # a publish-new token
+scripts/publish.sh                         # paced, resumable
 ```
 
-It skips anything already live and grinds through the rest. Re-run it any time
-to resume. **Rotate the token afterward** if it was ever exposed (e.g. pasted
-where it could be logged).
-
-The client crates caliban#469 needs — `gonzalo-core`, `gonzalo-store-server`,
-`gonzalo-store-fs` and their transitive closure (`gonzalo-proto`,
-`gonzalo-domain`) — publish early in dependency order, so caliban is unblocked
-well before the full workspace finishes.
+`scripts/publish.sh` skips anything already live and grinds through the rest, so
+it can be re-run to resume. **Rotate the token afterward** if it was ever exposed
+(e.g. pasted somewhere it could be logged).
 
 ## Subsequent releases (version bumps)
 
@@ -135,6 +133,46 @@ The tag push fires both `release-image.yml` (image) and `publish.yml` (crates).
 If a release ever introduces **new** crate names and there are more than ~5 of
 them, the workflow publishes the burst and stops (it won't idle-bill on the
 429) — finish the rest locally with `scripts/publish.sh`.
+
+Throughout, `X.Y.Z` is whatever `[workspace.package].version` in `Cargo.toml`
+says after the release PR lands — `publish.yml` refuses a tag that disagrees with
+it, so the two cannot drift.
+
+## Verifying a release — the crates.io API is not what cargo reads
+
+**A crate showing the new version on crates.io does not mean `cargo install` will
+get it yet.** The two are different systems:
+
+| surface | consistency |
+|---|---|
+| `/api/v1/crates/<name>` and the web UI | reads the database — immediate |
+| the **sparse index** cargo resolves against | CDN-cached — can lag ~an hour |
+
+So the obvious post-release check ("crates.io lists X.Y.Z") does not verify the
+thing that actually matters. After `v0.4.0`, an install run about an hour after
+publishing silently produced `gonzalo-cli` at 0.4.0 but `gonzalo-mcp` and
+`gonzalo-parse` still at 0.3.0 — no error, no warning, and only
+`cargo install --list` showed it. Every 0.4.0 crate was published and unyanked at
+the time; it was purely index freshness.
+
+Pin the version when installing, so a stale index fails loudly instead of quietly
+serving the old build:
+
+```sh
+cargo install gonzalo-cli@X.Y.Z gonzalo-mcp@X.Y.Z gonzalo-parse@X.Y.Z
+```
+
+If that errors with no matching package, the index has not caught up — wait and
+retry. Then confirm what actually landed, and force anything stale:
+
+```sh
+cargo install --list | grep -E 'gonzalo-(cli|mcp|parse)'
+cargo install --force gonzalo-mcp@X.Y.Z        # if it came back at the old version
+```
+
+Note that `--force` is also what you need after a *code* change at the same
+version, and that an MCP client must be reconnected to pick up a newly installed
+binary — a running server keeps executing the old one.
 
 ## If a publish fails partway
 

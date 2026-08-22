@@ -9,6 +9,20 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+
+## [0.5.0] - 2026-08-22
+
+Code-graph correctness. `impact` and reference resolution stop asserting edges
+they cannot justify — a closure that returned half the repo for one seed, and a
+name-matched resolver that credited std methods to same-named project functions.
+Alongside that, the MCP server gains aggregate queries that answer questions about
+a whole view rather than about a symbol name the caller already has.
+
+**Upgrading:** the first index after this release does a one-time **full** re-walk
+of every view (see `EXTRACTION_VERSION` below) — expected, not a fault. Reinstall
+the binary as well as re-indexing: the resolution fixes live in the query path, so
+a stale `gonzalo-mcp` keeps returning the old answers over freshly indexed data.
+
 ### Fixed
 
 - **A method call no longer claims a same-named free function** (#223).
@@ -91,35 +105,6 @@ the patch version for fixes.
 
   `diff` gets the same check on both `view_a` and `view_b`.
 
-### Added
-
-- **`EXTRACTION_VERSION`, and a full walk when it changes** (#223). The
-  incremental driver carries unchanged slices forward untouched, so a parser
-  improvement never reached files that did not change — an existing view stayed
-  permanently half-upgraded. `gonzalo index` now records the extraction format
-  alongside the view and rebuilds in full when it differs, which is what lets
-  #216's and #223's parsing changes actually reach an established view.
-
-- **A guide chapter for the MCP server** (#208) — `docs/guide/src/mcp.md`, covering
-  install → index → register → verify → keep fresh, a tool reference grouped by the
-  question each tool answers, and the capability boundaries. It leads with the thing
-  nothing in the repo stated: the server only *reads*, `gonzalo index` writes, so an
-  unindexed setup answers every query forever with no indication why. It also records
-  the traps found while wiring the server up for real — `GONZALO_ROOT` not expanding
-  `~` (#211), `~/.cargo/bin` missing from the non-interactive shells an MCP client
-  spawns, and needing to reconnect the server to pick up a newly installed binary —
-  plus a troubleshooting table keyed by symptom.
-
-- **`views` discovery tool and a view count in `status`** (#210). `views` lists
-  every indexed `(repo, view_id)` with its file count and the commit it was
-  indexed at, which makes the server self-describing rather than dependent on
-  out-of-band documentation; comparing `base_commit` against the checkout's HEAD
-  also surfaces a stale view, the quieter form of the same problem. `status` now
-  reports how many views are indexed, so the natural health-check call actually
-  detects a server pointed at an empty or wrong store. The `repo`/`view_id`
-  schema descriptions now say they must match an indexed view and point at
-  `views`.
-
 - **Calls inside Rust macro arguments are now recorded as references** (#216).
   Macro arguments parse as a `token_tree` of raw tokens rather than expressions,
   so `assert_eq!(f(), 1)` contained no `call_expression` and the call to `f` was
@@ -166,6 +151,33 @@ the patch version for fixes.
 
 ### Added
 
+- **`EXTRACTION_VERSION`, and a full walk when it changes** (#223). The
+  incremental driver carries unchanged slices forward untouched, so a parser
+  improvement never reached files that did not change — an existing view stayed
+  permanently half-upgraded. `gonzalo index` now records the extraction format
+  alongside the view and rebuilds in full when it differs, which is what lets
+  #216's and #223's parsing changes actually reach an established view.
+
+- **A guide chapter for the MCP server** (#208) — `docs/guide/src/mcp.md`, covering
+  install → index → register → verify → keep fresh, a tool reference grouped by the
+  question each tool answers, and the capability boundaries. It leads with the thing
+  nothing in the repo stated: the server only *reads*, `gonzalo index` writes, so an
+  unindexed setup answers every query forever with no indication why. It also records
+  the traps found while wiring the server up for real — `GONZALO_ROOT` not expanding
+  `~` (#211), `~/.cargo/bin` missing from the non-interactive shells an MCP client
+  spawns, and needing to reconnect the server to pick up a newly installed binary —
+  plus a troubleshooting table keyed by symptom.
+
+- **`views` discovery tool and a view count in `status`** (#210). `views` lists
+  every indexed `(repo, view_id)` with its file count and the commit it was
+  indexed at, which makes the server self-describing rather than dependent on
+  out-of-band documentation; comparing `base_commit` against the checkout's HEAD
+  also surfaces a stale view, the quieter form of the same problem. `status` now
+  reports how many views are indexed, so the natural health-check call actually
+  detects a server pointed at an empty or wrong store. The `repo`/`view_id`
+  schema descriptions now say they must match an indexed view and point at
+  `views`.
+
 - **Aggregate code-graph queries** (#214) — three MCP tools that answer questions
   about a view rather than about a symbol name the caller already has:
   `overview` (file/symbol/reference counts, a breakdown by kind and language, and
@@ -175,6 +187,7 @@ the patch version for fixes.
   default `GraphStore` methods, so every store implementation inherits them.
   Results are bounded and report `total` + `truncated` rather than silently
   cutting.
+
 - **`unreferenced` dead-code candidates** (#214) — a fourth aggregate tool
   listing symbols with no inbound reference, filtered by the same
   `path_prefix`/`kind`/`name_contains` and bounded the same way. `exclude_tests`
@@ -399,7 +412,8 @@ milestone (M1–M6).
   ADRs 0001–0009; added CI (fmt/clippy/build/test), a line-coverage gate, the
   Kanban label taxonomy, and board/triage automation.
 
-[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/caliban-ai/gonzalo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/gonzalo/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/caliban-ai/gonzalo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caliban-ai/gonzalo/compare/v0.1.0...v0.2.0
