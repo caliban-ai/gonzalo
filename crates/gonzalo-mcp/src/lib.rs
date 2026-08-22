@@ -90,8 +90,16 @@ impl GonzaloMcp {
             ),
             Tool::new(
                 "impact",
-                "List every symbol transitively affected if `name` changes (caller closure).",
-                view_query_schema(),
+                "Every symbol transitively affected if `name` changes (the caller closure). Only \
+                 call edges that resolve to a specific definition are followed, so the walk does \
+                 not merge unrelated code that happens to share an identifier; edges that cannot \
+                 be attributed are counted in `ambiguous_edges` rather than traversed, and a \
+                 non-zero count means the true set may be larger. Each result carries the path \
+                 defining it. `truncated` means the walk stopped at `max_depth` with frontier \
+                 left, so completeness is unknown. Note that only calls are edges: `impact` on a \
+                 struct, trait, or type is empty because type usage is not recorded, which means \
+                 \"not applicable\" rather than \"nothing depends on it\".",
+                impact_schema(),
             ),
             Tool::new(
                 "explore",
@@ -240,7 +248,18 @@ impl GonzaloMcp {
             "search" => self.result(self.service.graph_definitions(&repo, &view, &sym).await),
             "callers" => self.result(self.service.graph_callers_of(&repo, &view, &sym).await),
             "callees" => self.result(self.service.graph_callees(&repo, &view, &sym).await),
-            "impact" => self.result(self.service.graph_impact(&repo, &view, &sym).await),
+            "impact" => {
+                let max_depth = match usize_arg(&arguments, "max_depth", 0) {
+                    Ok(0) => None,
+                    Ok(n) => Some(n),
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                self.result(
+                    self.service
+                        .graph_impact(&repo, &view, &sym, max_depth)
+                        .await,
+                )
+            }
             "explore" => self.result(self.service.graph_references_to(&repo, &view, &sym).await),
             "node" => self.node(&repo, &view, &sym).await,
             // Unreachable: the known-tool guard above already returned for any
@@ -583,6 +602,35 @@ fn unreferenced_schema() -> Arc<Map<String, Value>> {
             }
         },
         "required": ["repo", "view_id"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
+/// Input schema for `impact`: the per-symbol selector plus an optional depth cap.
+fn impact_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": {
+                "type": "string",
+                "description": "repository of an INDEXED view, e.g. acme/widgets — must match one \
+                                reported by `views`, not an arbitrary name"
+            },
+            "view_id": {
+                "type": "string",
+                "description": "view id of an INDEXED view, e.g. main — must match one reported \
+                                by `views`"
+            },
+            "name": { "type": "string", "description": "symbol name to seed the closure from" },
+            "max_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "stop after this many hops (0 or omitted = unbounded); the result \
+                                reports `truncated` when a cap stopped it early"
+            }
+        },
+        "required": ["repo", "view_id", "name"],
         "additionalProperties": false
     });
     Arc::new(schema.as_object().expect("object schema").clone())
@@ -1367,21 +1415,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn impact_and_callees_return_names() {
+    async fn callees_returns_names() {
         let s = seeded_server().await;
-        let impact = s
-            .dispatch("impact", args("r", "main", "helper"))
-            .await
-            .unwrap();
-        let names: Value = serde_json::from_str(&result_text(&impact)).unwrap();
-        assert_eq!(names, serde_json::json!(["main"]));
-
         let callees = s
             .dispatch("callees", args("r", "main", "main"))
             .await
             .unwrap();
         let names: Value = serde_json::from_str(&result_text(&callees)).unwrap();
         assert_eq!(names, serde_json::json!(["helper"]));
+    }
+
+    // ---- resolution-gated impact (#207) ------------------------------------
+
+    #[tokio::test]
+    async fn impact_returns_a_report_with_paths() {
+        let s = seeded_server().await;
+        let v: Value = serde_json::from_str(&result_text(
+            &s.dispatch("impact", args("r", "main", "helper"))
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        // Not a bare name list any more: every node carries its defining path,
+        // and the honesty fields ride alongside.
+        assert_eq!(v["reached"][0]["name"], "main");
+        assert_eq!(v["reached"][0]["path"], "main.rs");
+        assert_eq!(v["ambiguous_edges"], 0);
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn impact_does_not_merge_subgraphs_through_a_shared_name() {
+        // `helper` is defined in both files; nothing else is shared. The old
+        // name-matched closure reached `top_b` from `leaf_a` (#207).
+        let s = seeded_with(&[
+            (
+                "a.rs",
+                "fn leaf_a() {}\nfn helper() { leaf_a(); }\nfn top_a() { helper(); }",
+            ),
+            (
+                "b.rs",
+                "fn leaf_b() {}\nfn helper() { leaf_b(); }\nfn top_b() { helper(); }",
+            ),
+        ])
+        .await;
+        let v: Value = serde_json::from_str(&result_text(
+            &s.dispatch("impact", args("r", "main", "leaf_a"))
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        let names: Vec<&str> = v["reached"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"top_a"), "{names:?}");
+        assert!(!names.contains(&"top_b"), "must not cross files: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn impact_accepts_a_max_depth() {
+        let s = seeded_with(&[("a.rs", "fn l() {}\nfn m() { l(); }\nfn t() { m(); }")]).await;
+        let mut a = args("r", "main", "l").unwrap();
+        a.insert("max_depth".into(), serde_json::json!(1));
+        let v: Value =
+            serde_json::from_str(&result_text(&s.dispatch("impact", Some(a)).await.unwrap()))
+                .unwrap();
+        assert_eq!(v["reached"].as_array().unwrap().len(), 1);
+        assert_eq!(v["reached"][0]["name"], "m");
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn impact_rejects_a_non_integer_max_depth() {
+        let s = seeded_server().await;
+        let mut a = args("r", "main", "helper").unwrap();
+        a.insert("max_depth".into(), serde_json::json!("deep"));
+        let result = s.dispatch("impact", Some(a)).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("max_depth"));
     }
 
     #[tokio::test]

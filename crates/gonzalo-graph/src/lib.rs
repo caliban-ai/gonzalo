@@ -17,7 +17,10 @@ pub use model::{
     CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
     SymbolKind, ViewOverview,
 };
-pub use resolve::{Resolution, ResolvedReference, resolve_references_to, resolved_callers_of};
+pub use resolve::{
+    ImpactNode, ImpactReport, Resolution, ResolvedReference, resolve_references_to,
+    resolved_callers_of, resolved_impact,
+};
 pub use store::{GraphStore, InMemoryGraphStore};
 
 #[cfg(feature = "conformance")]

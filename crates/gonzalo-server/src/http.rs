@@ -407,7 +407,7 @@ async fn graph_impact(
     if let Some(denied) = graph_authz(&principal, &q.repo) {
         return denied;
     }
-    match svc.graph_impact(&q.repo, &q.view, &q.name).await {
+    match svc.graph_impact_names(&q.repo, &q.view, &q.name).await {
         Ok(names) => (StatusCode::OK, Json(names)).into_response(),
         Err(e) => server_error(e),
     }

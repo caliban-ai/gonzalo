@@ -152,7 +152,7 @@ matters because an agent reads `[]` as "nothing calls this" and reports it as fa
 | `node` | definitions + callers + callees in one call |
 | `callers` / `callees` | who calls this / what does this call |
 | `explore` | every reference, with paths |
-| `impact` | transitive caller closure — **see the boundaries below** |
+| `impact` | transitive caller closure, resolution-gated; takes `max_depth` |
 
 **Across views**
 
@@ -177,10 +177,15 @@ a name are one node. `callees` includes enum variants, constructors, and std met
 ambiguity report: any name scoring above 1 is defined in several places, and every
 traversal through it merges unrelated subgraphs.
 
-**`impact` is unreliable on real repos.** Its transitive closure runs through those
-ambiguous names and returns roughly half the repository for a single seed
-([#207](https://github.com/caliban-ai/gonzalo/issues/207)). Prefer `callers` and
-`node`, and treat `impact` as a rough upper bound at best.
+**`impact` follows only resolvable edges.** It used to walk the name-matched graph and
+return roughly half the repository for one seed; it now keys on `(name, defining path)`
+and refuses to traverse an ambiguous reference, reporting the count in
+`ambiguous_edges` instead ([#207](https://github.com/caliban-ai/gonzalo/issues/207)).
+Read that count: non-zero means the true set may be larger than what you got. It is
+still an over-estimate — a name defined exactly once resolves confidently even when the
+call meant a std method of the same name
+([#223](https://github.com/caliban-ai/gonzalo/issues/223)) — so treat the closure as a
+lead list and confirm the load-bearing edges with `callers`.
 
 **`callers` on a type is always empty.** Only call expressions are edges, so types,
 traits, and structs have no inbound edges. Empty there means "not applicable", not
