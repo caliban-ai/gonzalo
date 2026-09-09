@@ -182,25 +182,168 @@ pub struct IndexSummary {
     pub incremental: bool,
 }
 
-/// Locate the `gonzalo-parse-worker` binary for crash-isolated parsing:
-/// `GONZALO_PARSE_WORKER` env override, else a sibling of the current
-/// executable (installed/`cargo build` layout). Returns `None` when no worker is
-/// available, in which case indexing parses in-process.
-fn resolve_parse_worker() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("GONZALO_PARSE_WORKER") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
+/// The `gonzalo-parse-worker` file name for this platform.
+fn worker_file_name() -> &'static str {
+    if cfg!(windows) {
+        "gonzalo-parse-worker.exe"
+    } else {
+        "gonzalo-parse-worker"
+    }
+}
+
+/// Where a parse worker was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerSource {
+    /// The `GONZALO_PARSE_WORKER` environment override.
+    Env,
+    /// Beside the running executable (the installed / `cargo build` layout).
+    Sibling,
+    /// On `PATH` — the symlink and split-install layouts, where a sibling
+    /// check cannot succeed but the worker is plainly available.
+    Path,
+}
+
+impl WorkerSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Env => "GONZALO_PARSE_WORKER",
+            Self::Sibling => "beside the executable",
+            Self::Path => "on PATH",
         }
     }
-    let sibling = std::env::current_exe()
-        .ok()?
-        .with_file_name(if cfg!(windows) {
-            "gonzalo-parse-worker.exe"
+}
+
+/// How an index run will parse.
+///
+/// The two modes produce identical graphs, which is exactly why the fallback
+/// went unnoticed: the worker is a pure isolation wrapper, so its absence costs
+/// nothing until a grammar `abort()`s and takes the whole run with it instead of
+/// skipping one file (#212). Reporting the mode is what makes the guarantee
+/// checkable at the moment it matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseMode {
+    /// Crash-isolated: parses run in a worker subprocess pool.
+    Isolated { path: PathBuf, source: WorkerSource },
+    /// In-process: no worker was found, so a grammar crash aborts the run.
+    /// Carries every location that was searched, so the warning can say where
+    /// to put one.
+    InProcess { searched: Vec<PathBuf> },
+}
+
+impl ParseMode {
+    /// The worker binary to parse through, or `None` to parse in-process.
+    pub fn worker(&self) -> Option<&Path> {
+        match self {
+            Self::Isolated { path, .. } => Some(path),
+            Self::InProcess { .. } => None,
+        }
+    }
+
+    /// Whether parsing is crash-isolated.
+    pub fn is_isolated(&self) -> bool {
+        matches!(self, Self::Isolated { .. })
+    }
+
+    /// One line naming the active mode, for `gonzalo index` to print.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Isolated { path, source } => {
+                format!("isolated worker {} ({})", path.display(), source.describe())
+            }
+            Self::InProcess { .. } => "in-process (no worker found)".to_string(),
+        }
+    }
+
+    /// The warning to emit when isolation is inactive, naming everywhere that
+    /// was searched. `None` when parsing is isolated.
+    pub fn warning(&self) -> Option<String> {
+        let Self::InProcess { searched } = self else {
+            return None;
+        };
+        let where_looked = if searched.is_empty() {
+            "  (nowhere — no executable path and no PATH entries)".to_string()
         } else {
-            "gonzalo-parse-worker"
-        });
-    sibling.exists().then_some(sibling)
+            searched
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Some(format!(
+            "gonzalo index: warning — parsing IN-PROCESS, not crash-isolated. A tree-sitter \
+             grammar that aborts will take down this run instead of skipping one file.\n\
+             Searched for {}:\n{where_looked}\n\
+             Install it (`cargo install gonzalo-parse`), put it on PATH or beside this \
+             executable, or point GONZALO_PARSE_WORKER at it. Use --require-parse-worker to \
+             make this a hard error.",
+            worker_file_name()
+        ))
+    }
+}
+
+/// Locate the `gonzalo-parse-worker` binary, given the inputs that decide it.
+///
+/// Split from the environment so it can be tested: setting a process
+/// environment variable is `unsafe` under edition 2024, which this workspace
+/// forbids outright.
+///
+/// Order is override, then adjacency, then `PATH` — most specific first.
+fn resolve_worker_from(
+    env_override: Option<PathBuf>,
+    exe: Option<PathBuf>,
+    search_path: &[PathBuf],
+) -> ParseMode {
+    let name = worker_file_name();
+    let mut searched = Vec::new();
+
+    if let Some(path) = env_override {
+        if path.is_file() {
+            return ParseMode::Isolated {
+                path,
+                source: WorkerSource::Env,
+            };
+        }
+        searched.push(path);
+    }
+
+    if let Some(exe) = exe {
+        let sibling = exe.with_file_name(name);
+        if sibling.is_file() {
+            return ParseMode::Isolated {
+                path: sibling,
+                source: WorkerSource::Sibling,
+            };
+        }
+        searched.push(sibling);
+    }
+
+    for dir in search_path {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return ParseMode::Isolated {
+                path: candidate,
+                source: WorkerSource::Path,
+            };
+        }
+        searched.push(candidate);
+    }
+
+    ParseMode::InProcess { searched }
+}
+
+/// Locate the `gonzalo-parse-worker` binary for crash-isolated parsing:
+/// the `GONZALO_PARSE_WORKER` override, else a sibling of the current
+/// executable, else `PATH`. Falls back to in-process parsing when none of those
+/// has one — reporting where it looked (#212).
+pub fn resolve_parse_worker() -> ParseMode {
+    let search_path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    resolve_worker_from(
+        std::env::var_os("GONZALO_PARSE_WORKER").map(PathBuf::from),
+        std::env::current_exe().ok(),
+        &search_path,
+    )
 }
 
 /// Parse one file's `content` as `language`, through the crash-isolated `pool`
@@ -249,8 +392,8 @@ pub async fn index_with(
     view: &str,
     filter: &IndexFilter,
 ) -> Result<IndexSummary> {
-    let worker = resolve_parse_worker();
-    index_with_worker(root, src, repo, view, filter, worker.as_deref()).await
+    let mode = resolve_parse_worker();
+    index_with_worker(root, src, repo, view, filter, mode.worker()).await
 }
 
 /// How long to wait for a worker to answer [`worker_extraction_version`].
@@ -658,7 +801,22 @@ pub async fn index_with_gc_filtered(
     gc_after: bool,
     filter: &IndexFilter,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
-    let summary = index_with(root, src, repo, view, filter).await?;
+    let mode = resolve_parse_worker();
+    index_with_gc_filtered_worker(root, src, repo, view, gc_after, filter, mode.worker()).await
+}
+
+/// [`index_with_gc_filtered`], with the parse worker pinned rather than
+/// resolved — see [`index_with_worker`].
+pub async fn index_with_gc_filtered_worker(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    gc_after: bool,
+    filter: &IndexFilter,
+    worker: Option<&Path>,
+) -> Result<(IndexSummary, Option<GcSummary>)> {
+    let summary = index_with_worker(root, src, repo, view, filter, worker).await?;
     let swept = if gc_after {
         Some(gc(root).await?)
     } else {
@@ -819,6 +977,51 @@ mod tests {
 
     fn write_file(dir: &Path, name: &str, contents: &str) {
         std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    // The real `index`/`index_with`/`index_with_gc` resolve a parse worker from
+    // the environment, and since #212 that includes `PATH` — so on any machine
+    // with `gonzalo-parse-worker` installed these tests would silently measure
+    // that binary instead of this build. (Concretely: a released worker predates
+    // `--extraction-version`, so #228 reads it as unknown and every run becomes a
+    // full walk, and the incremental assertions below fail for reasons that have
+    // nothing to do with what they test.)
+    //
+    // These shadow the real entry points with parsing pinned in-process, so a
+    // test asserts about the code under test and nothing ambient. Worker
+    // resolution itself is covered directly, against `resolve_worker_from`.
+
+    async fn index(root: &Path, src: &Path, repo: &str, view: &str) -> Result<IndexSummary> {
+        index_with(root, src, repo, view, &IndexFilter::default()).await
+    }
+
+    async fn index_with(
+        root: &Path,
+        src: &Path,
+        repo: &str,
+        view: &str,
+        filter: &IndexFilter,
+    ) -> Result<IndexSummary> {
+        index_with_worker(root, src, repo, view, filter, None).await
+    }
+
+    async fn index_with_gc(
+        root: &Path,
+        src: &Path,
+        repo: &str,
+        view: &str,
+        gc_after: bool,
+    ) -> Result<(IndexSummary, Option<GcSummary>)> {
+        index_with_gc_filtered_worker(
+            root,
+            src,
+            repo,
+            view,
+            gc_after,
+            &IndexFilter::default(),
+            None,
+        )
+        .await
     }
 
     // ── migrate: basic import ────────────────────────────────────────────────
@@ -1233,6 +1436,144 @@ mod tests {
         let sig = git2::Signature::now("t", "t@localhost").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
             .unwrap();
+    }
+
+    // ── index: locating the parse worker (gonzalo#212) ───────────────────────
+
+    /// Create an empty file at `dir/name` and return its path.
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "").unwrap();
+        path
+    }
+
+    #[test]
+    fn the_env_override_wins_over_everything_else() {
+        let over = TempDir::new().unwrap();
+        let beside = TempDir::new().unwrap();
+        let on_path = TempDir::new().unwrap();
+        let chosen = touch(over.path(), "my-worker");
+        touch(beside.path(), worker_file_name());
+        touch(on_path.path(), worker_file_name());
+
+        let mode = resolve_worker_from(
+            Some(chosen.clone()),
+            Some(beside.path().join("gonzalo")),
+            &[on_path.path().to_path_buf()],
+        );
+        assert_eq!(
+            mode,
+            ParseMode::Isolated {
+                path: chosen,
+                source: WorkerSource::Env
+            }
+        );
+    }
+
+    #[test]
+    fn a_sibling_of_the_executable_is_preferred_over_path() {
+        let beside = TempDir::new().unwrap();
+        let on_path = TempDir::new().unwrap();
+        let sibling = touch(beside.path(), worker_file_name());
+        touch(on_path.path(), worker_file_name());
+
+        let mode = resolve_worker_from(
+            None,
+            Some(beside.path().join("gonzalo")),
+            &[on_path.path().to_path_buf()],
+        );
+        assert_eq!(
+            mode,
+            ParseMode::Isolated {
+                path: sibling,
+                source: WorkerSource::Sibling
+            }
+        );
+    }
+
+    #[test]
+    fn the_worker_is_found_on_path_when_it_is_not_beside_the_executable() {
+        // The layouts a sibling check cannot reach: a symlinked `gonzalo` on
+        // PATH, a container that copies one binary, `cargo run` from a
+        // workspace target dir. The worker is plainly available in all three.
+        let beside = TempDir::new().unwrap();
+        let empty = TempDir::new().unwrap();
+        let on_path = TempDir::new().unwrap();
+        let found = touch(on_path.path(), worker_file_name());
+
+        let mode = resolve_worker_from(
+            None,
+            Some(beside.path().join("gonzalo")),
+            &[empty.path().to_path_buf(), on_path.path().to_path_buf()],
+        );
+        assert_eq!(
+            mode,
+            ParseMode::Isolated {
+                path: found,
+                source: WorkerSource::Path
+            }
+        );
+    }
+
+    #[test]
+    fn no_worker_anywhere_falls_back_and_names_every_place_it_looked() {
+        let missing = TempDir::new().unwrap();
+        let beside = TempDir::new().unwrap();
+        let on_path = TempDir::new().unwrap();
+        let override_path = missing.path().join("not-here");
+
+        let mode = resolve_worker_from(
+            Some(override_path.clone()),
+            Some(beside.path().join("gonzalo")),
+            &[on_path.path().to_path_buf()],
+        );
+
+        let ParseMode::InProcess { searched } = &mode else {
+            panic!("expected the in-process fallback, got {mode:?}");
+        };
+        // A bad override is a place it looked, not a reason to stop looking.
+        assert_eq!(
+            searched,
+            &[
+                override_path,
+                beside.path().join(worker_file_name()),
+                on_path.path().join(worker_file_name()),
+            ]
+        );
+        assert!(!mode.is_isolated());
+        assert!(mode.worker().is_none());
+
+        // The warning has to be actionable: it names the binary, every path
+        // tried, and what a grammar crash now costs.
+        let warning = mode.warning().expect("in-process must warn");
+        assert!(warning.contains(worker_file_name()));
+        assert!(warning.contains(&beside.path().join(worker_file_name()).display().to_string()));
+        assert!(warning.contains("--require-parse-worker"));
+        assert!(warning.contains("IN-PROCESS"));
+    }
+
+    #[test]
+    fn an_isolated_mode_names_its_worker_and_never_warns() {
+        let dir = TempDir::new().unwrap();
+        let worker = touch(dir.path(), worker_file_name());
+        let mode = resolve_worker_from(None, Some(dir.path().join("gonzalo")), &[]);
+
+        assert_eq!(mode.worker(), Some(worker.as_path()));
+        assert!(mode.warning().is_none(), "isolation is the quiet path");
+        let summary = mode.summary();
+        assert!(summary.contains("isolated"));
+        assert!(summary.contains(&worker.display().to_string()));
+        assert!(summary.contains("beside the executable"));
+    }
+
+    #[test]
+    fn a_directory_named_like_the_worker_is_not_mistaken_for_it() {
+        // `is_file`, not `exists` — a directory of that name on PATH would
+        // otherwise be selected and every parse would fail to spawn.
+        let on_path = TempDir::new().unwrap();
+        std::fs::create_dir(on_path.path().join(worker_file_name())).unwrap();
+        let mode = resolve_worker_from(None, None, &[on_path.path().to_path_buf()]);
+        assert!(!mode.is_isolated());
     }
 
     // ── index: the parse path's extraction version (gonzalo#228) ─────────────

@@ -22,6 +22,18 @@ the patch version for fixes.
 
 ### Fixed
 
+- `gonzalo index` says which parse mode it is using instead of silently
+  degrading. Crash isolation depends on finding `gonzalo-parse-worker`, and when
+  it could not, indexing quietly parsed in-process — no log line, no warning, no
+  way to tell. The two modes produce byte-identical graphs, so the loss was
+  invisible until a tree-sitter grammar aborted and took down the whole run
+  instead of skipping one file. A `parse:` line now names the worker and how it
+  was found; the fallback prints a warning listing every location searched; and
+  `--require-parse-worker` turns a missing worker into a hard error for CI and
+  container builds. Lookup also covers `PATH`, so symlink and split-install
+  layouts — where a sibling check cannot succeed but the worker is plainly
+  available — find it. (#212)
+
 - A stale `gonzalo-parse-worker` no longer produces pre-upgrade extraction that
   the view records as current. `EXTRACTION_VERSION` guarded the CLI, but the
   worker is a separately installed binary and is what actually parses — so a

@@ -29,8 +29,10 @@ each gets its own SQLite graph under `<root>/graphs/<encoded-repo>/<view>.db`.
 Three binaries are involved and they must all be at the same version: `gonzalo`,
 `gonzalo-mcp`, and `gonzalo-parse-worker`. The last one isolates tree-sitter parsing in
 a subprocess so one bad file skips instead of aborting the whole index. Indexing works
-without it — it silently falls back to in-process parsing — so it is not optional in
-practice, just easy to forget.
+without it, falling back to in-process parsing — so it is not optional in practice,
+just easy to forget. `gonzalo index` now says which mode it is in, and
+`--require-parse-worker` turns the fallback into a hard error for CI and container
+builds that should not take isolation on trust.
 
 ### Apple Silicon: the release archive
 
@@ -79,6 +81,7 @@ gonzalo index --root /Users/you/.gonzalo --repo acme/widgets --view main /path/t
 Output tells you what happened:
 
 ```
+parse:    isolated worker /Users/you/.cargo/bin/gonzalo-parse-worker (beside the executable)
 driver:   full walk
 files:    465
 added:    465
@@ -88,6 +91,12 @@ skipped:  0
 ignored:  2 files, 9 dirs not descended
 ```
 
+- `parse` — `isolated worker <path>` when tree-sitter runs in a crash-isolated
+  subprocess, or `in-process (no worker found)` when it does not. The two produce
+  identical graphs, so this line is the only way to tell whether a grammar that
+  `abort()`s will skip one file or kill the run. In-process also prints a warning
+  naming every location searched — the `GONZALO_PARSE_WORKER` override, beside the
+  executable, then each `PATH` entry. Pass `--require-parse-worker` to fail instead.
 - `driver` — `full walk` the first time; afterwards a git-diff-driven **incremental**
   pass that re-parses only what changed. A no-op re-index is well under a second.
 - `skipped` — files a parse worker crashed or hung on.

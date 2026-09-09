@@ -101,3 +101,37 @@ async fn times_out_a_hung_worker() {
     let g = p.parse(Language::Rust, "fn after_hang() {}").await.unwrap();
     assert!(g.symbols.iter().any(|s| s.name == "after_hang"));
 }
+
+/// Isolated and in-process parsing must produce **identical** graphs (#212).
+///
+/// This is the property that makes the silent fallback so easy to miss: the
+/// worker is a pure isolation wrapper, not a different parser, so a run with no
+/// worker looks perfectly healthy right up until a grammar `abort()`s and takes
+/// the whole index down instead of skipping one file. Pin the equivalence, so
+/// "which mode am I in" stays purely a question about crash containment.
+#[tokio::test]
+async fn isolated_and_in_process_parsing_agree() {
+    let p = pool(2);
+    let cases = [
+        (
+            Language::Rust,
+            "fn helper() {}\nstruct S;\nfn main() { helper(); S::new(); }",
+        ),
+        (
+            Language::Python,
+            "class C:\n    def m(self):\n        return other(1)\n",
+        ),
+        (
+            Language::Go,
+            "package main\nfunc helper() {}\nfunc main() { helper() }\n",
+        ),
+    ];
+    for (language, source) in cases {
+        let isolated = p.parse(language, source).await.unwrap();
+        let in_process = gonzalo_graph::build(language, source);
+        assert_eq!(
+            isolated, in_process,
+            "{language:?} must parse the same in either mode"
+        );
+    }
+}
