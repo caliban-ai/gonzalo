@@ -22,6 +22,18 @@ the patch version for fixes.
 
 ### Fixed
 
+- A leading `~` in a store root is expanded to `$HOME` instead of being taken
+  literally. `GONZALO_ROOT=~/.gonzalo` in an MCP client config reaches the
+  process verbatim — there is no shell in that path — so it created a directory
+  *literally named* `~` in whatever the working directory happened to be, and
+  every query then answered from the wrong, empty store. The form users
+  naturally write, and the one that works when tried in a shell, was exactly the
+  form that silently misbehaved where it mattered. Expansion covers
+  `GONZALO_ROOT` and every `--root` argument, which has the same exposure from a
+  systemd unit or container spec, and `status` now reports the expanded path so
+  it is verifiable. Only a leading `~` is touched: `~otheruser/…` is left alone,
+  and a `~` anywhere but the front is an ordinary directory name. (#211)
+
 - `gonzalo index` says which parse mode it is using instead of silently
   degrading. Crash isolation depends on finding `gonzalo-parse-worker`, and when
   it could not, indexing quietly parsed in-process — no log line, no warning, no
