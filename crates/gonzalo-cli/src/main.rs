@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
-    IndexFilter, WatchConfig, gc, get, index_with_gc_filtered, list, migrate, status, sync_stores,
-    ticket_move, ticket_sync, watch,
+    IndexFilter, WatchConfig, gc, get, index_with_gc_filtered, list, migrate, resolve_parse_worker,
+    status, sync_stores, ticket_move, ticket_sync, watch,
 };
 use gonzalo_core::RecordKind;
 use std::path::PathBuf;
@@ -101,6 +101,12 @@ enum Commands {
         /// stay reproducible from the commit alone.
         #[arg(long = "include", value_name = "PATH")]
         include: Vec<String>,
+        /// Fail instead of falling back to in-process parsing when no
+        /// `gonzalo-parse-worker` can be found. Crash isolation is otherwise a
+        /// silent best-effort, which is not something CI or a container build
+        /// should have to take on trust (#212).
+        #[arg(long)]
+        require_parse_worker: bool,
     },
     /// Garbage-collect orphaned code-graph slices, marking against every live
     /// view's manifest across all repos.
@@ -257,8 +263,25 @@ async fn main() -> Result<()> {
             debounce_ms,
             reconcile_secs,
             include,
+            require_parse_worker,
         } => {
             let filter = IndexFilter::new(&include);
+
+            // Say which parse mode is active before doing any work. The two
+            // modes produce identical graphs, so this line is the only way to
+            // know whether a grammar crash will skip one file or kill the run.
+            let parse_mode = resolve_parse_worker();
+            if require_parse_worker && !parse_mode.is_isolated() {
+                anyhow::bail!(
+                    "--require-parse-worker: no {} found.\n{}",
+                    "gonzalo-parse-worker",
+                    parse_mode.warning().unwrap_or_default()
+                );
+            }
+            println!("parse:    {}", parse_mode.summary());
+            if let Some(warning) = parse_mode.warning() {
+                eprintln!("{warning}");
+            }
             if watch_mode {
                 let config = WatchConfig {
                     debounce: Duration::from_millis(debounce_ms),
