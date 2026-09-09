@@ -36,11 +36,13 @@ builds that should not take isolation on trust.
 
 ### Apple Silicon: the release archive
 
-Every release carries one prebuilt archive holding all three, which is the shortest
-path to a set that cannot be mismatched:
+Releases carry one prebuilt archive holding all three, which is the shortest path to a
+set that cannot be mismatched. Take the tag from the
+[latest release](https://github.com/caliban-ai/gonzalo/releases/latest) — or let `gh`
+read it for you:
 
 ```sh
-tag=v0.5.0
+tag=$(gh release view --repo caliban-ai/gonzalo --json tagName -q .tagName)
 base="https://github.com/caliban-ai/gonzalo/releases/download/$tag"
 pkg="gonzalo-$tag-aarch64-apple-darwin"
 curl -fsSLO "$base/$pkg.tar.gz" -O "$base/$pkg.tar.gz.sha256"
@@ -48,6 +50,9 @@ shasum -a 256 -c "$pkg.tar.gz.sha256"
 tar xzf "$pkg.tar.gz"
 install -m 755 "$pkg"/gonzalo "$pkg"/gonzalo-mcp "$pkg"/gonzalo-parse-worker ~/.cargo/bin/
 ```
+
+Archives start with the first release after `v0.5.0`; earlier releases carry no assets,
+so build from the registry below if you need one of those.
 
 The binaries are ad-hoc signed, not notarized. A `curl` download runs as-is; a
 **browser** download is quarantined and needs `xattr -d com.apple.quarantine "$pkg"/*`.
@@ -57,7 +62,8 @@ macOS arm64 is the only prebuilt target. Everywhere else, build from the registr
 ### Anywhere else: from crates.io
 
 ```sh
-cargo install gonzalo-cli@0.5.0 gonzalo-mcp@0.5.0 gonzalo-parse@0.5.0
+v=0.5.0   # the version you want; `cargo search gonzalo-cli` shows the newest
+cargo install "gonzalo-cli@$v" "gonzalo-mcp@$v" "gonzalo-parse@$v"
 ```
 
 Pin the version on all three. They are separate crates, so nothing stops them landing
