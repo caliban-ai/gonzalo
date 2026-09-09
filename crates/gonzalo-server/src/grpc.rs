@@ -391,6 +391,25 @@ fn located_response<T: Serialize>(items: &[T]) -> Result<GraphLocatedResponse, S
 /// Serve gRPC on an already-bound listener until the process ends. `auth`
 /// governs per-call namespace authorization (ADR 0015); `Auth::Disabled` serves
 /// open.
+///
+/// # The decode ceiling applies to every RPC, not just blobs
+///
+/// `max_decoding_message_size` below is raised to `max_blob_size` so 64 MiB
+/// blobs can transit `PutBlob`. tonic scopes that setting **per server**, not
+/// per method — there is no per-RPC knob — so it raises the decode ceiling for
+/// *every* RPC, including record `Put`, from tonic's 4 MiB default to
+/// `GONZALO_MAX_BLOB_SIZE`.
+///
+/// Two consequences worth knowing before you change the env var:
+///
+/// - Raising `GONZALO_MAX_BLOB_SIZE` to allow larger blobs also allows larger
+///   records. That is a surprising reach for a knob named for blobs.
+/// - It is asymmetric with HTTP, where the blob body limit is scoped to the
+///   blob sub-router, so record `PUT`s keep axum's 2 MiB default (`http.rs`).
+///
+/// This is bounded and every call is authenticated, so it is documented rather
+/// than closed (#194). Closing it would mean a tower layer inspecting
+/// content-length by gRPC method path — real machinery for a benign gap.
 pub async fn serve_grpc(
     listener: tokio::net::TcpListener,
     service: Service,
@@ -400,6 +419,7 @@ pub async fn serve_grpc(
     let adapter = GrpcAdapter::with_auth(service, auth);
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     tonic::transport::Server::builder()
+        // Per-server, so this governs record RPCs too — see the doc comment.
         .add_service(GonzaloServer::new(adapter).max_decoding_message_size(max_blob))
         .serve_with_incoming(incoming)
         .await
