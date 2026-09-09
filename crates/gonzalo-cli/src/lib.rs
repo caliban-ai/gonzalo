@@ -8,7 +8,7 @@ use gonzalo_core::{
 };
 use gonzalo_graph::{CodeGraph, EXTRACTION_VERSION, GraphStore, Language, build};
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
-use gonzalo_parse::ParserPool;
+use gonzalo_parse::{ParserPool, worker_extraction_version};
 use gonzalo_store_fs::FsStore;
 use gonzalo_ticket::IngestSummary;
 use gonzalo_ticket_config::{Config, Connection, parse_category};
@@ -249,12 +249,58 @@ pub async fn index_with(
     view: &str,
     filter: &IndexFilter,
 ) -> Result<IndexSummary> {
+    let worker = resolve_parse_worker();
+    index_with_worker(root, src, repo, view, filter, worker.as_deref()).await
+}
+
+/// How long to wait for a worker to answer [`worker_extraction_version`].
+/// Generous next to a process spawn; a worker that misses it reads as unknown
+/// rather than wedging the run.
+const WORKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`index_with`], with the parse worker pinned rather than resolved.
+///
+/// `worker` is the `gonzalo-parse-worker` binary to parse through, or `None` to
+/// parse in-process. [`index_with`] passes whatever [`resolve_parse_worker`]
+/// finds; pinning it explicitly is what lets a test drive a known parse path.
+pub async fn index_with_worker(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    filter: &IndexFilter,
+    worker: Option<&Path>,
+) -> Result<IndexSummary> {
     let store = FsStore::new(root);
+
+    // The extraction format the parse path will actually produce — which is not
+    // necessarily this build's. The worker is a separately installed binary, so
+    // ask it; `None` (a pre-#228 worker, a missing one, a hang) is unknown, and
+    // unknown is recorded as 0 so it can never be mistaken for agreement (#228).
+    // With no worker the CLI parses in-process, so its own constant is accurate.
+    let parse_version = match worker {
+        Some(bin) => worker_extraction_version(bin, WORKER_PROBE_TIMEOUT)
+            .await
+            .unwrap_or(0),
+        None => EXTRACTION_VERSION,
+    };
+    if parse_version != EXTRACTION_VERSION {
+        let reported = match parse_version {
+            0 => "did not report one".to_string(),
+            v => format!("reports {v}"),
+        };
+        eprintln!(
+            "gonzalo index: warning — the parse worker {reported}, but this build records \
+             extraction version {EXTRACTION_VERSION}. Parsing anyway, rebuilding the view in \
+             full and crediting it to the worker; install a matching gonzalo-parse-worker to \
+             get {EXTRACTION_VERSION} extraction."
+        );
+    }
 
     // Parse through a crash-isolated worker pool when a worker binary is
     // available (so a grammar crash on one file skips that file instead of
     // aborting the index); otherwise parse in-process.
-    let pool = resolve_parse_worker().map(|bin| {
+    let pool = worker.map(|bin| {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -281,11 +327,13 @@ pub async fn index_with(
     // A view built by a parser that recorded different things must be rebuilt
     // in full: the incremental driver carries unchanged slices forward, so
     // without this an existing view keeps pre-upgrade extraction forever.
+    // Compared against the version the *parse path* produces, not this build's
+    // — otherwise a stale worker's output is carried forward as current (#228).
     let version_path = db_path.with_extension("fmt");
     let recorded_version: Option<u32> = std::fs::read_to_string(&version_path)
         .ok()
         .and_then(|s| s.trim().parse().ok());
-    let format_changed = recorded_version != Some(EXTRACTION_VERSION);
+    let format_changed = recorded_version != Some(parse_version);
 
     let recorded_base = std::fs::read_to_string(&base_path)
         .ok()
@@ -372,10 +420,13 @@ pub async fn index_with(
         std::fs::write(&base_path, sha).ok();
     }
     // Record the extraction format this view was built with, so the next run can
-    // tell whether an incremental pass is still valid.
+    // tell whether an incremental pass is still valid. This is the version the
+    // parse path actually produced — never this build's constant when something
+    // else did the parsing, or the view would claim an upgrade it never got and
+    // no later re-index would revisit it (#228).
     if let Some(parent) = version_path.parent() {
         std::fs::create_dir_all(parent).ok();
-        std::fs::write(&version_path, EXTRACTION_VERSION.to_string()).ok();
+        std::fs::write(&version_path, parse_version.to_string()).ok();
     }
 
     Ok(IndexSummary {
@@ -1182,6 +1233,189 @@ mod tests {
         let sig = git2::Signature::now("t", "t@localhost").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
             .unwrap();
+    }
+
+    // ── index: the parse path's extraction version (gonzalo#228) ─────────────
+
+    /// An executable stand-in for `gonzalo-parse-worker` that reports
+    /// `reports` as its extraction version and parses everything to an empty
+    /// slice. Enough to drive an index run without a real grammar.
+    fn worker_reporting(dir: &Path, name: &str, reports: Option<u32>) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let answer = match reports {
+            // A pre-#228 worker ignores argv and blocks on stdin; the probe
+            // closes stdin, so it exits silently having answered nothing.
+            None => String::new(),
+            Some(v) => format!("[ \"$1\" = --extraction-version ] && {{ echo {v}; exit 0; }}\n"),
+        };
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n{answer}while IFS= read -r _; do \
+                 printf '%s\\n' '{{\"symbols\":[],\"references\":[]}}'; done\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn fmt_of(root: &Path) -> String {
+        let p = view_db_path(&root.join("graphs"), "r", "main").with_extension("fmt");
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stale_worker_forces_a_full_walk_and_is_never_credited() {
+        // The hole #228 records: EXTRACTION_VERSION is compiled into the CLI,
+        // but the *worker* is what parses. A new CLI driving an old worker used
+        // to emit pre-upgrade extraction and then stamp `.fmt` with the new
+        // version — leaving the view wrong AND marked current, so no later
+        // re-index would ever repair it.
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        git_init_commit(src.path());
+        let bins = TempDir::new().unwrap();
+
+        // A worker that agrees with this build behaves exactly as before.
+        let current = worker_reporting(bins.path(), "current", Some(EXTRACTION_VERSION));
+        let filter = IndexFilter::default();
+        index_with_worker(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &filter,
+            Some(current.as_path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fmt_of(root.path()), EXTRACTION_VERSION.to_string());
+        assert!(
+            index_with_worker(
+                root.path(),
+                src.path(),
+                "r",
+                "main",
+                &filter,
+                Some(current.as_path())
+            )
+            .await
+            .unwrap()
+            .incremental,
+            "a worker at the current version still indexes incrementally"
+        );
+
+        // Swap in a worker one version behind — the exact upgrade-order slip.
+        let stale = worker_reporting(bins.path(), "stale", Some(EXTRACTION_VERSION - 1));
+        let summary = index_with_worker(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &filter,
+            Some(stale.as_path()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !summary.incremental,
+            "a worker that disagrees with the CLI must rebuild in full"
+        );
+        assert_eq!(
+            fmt_of(root.path()),
+            (EXTRACTION_VERSION - 1).to_string(),
+            "and the view must be credited to what actually parsed, not to the CLI"
+        );
+
+        // Because the stamp is honest, fixing the worker repairs the view on the
+        // next run instead of leaving it silently half-upgraded forever.
+        let after = index_with_worker(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &filter,
+            Some(current.as_path()),
+        )
+        .await
+        .unwrap();
+        assert!(!after.incremental, "restoring the worker re-walks the view");
+        assert_eq!(fmt_of(root.path()), EXTRACTION_VERSION.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_cannot_report_its_version_is_recorded_as_unknown() {
+        // A pre-#228 worker answers nothing, so the view is credited to 0 —
+        // "built by a parser that would not say". Two such runs may still go
+        // incrementally: 0 == 0 claims only that the parse path is the same
+        // unknown one, which is true, and forcing a full walk on every index
+        // would punish every not-yet-upgraded user (badly so under `--watch`).
+        //
+        // What must not happen is 0 being mistaken for this build's version —
+        // that is the #228 failure, and the transition below is where it shows.
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        git_init_commit(src.path());
+        let bins = TempDir::new().unwrap();
+        let silent = worker_reporting(bins.path(), "silent", None);
+        let filter = IndexFilter::default();
+
+        index_with_worker(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &filter,
+            Some(silent.as_path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fmt_of(root.path()), "0", "unknown is recorded, not assumed");
+
+        // Installing a worker that does report repairs the view rather than
+        // inheriting whatever the silent one left behind.
+        let current = worker_reporting(bins.path(), "current", Some(EXTRACTION_VERSION));
+        let healed = index_with_worker(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &filter,
+            Some(current.as_path()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !healed.incremental,
+            "a view built by an unknown parser must be rebuilt once a known one appears"
+        );
+        assert_eq!(fmt_of(root.path()), EXTRACTION_VERSION.to_string());
+    }
+
+    #[tokio::test]
+    async fn in_process_parsing_is_credited_to_this_build() {
+        // With no worker at all the CLI parses in-process, so its own constant
+        // does describe what was recorded (#212's fallback path).
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+        git_init_commit(src.path());
+
+        index_with_worker(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            &IndexFilter::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fmt_of(root.path()), EXTRACTION_VERSION.to_string());
     }
 
     #[tokio::test]

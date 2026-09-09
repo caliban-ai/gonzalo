@@ -45,6 +45,38 @@ pub enum ParseError {
     Protocol(String),
 }
 
+/// Ask the worker binary at `bin` which extraction format it produces, giving
+/// up after `timeout`.
+///
+/// The worker is a **separately installed binary**, so a caller's own
+/// [`EXTRACTION_VERSION`](gonzalo_graph::EXTRACTION_VERSION) says nothing about
+/// what actually parses: a new CLI driving an old worker emits pre-upgrade
+/// extraction while believing it emitted current data (#228). This is how the
+/// caller finds out instead of assuming.
+///
+/// `None` means *unknown*, never *agreed*. It covers every way the answer can
+/// fail to arrive — the binary is missing or not executable, it exits non-zero,
+/// it prints something unparseable, it hangs, or it is a pre-#228 worker that
+/// ignores argv and blocks on stdin (the probe closes stdin, so such a worker
+/// exits silently). A caller must treat `None` as a version that cannot match.
+pub async fn worker_extraction_version(bin: &Path, timeout: Duration) -> Option<u32> {
+    let probe = Command::new(bin)
+        .arg("--extraction-version")
+        // Closed, not inherited: a pre-#228 worker reads argv-less and would
+        // otherwise sit forever waiting for a parse request.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+
+    let out = tokio::time::timeout(timeout, probe).await.ok()?.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+}
+
 /// A pool of parse-worker subprocesses.
 pub struct ParserPool {
     worker_bin: PathBuf,
