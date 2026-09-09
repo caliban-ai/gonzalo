@@ -47,7 +47,16 @@ repository = "https://github.com/caliban-ai/gonzalo"
 gonzalo-core   = { path = "crates/gonzalo-core", version = "0.5.0" }
 gonzalo-store-fs = { path = "crates/gonzalo-store-fs", version = "0.5.0" }
 gonzalo-store-git = { path = "crates/gonzalo-store-git", version = "0.5.0" }
-git2         = { version = "0.20", default-features = false }
+# `vendored-libgit2` builds and statically links libgit2 rather than probing
+# pkg-config for a system copy. Without it, libgit2-sys links whatever the build
+# machine happens to have — so a macOS build with Homebrew installed produced a
+# binary referencing /opt/homebrew, which dies in dyld anywhere else, while the
+# Linux container (no libgit2-dev in its builder) already vendored. Same tag,
+# different portability, depending on the runner (#246).
+#
+# `default-features = false` still applies: no `https`, no `ssh`. Transport for
+# gonzalo-store-git remotes is a separate, explicit decision.
+git2         = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 gonzalo-store-s3 = { path = "crates/gonzalo-store-s3", version = "0.5.0" }
 aws-config   = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3   = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
