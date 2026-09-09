@@ -42,20 +42,38 @@ a `path` and a `version` — `cargo publish` requires the registry `version` on
 every dependency (the `path` is used for the local verify build; the `version`
 is what lands in the published manifest).
 
-## The crates.io new-crate rate limit
+## The crates.io rate limits — there are two of them
 
-crates.io throttles the creation of **brand-new crate names** much harder than
-new *versions* of existing crates: a burst of **5 new crates**, then **~1 new
-crate per 10 minutes** (https://crates.io/docs/rate-limits). The first release
-of the workspace therefore cannot go out in one shot — a plain
-`cargo publish --workspace` uploads ~5 crates and then fails with HTTP 429.
+crates.io enforces **two separate limits**, and a 24-crate workspace trips both:
 
-This only bites on the **first** publish of each crate name. Once all 24 crates
-exist, future releases publish new *versions*, which are not meaningfully
-limited.
+| limit | applies to | when it bites |
+|---|---|---|
+| **new-crate burst** | publishing crate *names* not seen before | the first release only |
+| **updates to existing crates** | every version bump | **every release** |
+
+**New crate names.** A burst of **5**, then **~1 per 10 minutes**
+(https://crates.io/docs/rate-limits). The first release of the workspace
+therefore cannot go out in one shot — a plain `cargo publish --workspace`
+uploads ~5 crates and then fails with HTTP 429. This only bites on the *first*
+publish of each name.
+
+**Version bumps of crates that already exist.** These are limited too, by a
+separate allowance. Publishing 24 crates back to back exceeds it, so **every**
+gonzalo release is expected to stop partway with:
+
+```
+error: failed to publish gonzalo-mcp v0.5.0 to registry at https://crates.io
+Caused by:
+  the remote server responded with an error (status 429 Too Many Requests):
+  You have published too many updates to existing crates in a short period of time.
+```
+
+That is the documented path, not a broken release — see
+[Resuming a rate-limited publish](#resuming-a-rate-limited-publish).
 
 To request a higher limit, email **help@crates.io** with the account and crate
-list; they routinely grant it for legitimate multi-crate projects.
+list; they routinely grant it for legitimate multi-crate projects. That is the
+only thing that makes a release a single uninterrupted run.
 
 ## `scripts/publish.sh`
 
@@ -118,8 +136,10 @@ it can be re-run to resume. **Rotate the token afterward** if it was ever expose
 
 ## Subsequent releases (version bumps)
 
-These publish new *versions* of existing crates and are not rate-limited, so the
-workflow handles them automatically. Cut the release with **cai-cut-release**
+These publish new *versions* of existing crates. They **are** rate-limited — by
+the update allowance rather than the new-crate one — and 24 crates in a row
+exceed it, so expect the workflow to publish most of them and then stop. Cut the
+release with **cai-cut-release**
 (which bumps the version + internal dep pins in lockstep, rolls the changelog,
 and lands the release PR), then:
 
@@ -139,13 +159,59 @@ The tag push fires all three workflows. `publish.yml` validates the guards and
 runs `scripts/publish.sh` with `MAX_SLEEP_SECS=0`, publishing each crate in
 dependency order with no recompile.
 
-If a release ever introduces **new** crate names and there are more than ~5 of
-them, the workflow publishes the burst and stops (it won't idle-bill on the
-429) — finish the rest locally with `scripts/publish.sh`.
-
 Throughout, `X.Y.Z` is whatever `[workspace.package].version` in `Cargo.toml`
 says after the release PR lands — `publish.yml` refuses a tag that disagrees with
 it, so the two cannot drift.
+
+### Resuming a rate-limited publish
+
+**Expect `publish.yml` to go red partway through, and do not read that as a
+broken release.** `MAX_SLEEP_SECS=0` in CI means the runner never idles on a 429
+— sleeping on a GitHub runner is billed, sleeping on your laptop is free — so
+`scripts/publish.sh` publishes what the allowance permits, prints how long the
+window has left, and exits 75:
+
+```
+⏸ 429: need to wait 615s (> MAX_SLEEP_SECS=0). Stopping; re-run to resume.
+==> partial: 23 published, 0 already present this run.
+```
+
+Wait out the window it names, then resume. The script skips anything already
+live, so re-running is safe and cheap:
+
+```sh
+gh run rerun <run-id> --repo caliban-ai/gonzalo --failed
+```
+
+`v0.5.0` needed exactly this: 23 of 24 crates published, `gonzalo-mcp` hit the
+update limit, and the rerun 615 s later finished in 36 s.
+
+Locally, `scripts/publish.sh` with the default `MAX_SLEEP_SECS` sleeps through
+the window on its own instead of exiting.
+
+The same applies, for the other limit, if a release ever introduces more than
+~5 **new** crate names: the workflow publishes the burst and stops.
+
+### Confirm every crate is live before creating the Release
+
+A partial publish otherwise ships a GitHub Release pointing at versions that are
+not all on crates.io. After `publish.yml` reports success, check the whole set —
+and note that the API is not what `cargo` reads, so also see the next section:
+
+```sh
+for c in $(cargo metadata --no-deps --format-version 1 \
+           | jq -r '.packages[] | select(.publish != []) | .name'); do
+  live=$(curl -s "https://crates.io/api/v1/crates/$c/versions" \
+         -H 'User-Agent: gonzalo-release (you@example.com)' \
+         | jq -r '.versions[0].num')
+  [ "$live" = "X.Y.Z" ] || echo "STALE: $c is $live"
+done
+```
+
+Silence means every crate is at the tagged version. In zsh, capture that crate
+list as an array (`crates=(${(f)"$(…)"})`) — zsh does not word-split an
+unquoted string, so a plain `for c in $CRATES` iterates once over the whole
+blob and reports nothing wrong.
 
 ## Prebuilt binaries (macOS, Apple Silicon)
 
@@ -266,8 +332,11 @@ binary — a running server keeps executing the old one.
 
 ## If a publish fails partway
 
-crates.io releases are immutable, so already-published crates cannot be
-re-uploaded at the same version. Recovery is simply to **re-run
-`scripts/publish.sh`** — it skips everything already live and continues with the
-rest. (If you must do it by hand: `cargo publish -p <crate> --no-verify` for each
-remaining crate, in dependency order.)
+For the routine case — a 429 on the update limit, which is most of them — see
+[Resuming a rate-limited publish](#resuming-a-rate-limited-publish).
+
+For any other partial failure the recovery is the same shape. crates.io releases
+are immutable, so already-published crates cannot be re-uploaded at the same
+version. Re-run **`scripts/publish.sh`**: it skips everything already live and
+continues with the rest. (By hand, if you must: `cargo publish -p <crate>
+--no-verify` for each remaining crate, in dependency order.)
