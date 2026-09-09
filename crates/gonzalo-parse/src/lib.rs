@@ -60,21 +60,43 @@ pub enum ParseError {
 /// ignores argv and blocks on stdin (the probe closes stdin, so such a worker
 /// exits silently). A caller must treat `None` as a version that cannot match.
 pub async fn worker_extraction_version(bin: &Path, timeout: Duration) -> Option<u32> {
-    let probe = Command::new(bin)
-        .arg("--extraction-version")
-        // Closed, not inherited: a pre-#228 worker reads argv-less and would
-        // otherwise sit forever waiting for a parse request.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
+    const BUSY_RETRIES: u32 = 4;
 
-    let out = tokio::time::timeout(timeout, probe).await.ok()?.ok()?;
-    if !out.status.success() {
-        return None;
+    for attempt in 0..=BUSY_RETRIES {
+        let probe = Command::new(bin)
+            .arg("--extraction-version")
+            // Closed, not inherited: a pre-#228 worker reads argv-less and would
+            // otherwise sit forever waiting for a parse request.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+
+        let out = match tokio::time::timeout(timeout, probe).await {
+            Err(_) => return None, // hung — do not retry, it will hang again
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                // ETXTBSY: someone holds the binary open for writing. On Linux
+                // a concurrent process spawn is enough — the fork inherits an
+                // open write fd until it execs — and a worker being reinstalled
+                // while an index runs hits the same window. Reporting "unknown"
+                // for a worker that is merely momentarily busy would trigger a
+                // spurious full walk (#228), so wait it out briefly.
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < BUSY_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                return None;
+            }
+        };
+
+        if !out.status.success() {
+            return None;
+        }
+        return std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok();
     }
-    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+    None
 }
 
 /// A pool of parse-worker subprocesses.
