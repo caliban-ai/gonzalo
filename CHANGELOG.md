@@ -9,6 +9,17 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Added
+
+- Prebuilt macOS Apple Silicon binaries on every tagged release. A `v*` tag now
+  also builds `gonzalo-vX.Y.Z-aarch64-apple-darwin.tar.gz` (plus a `.sha256`) and
+  attaches it to the GitHub Release. The archive holds `gonzalo`, `gonzalo-mcp`
+  and `gonzalo-parse-worker` together, which is the point: installed separately
+  from crates.io those three can land at different versions, and a CLI newer than
+  its parse worker indexes with the old parser and then marks the view current
+  (#212, #228). `aarch64-apple-darwin` is the only target built; the container
+  image covers Linux. See `docs/releasing.md`. (#229)
+
 
 ## [0.5.0] - 2026-08-22
 

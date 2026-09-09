@@ -1,0 +1,95 @@
+name: release-binaries
+
+# Prebuilt Apple Silicon binaries, attached to the GitHub Release (gonzalo#229).
+#
+# WHY THIS EXISTS: gonzalo-cli, gonzalo-mcp and gonzalo-parse are three separate
+# crates whose binaries must agree on EXTRACTION_VERSION. Installed one at a time
+# from crates.io they drift — a 0.5.0 CLI driving a 0.4.0 worker silently writes
+# pre-upgrade extraction and then marks it current (#228), and installing the CLI
+# without the worker silently drops crash isolation (#212). One archive holding
+# exactly one of each removes both failure modes by construction.
+#
+# SCOPE: aarch64-apple-darwin only. No x86_64 Mac, no Linux (the container image
+# covers Linux), no Windows. Another target gets added when someone asks for one.
+#
+# The build → sign → smoke-test → archive chain lives in scripts/package-macos.sh
+# rather than in this file, so it can be rehearsed locally on the same platform
+# it targets — see the note on the trigger below.
+on:
+  push:
+    tags: ["v*"]
+
+# Tags only: deliberately no pull_request and no workflow_dispatch. macOS is the
+# priciest runner class and this workspace is a heavy compile (bundled SQLite,
+# tree-sitter C grammars, tonic), which is not a toll worth paying on every PR to
+# validate a workflow that runs a handful of times a year. The cost of that
+# choice is that this file gets no rehearsal before a real tag — which is exactly
+# why the work it does is a script you can run on your own Mac first.
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # gh release upload
+
+jobs:
+  build:
+    name: aarch64-apple-darwin
+    # Guard 1: never run anywhere but the canonical public repo (as publish.yml).
+    if: github.repository == 'caliban-ai/gonzalo'
+    # Pinned rather than macos-latest: the runner must stay on Apple Silicon, and
+    # a pin means a future label rotation cannot silently change the output arch.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins 1.95.0, which rustup honours for every cargo
+      # invocation below. The build target is the runner's own host target, so
+      # nothing is cross-compiled and no extra target needs installing.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Guards 2 and 3 (arm64 host, tag == workspace version), the build, the
+      # ad-hoc re-sign that stripping invalidates, and a smoke test per binary
+      # all live here. It fails loudly rather than shipping an untested archive.
+      - name: Build and package
+        run: scripts/package-macos.sh "$GITHUB_REF_NAME"
+
+      - name: Name the archive
+        run: echo "PKG=gonzalo-${GITHUB_REF_NAME}-aarch64-apple-darwin" >> "$GITHUB_ENV"
+
+      # Attach to the run BEFORE touching the Release. If the upload below fails
+      # (see the ordering note in docs/releasing.md) the archive is still
+      # retrievable with `gh run download`, so recovery costs seconds rather than
+      # a full rebuild.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: dist/${{ env.PKG }}.tar.gz*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Wait for the GitHub Release
+        # The runbook pushes the tag before creating the Release, so this job can
+        # start first. Poll rather than create it: the notes are curated from the
+        # changelog by a human, and a placeholder here would collide with that.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 40); do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "release $GITHUB_REF_NAME exists"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::release $GITHUB_REF_NAME was not created within 10 minutes. The archive is attached to this run: gh run download ${{ github.run_id }}"
+          exit 1
+
+      - name: Attach to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/$PKG.tar.gz" "dist/$PKG.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
