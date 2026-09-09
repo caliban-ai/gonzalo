@@ -129,8 +129,10 @@ enum Commands {
     /// Sync two filesystem stores.
     Sync {
         /// Root directory of store A.
+        #[arg(value_parser = store_root)]
         a: PathBuf,
         /// Root directory of store B.
+        #[arg(value_parser = store_root)]
         b: PathBuf,
     },
     /// Read external ticket boards into the store, and inspect imported tickets.

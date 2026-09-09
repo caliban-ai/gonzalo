@@ -97,3 +97,77 @@ fn get_present_record_exits_zero_and_prints_to_stdout() {
         "the record JSON should reach stdout, got {stdout:?}"
     );
 }
+
+// ── store roots expand a leading `~` even with no shell (gonzalo#238) ────────
+
+/// `gonzalo sync` takes its two store roots as positional arguments, and those
+/// were the one place #211's expansion did not reach. The failure was silent:
+/// syncing `~/a` and `~/b` operated on two directories that did not exist and
+/// reported `copied_to_b: 0`, which reads as "already in sync".
+///
+/// `Command::env` sets the variable on the **child**, so this needs no
+/// `std::env::set_var` — which is `unsafe` under edition 2024 and forbidden here.
+#[test]
+fn sync_expands_a_leading_tilde_in_both_store_roots() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("note.md"), "hello").unwrap();
+
+    // Build store A at $HOME/sa. `--root` already expands, so this also pins
+    // that the two paths agree about where `~/sa` is.
+    let seed = Command::new(bin())
+        .args([
+            "migrate",
+            "--root",
+            "~/sa",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+        ])
+        .arg(src.path())
+        .env("HOME", home.path())
+        .output()
+        .expect("run gonzalo migrate");
+    assert!(seed.status.success(), "seeding store A failed: {seed:?}");
+    assert!(
+        home.path().join("sa").is_dir(),
+        "migrate --root '~/sa' must write under $HOME"
+    );
+
+    let out = Command::new(bin())
+        .args(["sync", "~/sa", "~/sb"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run gonzalo sync");
+    assert!(out.status.success(), "sync failed: {out:?}");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("copied_to_b: 1"),
+        "sync must see store A's record through the tilde, got {stdout:?}"
+    );
+    assert!(
+        home.path().join("sb").is_dir(),
+        "store B must be created under $HOME, not at a literal '~'"
+    );
+}
+
+/// The other half of the contract: paths without a tilde must be untouched, so
+/// a relative store root stays relative to the working directory.
+#[test]
+fn sync_leaves_a_relative_store_root_alone() {
+    let cwd = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let out = Command::new(bin())
+        .args(["sync", "./ra", "./rb"])
+        .current_dir(cwd.path())
+        .env("HOME", home.path())
+        .output()
+        .expect("run gonzalo sync");
+    assert!(out.status.success(), "sync failed: {out:?}");
+    assert!(
+        home.path().read_dir().unwrap().next().is_none(),
+        "a relative root must not land in $HOME"
+    );
+}

@@ -192,7 +192,13 @@ fn worker_file_name() -> &'static str {
 }
 
 /// Where a parse worker was found.
+///
+/// `#[non_exhaustive]`: this set is already known to be growing — #212's own
+/// proposal anticipates a `--parse-worker <path>` flag, which is a fourth
+/// source. Sealing it now costs nothing; adding a variant later to a sealed
+/// enum is not a breaking change, while adding one to an open enum is (#241).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WorkerSource {
     /// The `GONZALO_PARSE_WORKER` environment override.
     Env,
@@ -221,6 +227,7 @@ impl WorkerSource {
 /// skipping one file (#212). Reporting the mode is what makes the guarantee
 /// checkable at the moment it matters.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParseMode {
     /// Crash-isolated: parses run in a worker subprocess pool.
     Isolated { path: PathBuf, source: WorkerSource },
@@ -396,6 +403,44 @@ pub async fn index_with(
     index_with_worker(root, src, repo, view, filter, mode.worker()).await
 }
 
+/// The warning shown when the parse path's extraction version is not this
+/// build's. `reported` is the worker's version, or `0` for "would not say".
+///
+/// Unknown and known-stale are **different states**, and saying so matters most
+/// on the upgrade everyone performs at least once: every worker released before
+/// `--extraction-version` (#228) answers nothing, while producing extraction
+/// that may well be current. Telling that user to "install a matching worker to
+/// get version N extraction" claims their data is wrong when it is not (#239).
+fn worker_version_warning(reported: u32) -> String {
+    if reported == 0 {
+        format!(
+            "gonzalo index: note — the parse worker did not report an extraction version, so \
+             it predates `--extraction-version` (gonzalo 0.5.0 or earlier). Its output may \
+             well match this build's version {EXTRACTION_VERSION}, but that cannot be \
+             confirmed, so the view is credited `unknown` and rebuilt in full. Upgrading \
+             gonzalo-parse-worker alongside gonzalo clears this and rebuilds once more."
+        )
+    } else {
+        format!(
+            "gonzalo index: WARNING — the parse worker reports extraction version {reported}, \
+             but this build records {EXTRACTION_VERSION}. The two disagree about what a parse \
+             records. Parsing anyway, rebuilding the view in full and crediting it to the \
+             worker; install a matching gonzalo-parse-worker to get {EXTRACTION_VERSION} \
+             extraction."
+        )
+    }
+}
+
+/// Print `msg` to stderr at most once per process.
+///
+/// `--watch` re-enters the index path on every debounced change, so a
+/// per-index warning becomes a paragraph per file save (#239). The condition
+/// cannot change mid-process anyway: the binaries on disk are what they are.
+fn warn_once(msg: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("{msg}"));
+}
+
 /// How long to wait for a worker to answer [`worker_extraction_version`].
 /// Generous next to a process spawn; a worker that misses it reads as unknown
 /// rather than wedging the run.
@@ -428,16 +473,7 @@ pub async fn index_with_worker(
         None => EXTRACTION_VERSION,
     };
     if parse_version != EXTRACTION_VERSION {
-        let reported = match parse_version {
-            0 => "did not report one".to_string(),
-            v => format!("reports {v}"),
-        };
-        eprintln!(
-            "gonzalo index: warning — the parse worker {reported}, but this build records \
-             extraction version {EXTRACTION_VERSION}. Parsing anyway, rebuilding the view in \
-             full and crediting it to the worker; install a matching gonzalo-parse-worker to \
-             get {EXTRACTION_VERSION} extraction."
-        );
+        warn_once(&worker_version_warning(parse_version));
     }
 
     // Parse through a crash-isolated worker pool when a worker binary is
@@ -1436,6 +1472,37 @@ mod tests {
         let sig = git2::Signature::now("t", "t@localhost").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
             .unwrap();
+    }
+
+    // ── the parse-version warning says the right thing (gonzalo#239) ─────────
+
+    #[test]
+    fn an_unknown_worker_version_does_not_claim_the_extraction_is_wrong() {
+        // Every worker released before #228 answers nothing while very likely
+        // producing current extraction. Telling that user to upgrade "to get
+        // version N extraction" asserts their data is wrong. It is not — it is
+        // unconfirmed, which is a different thing and the whole point here.
+        let msg = worker_version_warning(0);
+        assert!(msg.contains("did not report"), "{msg}");
+        assert!(msg.contains("cannot be confirmed"), "{msg}");
+        assert!(
+            !msg.contains("WARNING"),
+            "unconfirmed is a note, not a warning: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!("to get {EXTRACTION_VERSION} extraction")),
+            "must not claim the recorded extraction is wrong: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_known_mismatch_still_warns_plainly() {
+        // A worker that reports a *different* version genuinely disagrees about
+        // what a parse records, so the strong wording is accurate there.
+        let msg = worker_version_warning(1);
+        assert!(msg.contains("WARNING"), "{msg}");
+        assert!(msg.contains("reports extraction version 1"), "{msg}");
+        assert!(msg.contains(&EXTRACTION_VERSION.to_string()), "{msg}");
     }
 
     // ── index: locating the parse worker (gonzalo#212) ───────────────────────
