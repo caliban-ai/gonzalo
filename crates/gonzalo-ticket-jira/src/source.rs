@@ -10,7 +10,9 @@
 use crate::mapping::{JiraIssue, issue_to_ticket};
 use async_trait::async_trait;
 use gonzalo_domain::{StateCategory, Ticket};
-use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
+use gonzalo_ticket::{
+    Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource, provider_error,
+};
 use serde::Deserialize;
 
 /// The statusCategory key a target [`StateCategory`] should land in.
@@ -204,8 +206,8 @@ impl TicketSource for JiraSource {
             .send()
             .await
             .map_err(be)?
-            .error_for_status()
-            .map_err(be)?;
+            .check_status()
+            .await?;
         let search: SearchResponse = resp.json().await.map_err(be)?;
         let tickets = search
             .issues
@@ -227,8 +229,8 @@ impl TicketSource for JiraSource {
             .send()
             .await
             .map_err(be)?
-            .error_for_status()
-            .map_err(be)?;
+            .check_status()
+            .await?;
         let issue: JiraIssue = resp.json().await.map_err(be)?;
         Ok(issue_to_ticket(&issue, self.mapping.as_ref()))
     }
@@ -242,8 +244,8 @@ impl TicketSource for JiraSource {
             .send()
             .await
             .map_err(be)?
-            .error_for_status()
-            .map_err(be)?;
+            .check_status()
+            .await?;
         let available: TransitionsResponse = resp.json().await.map_err(be)?;
 
         let transition = choose_transition(&available.transitions, target).ok_or_else(|| {
@@ -262,8 +264,8 @@ impl TicketSource for JiraSource {
         .send()
         .await
         .map_err(be)?
-        .error_for_status()
-        .map_err(be)?;
+        .check_status()
+        .await?;
         Ok(())
     }
 
@@ -284,14 +286,38 @@ impl TicketSource for JiraSource {
             .send()
             .await
             .map_err(be)?
-            .error_for_status()
-            .map_err(be)?;
+            .check_status()
+            .await?;
         Ok(())
     }
 }
 
 fn be<E: std::fmt::Display>(e: E) -> SourceError {
     SourceError::Backend(e.to_string())
+}
+
+/// Fail with the provider's own message instead of reqwest's generic one.
+///
+/// reqwest's `error_for_status()` discards the response body, which is exactly
+/// where a ticket provider puts the reason — expired token, missing scope,
+/// malformed query, rate-limit window. Swapping it for `check_status()` keeps
+/// the reason (#240). The message format is shared via
+/// [`provider_error`](gonzalo_ticket::provider_error) so the connectors cannot
+/// drift apart.
+trait CheckStatus: Sized {
+    async fn check_status(self) -> Result<Self>;
+}
+
+impl CheckStatus for reqwest::Response {
+    async fn check_status(self) -> Result<Self> {
+        let status = self.status();
+        if status.is_success() {
+            return Ok(self);
+        }
+        // Read the body only on the failure path; the caller decodes success.
+        let body = self.text().await.unwrap_or_default();
+        Err(provider_error(status.as_u16(), &body))
+    }
 }
 
 #[cfg(test)]
