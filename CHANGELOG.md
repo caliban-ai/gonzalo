@@ -48,6 +48,18 @@ the patch version for fixes.
 
 ### Fixed
 
+- The packaged `gonzalo` binary is portable. It linked **Homebrew's** libgit2 at
+  `/opt/homebrew/opt/libgit2/…`, an absolute path in the Mach-O load command, so
+  on any Mac without Homebrew it died in dyld before executing an instruction —
+  not even `--version` ran. `gonzalo-mcp` and `gonzalo-parse-worker` were always
+  clean, so the archive shipped one broken binary out of three, and it was the
+  one that creates the view the MCP server reads. libgit2 is now vendored and
+  statically linked, matching what the Linux container already did by accident
+  of having no `libgit2-dev` installed. `scripts/package-macos.sh` now refuses
+  to package a binary that links anything outside `/usr/lib` and
+  `/System/Library`, because which way this went depended on whether the build
+  machine happened to have a system libgit2. (#246)
+
 - Ticket connectors keep the provider's error message instead of discarding it.
   `SourceError::Backend` is documented as carrying the provider's message, but
   all five connectors reached it through reqwest's `error_for_status()`, which

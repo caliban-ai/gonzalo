@@ -93,6 +93,37 @@ for bin in "${BINS[@]}"; do
   codesign --verify "dist/$pkg/$bin"
 done
 
+# --- assert the binaries are actually portable -------------------------------
+
+# A release binary may link only libraries that exist on a stock macOS. This is
+# not theoretical: libgit2-sys probes pkg-config and links a *system* libgit2 if
+# the build machine has one, so a build on a Mac with Homebrew produced a
+# `gonzalo` referencing /opt/homebrew that died in dyld everywhere else — before
+# running a single instruction, so not even `--version` worked (#246).
+#
+# `vendored-libgit2` fixes that, but a dependency bump or a feature change can
+# quietly reintroduce it, and the smoke tests below cannot catch it: they run on
+# the build machine, which by definition has whatever the binary linked. Only an
+# explicit check does.
+echo "==> checking every binary links only system libraries"
+portability_ok=1
+for bin in "${BINS[@]}"; do
+  # Skip the Mach-O id line (the first line of otool -L output).
+  foreign="$(otool -L "dist/$pkg/$bin" | tail -n +2 | awk '{print $1}' \
+             | grep -v -E '^(/usr/lib/|/System/Library/)' || true)"
+  if [ -n "$foreign" ]; then
+    portability_ok=0
+    echo "error: $bin links non-system libraries:" >&2
+    echo "$foreign" | while IFS= read -r lib; do echo "  $lib" >&2; done
+  fi
+done
+if [ "$portability_ok" -ne 1 ]; then
+  echo "error: these paths will not exist on a user's machine; the binary dies in dyld." >&2
+  echo "       Check that the offending crate vendors its native dependency." >&2
+  exit 1
+fi
+echo "    all clear"
+
 # --- smoke-test what is actually about to ship -------------------------------
 
 # Each binary gets the cheapest check that proves it executes. They differ
