@@ -135,7 +135,7 @@ impl Store for ServerStore {
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Ok(None);
                 }
-                let resp = resp.error_for_status().map_err(be)?;
+                let resp = ensure_read_ok(resp).await?;
                 Ok(Some(resp.json::<Record>().await.map_err(be)?))
             }
             Backend::Grpc { client, token } => {
@@ -227,9 +227,8 @@ impl Store for ServerStore {
                 let resp = maybe_auth(client.get(url), token)
                     .send()
                     .await
-                    .map_err(be)?
-                    .error_for_status()
                     .map_err(be)?;
+                let resp = ensure_read_ok(resp).await?;
                 Ok(resp.json::<Vec<RecordKey>>().await.map_err(be)?)
             }
             Backend::Grpc { client, token } => {
@@ -348,7 +347,7 @@ impl BlobStore for ServerStore {
                 if resp.status() == reqwest::StatusCode::NOT_FOUND {
                     return Ok(None);
                 }
-                let resp = resp.error_for_status().map_err(be)?;
+                let resp = ensure_read_ok(resp).await?;
                 Ok(Some(resp.bytes().await.map_err(be)?.to_vec()))
             }
             Backend::Grpc { client, token } => {
@@ -376,9 +375,8 @@ impl BlobStore for ServerStore {
                 let resp = maybe_auth(client.get(url), token)
                     .send()
                     .await
-                    .map_err(be)?
-                    .error_for_status()
                     .map_err(be)?;
+                let resp = ensure_read_ok(resp).await?;
                 Ok(resp.json::<Vec<ContentHash>>().await.map_err(be)?)
             }
             Backend::Grpc { client, token } => {
@@ -496,6 +494,34 @@ fn classify_blob_put_response(
     }
 }
 
+/// The error a non-success **read** response carries.
+///
+/// The write paths surface a non-success status together with the daemon's
+/// plain-text body (#147), so a `403` authz denial or a `413` says why. The
+/// reads used reqwest's `error_for_status()`, which **discards the body** —
+/// leaving a generic "HTTP status client error … for url …" and making a failed
+/// remote read strictly harder to debug than a failed write. Same format both
+/// ways now (#195).
+fn read_response_error(status: reqwest::StatusCode, body: &str) -> CoreError {
+    CoreError::Backend(format!("daemon returned {status}: {body}"))
+}
+
+/// Pass `resp` through when the daemon answered successfully; otherwise consume
+/// its body and fail with [`read_response_error`].
+///
+/// `404` never reaches here for `get`/`get_blob` — absence is `Ok(None)` and
+/// those call sites check it first. For `list`/`list_blobs` a `404` is a real
+/// error, since the collection endpoint always exists.
+async fn ensure_read_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        // Hand it back untouched: only the caller knows how to decode it.
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(read_response_error(status, &body))
+}
+
 fn be<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Backend(e.to_string())
 }
@@ -531,6 +557,51 @@ mod tests {
             },
             links: Vec::new(),
         }
+    }
+
+    // ── read paths report failures like the write paths do (#195) ───────────
+
+    /// A `403` on a read names the daemon's reason, not reqwest's generic
+    /// "HTTP status client error". This is the whole point of #195.
+    #[test]
+    fn a_read_failure_carries_the_daemon_body() {
+        let err = read_response_error(StatusCode::FORBIDDEN, "namespace not authorized");
+        let CoreError::Backend(msg) = err else {
+            panic!("read failures are Backend errors");
+        };
+        assert!(msg.contains("403"), "{msg}");
+        assert!(msg.contains("namespace not authorized"), "{msg}");
+    }
+
+    /// The harmonization claim itself: for the same status and body, a read
+    /// error reads exactly like the write error it used to differ from. If
+    /// someone changes one format, this fails rather than letting them drift.
+    #[test]
+    fn reads_and_writes_report_a_failure_identically() {
+        let (status, body) = (StatusCode::FORBIDDEN, "namespace not authorized");
+        let read = read_response_error(status, body);
+        let write = classify_put_response(status, body).unwrap_err();
+        let blob_write =
+            classify_blob_put_response(status, body, ContentHash("h".into())).unwrap_err();
+        assert_eq!(read.to_string(), write.to_string());
+        assert_eq!(read.to_string(), blob_write.to_string());
+    }
+
+    /// `413` is the other status #147 cared about; it must survive a read too.
+    #[test]
+    fn a_read_failure_preserves_any_status() {
+        let msg =
+            read_response_error(StatusCode::PAYLOAD_TOO_LARGE, "blob exceeds 64 MiB").to_string();
+        assert!(msg.contains("413"), "{msg}");
+        assert!(msg.contains("blob exceeds 64 MiB"), "{msg}");
+    }
+
+    /// An empty body still produces a usable message — the status alone is the
+    /// signal, and it must not read as a truncated or malformed error.
+    #[test]
+    fn a_read_failure_with_no_body_still_names_the_status() {
+        let msg = read_response_error(StatusCode::BAD_GATEWAY, "").to_string();
+        assert!(msg.contains("502"), "{msg}");
     }
 
     /// `200 OK` carries a `committed` JSON body → `PutResult::Committed`.
