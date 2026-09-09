@@ -7,10 +7,21 @@ use gonzalo_cli::{
     status, sync_stores, ticket_move, ticket_sync, watch,
 };
 use gonzalo_core::RecordKind;
+use gonzalo_store_fs::expand_tilde;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Admin/ops CLI for the gonzalo persistence layer.
+/// clap parser for a store-root argument: expands a leading `~`.
+///
+/// argv arrives verbatim when nothing shell-like launched the process — a
+/// systemd unit, a container `command:`, a scheduler — so `--root ~/.gonzalo`
+/// has exactly the same trap as `GONZALO_ROOT` did (#211). Applied at parse
+/// time so every subcommand's root is expanded the same way.
+fn store_root(raw: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(expand_tilde(raw))
+}
+
 #[derive(Parser)]
 #[command(name = "gonzalo", version, about)]
 struct Cli {
@@ -23,7 +34,7 @@ enum Commands {
     /// List record keys in the store.
     List {
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
         /// Filter by namespace.
         #[arg(long)]
@@ -35,7 +46,7 @@ enum Commands {
     /// Fetch a single record.
     Get {
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
         /// Namespace of the record.
         namespace: String,
@@ -47,13 +58,13 @@ enum Commands {
     /// Show record counts grouped by namespace/collection.
     Status {
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
     },
     /// Recursively import files from a directory into the store.
     Migrate {
         /// Root directory of the fs store (destination).
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
         /// Source directory to import from.
         src: PathBuf,
@@ -71,7 +82,7 @@ enum Commands {
     /// content-addressed slices and reconcile the view's manifest).
     Index {
         /// Root directory of the fs store (destination).
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
         /// Source directory to index.
         src: PathBuf,
@@ -112,7 +123,7 @@ enum Commands {
     /// view's manifest across all repos.
     Gc {
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
     },
     /// Sync two filesystem stores.
@@ -137,7 +148,7 @@ enum TicketCommands {
         #[arg(long, default_value = "tickets.toml")]
         config: PathBuf,
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
         /// Author recorded on imported records.
         #[arg(long, default_value = "gonzalo-cli")]
@@ -146,13 +157,13 @@ enum TicketCommands {
     /// List imported ticket record keys.
     List {
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
     },
     /// Show one imported ticket record by uid (e.g. "caliban-ai/gonzalo#15").
     Get {
         /// Root directory of the fs store.
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
         /// Connection name the ticket was synced under. Required to find records
         /// synced from a board, whose keys are scoped by connection (#159).

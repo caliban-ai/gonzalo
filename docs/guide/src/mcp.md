@@ -133,11 +133,14 @@ each worktree under its own `view_id` and `diff` them.
 claude mcp add gonzalo --env GONZALO_ROOT=/Users/you/.gonzalo -- gonzalo-mcp
 ```
 
-> **Use an absolute path.** `GONZALO_ROOT` is passed straight through, and nothing in
-> gonzalo expands a leading `~`. Neither bash nor zsh expands a tilde in
-> `--env KEY=~/path` argument position either, so `GONZALO_ROOT=~/.gonzalo` creates a
-> directory *literally named* `~` in the current working directory and indexes
-> nothing you can find. See [#211](https://github.com/caliban-ai/gonzalo/issues/211).
+> A leading `~` in `GONZALO_ROOT` (and in `--root`) is expanded to `$HOME`, so
+> `GONZALO_ROOT=~/.gonzalo` works even though no shell is involved — neither bash nor
+> zsh expands a tilde in `--env KEY=~/path` argument position, and an MCP client hands
+> the value to the process verbatim. Before this was fixed it created a directory
+> *literally named* `~` in the current working directory and indexed nothing you could
+> find ([#211](https://github.com/caliban-ai/gonzalo/issues/211)). `status` reports the
+> expanded path, so check it there if in doubt. Only a *leading* `~` is expanded, and
+> `~otheruser/...` is left alone.
 
 Restarting or reconnecting the MCP client respawns the server process, which is how a
 newly installed binary's tools become visible — a full client restart is not needed.

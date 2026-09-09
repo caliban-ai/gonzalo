@@ -1,6 +1,9 @@
 //! Filesystem storage substrate for gonzalo.
 
 mod layout;
+mod tilde;
+
+pub use tilde::expand_tilde;
 
 use async_trait::async_trait;
 use gonzalo_core::{
