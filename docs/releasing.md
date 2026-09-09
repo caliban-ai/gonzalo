@@ -7,13 +7,15 @@ that exists only for this repo, and a tag↔version check. The actual upload run
 through **`scripts/publish.sh`**, which is resumable and rate-limit-aware (see
 below).
 
-A `v*` tag drives **two** workflows off the same push, in lockstep:
+A `v*` tag drives **three** workflows off the same push, in lockstep:
 
 - `release-image.yml` → builds and pushes the `ghcr.io/caliban-ai/gonzalo`
   container image;
-- `publish.yml` → publishes the crate set to crates.io.
+- `publish.yml` → publishes the crate set to crates.io;
+- `release-binaries.yml` → builds the Apple Silicon archive and attaches it to
+  the GitHub Release (see [Prebuilt binaries](#prebuilt-binaries-macos-apple-silicon)).
 
-One tag, one release — the image and crate versions never drift.
+One tag, one release — image, crate, and binary versions never drift.
 
 ## What gets published
 
@@ -124,11 +126,18 @@ and lands the release PR), then:
 ```sh
 git tag vX.Y.Z <merge-sha>
 git push origin vX.Y.Z
+gh release create vX.Y.Z --title "vX.Y.Z — <theme>" --notes "<the [X.Y.Z] changelog section>"
 ```
 
-The tag push fires both `release-image.yml` (image) and `publish.yml` (crates).
-`publish.yml` validates the guards and runs `scripts/publish.sh` with
-`MAX_SLEEP_SECS=0`, publishing each crate in dependency order with no recompile.
+**Create the Release immediately after the tag push**, before waiting on any
+workflow. `release-binaries.yml` starts on the same push and has nowhere to
+attach its archive until the Release exists; it waits ten minutes and then fails.
+Creating the Release needs only the tag, not the crates publish, so there is no
+reason to defer it — and doing it here removes the race rather than tolerating it.
+
+The tag push fires all three workflows. `publish.yml` validates the guards and
+runs `scripts/publish.sh` with `MAX_SLEEP_SECS=0`, publishing each crate in
+dependency order with no recompile.
 
 If a release ever introduces **new** crate names and there are more than ~5 of
 them, the workflow publishes the burst and stops (it won't idle-bill on the
@@ -137,6 +146,87 @@ them, the workflow publishes the burst and stops (it won't idle-bill on the
 Throughout, `X.Y.Z` is whatever `[workspace.package].version` in `Cargo.toml`
 says after the release PR lands — `publish.yml` refuses a tag that disagrees with
 it, so the two cannot drift.
+
+## Prebuilt binaries (macOS, Apple Silicon)
+
+Every release also carries one archive, built by `release-binaries.yml`:
+
+```
+gonzalo-vX.Y.Z-aarch64-apple-darwin.tar.gz
+gonzalo-vX.Y.Z-aarch64-apple-darwin.tar.gz.sha256
+```
+
+It holds `gonzalo`, `gonzalo-mcp`, `gonzalo-parse-worker`, and `LICENSE`.
+
+**Why an archive rather than three `cargo install` lines.** Those three binaries
+must agree on `EXTRACTION_VERSION`, and installed separately they drift: a 0.5.0
+CLI driving a 0.4.0 worker writes pre-upgrade extraction into a view and then
+stamps it current (gonzalo#228), and installing the CLI without the worker
+silently drops crash isolation (gonzalo#212). One archive with one of each makes
+a mismatch impossible. It also sidesteps the sparse-index lag described in the
+next section, since a release asset is immediately consistent.
+
+`gonzalod` is **not** in the archive — the container image is its distribution
+channel — and neither is the `gonzalo-soak` harness.
+
+### Installing
+
+```sh
+tag=vX.Y.Z
+base="https://github.com/caliban-ai/gonzalo/releases/download/$tag"
+pkg="gonzalo-$tag-aarch64-apple-darwin"
+curl -fsSLO "$base/$pkg.tar.gz" -O "$base/$pkg.tar.gz.sha256"
+shasum -a 256 -c "$pkg.tar.gz.sha256"
+tar xzf "$pkg.tar.gz"
+install -m 755 "$pkg"/gonzalo "$pkg"/gonzalo-mcp "$pkg"/gonzalo-parse-worker ~/.cargo/bin/
+```
+
+Keep all three together on `PATH`: `gonzalo index` locates the worker as a
+sibling of its own executable, so splitting them re-creates gonzalo#212.
+Reconnect any MCP client afterwards — a running server keeps executing the old
+binary.
+
+### Gatekeeper
+
+The binaries carry an ad-hoc signature, not a Developer ID one, and are not
+notarized. Fetched with `curl` they run as-is, because only quarantine-aware
+applications set the attribute. A **browser** download does set it, and macOS
+will then refuse to run them. Clear it:
+
+```sh
+xattr -d com.apple.quarantine "$pkg"/*
+```
+
+### Rehearsing and recovering
+
+`release-binaries.yml` runs on `v*` tags only — no PR build — so it is never
+exercised before a real release. The work it does therefore lives in
+**`scripts/package-macos.sh`**, which CI merely calls, so the identical chain can
+be run first on any Apple Silicon Mac:
+
+```sh
+scripts/package-macos.sh          # build, sign, smoke-test, archive into dist/
+SKIP_BUILD=1 scripts/package-macos.sh   # repackage without recompiling
+```
+
+The script refuses a non-arm64 host and a tag that disagrees with the workspace
+version, re-signs after stripping (stripping invalidates the ad-hoc signature and
+the binary would otherwise die with `Killed: 9`), and smoke-tests each binary:
+`gonzalo --version`, a real parse round-trip through the worker, and an MCP
+`initialize` handshake.
+
+The workflow attaches the archive to the **workflow run** before it touches the
+Release. So if the Release was created too late and the upload step failed, no
+rebuild is needed:
+
+```sh
+gh run download <run-id>
+gh release upload vX.Y.Z gonzalo-vX.Y.Z-aarch64-apple-darwin.tar.gz{,.sha256} --clobber
+```
+
+**Only `aarch64-apple-darwin` is built.** No x86_64 Mac, no Linux (the container
+image covers Linux), no Windows. Another target gets added when there is a
+concrete request for one, not before.
 
 ## Verifying a release — the crates.io API is not what cargo reads
 
