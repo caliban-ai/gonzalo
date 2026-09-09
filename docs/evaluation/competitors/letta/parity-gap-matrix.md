@@ -59,8 +59,8 @@ out of scope for gonzalo's substrate layer, not a backlog item.
 |---|---|---|
 | REST API | ✅ | HTTP/JSON over the daemon (ADR 0007) |
 | gRPC API | ✅ | Second transport over one canonical schema (ADR 0007) |
-| Python SDK | 🔴 | Rust only; a client could be generated from the daemon schema |
-| TypeScript SDK | 🔴 | As above |
+| Python SDK | 🔴 `by design` | Gonzalo ships Rust deliverables only; non-Rust consumers integrate over `gonzalod` and its published schema rather than a maintained SDK (ADR 0020) |
+| TypeScript SDK | 🔴 `by design` | As above (ADR 0020) |
 | Visual dev environment (ADE-equivalent) | 🔴 `by design` | Agent-debugging UI is out of scope; gonzalo ships an admin/ops CLI |
 | CLI | ✅ | `gonzalo` CLI: `list`/`get`/`status`/`migrate`/`sync`, `ticket …` |
 
@@ -94,9 +94,11 @@ framework** (loop, tools, self-managing memory, ADE), and almost all of that is
 gonzalo's angle is the inverse of Letta's: **shared, multi-writer, conflict-aware,
 backend-agnostic** persistence rather than turnkey per-agent state. The genuine
 convergence point is **git-backed memory**, which Letta Code adopted in 2026 and
-gonzalo has as a first-class substrate. The realistic backlog items here are
-**client SDKs** (D) and an optional **MCP adapter** (A) — everything else is a
-deliberate boundary, not a gap. The clean summary: gonzalo is a candidate
+gonzalo has as a first-class substrate. The realistic backlog item here is an
+optional **MCP adapter** (A) — everything else is a deliberate boundary, not a
+gap. The **client SDK** rows in D are one of those boundaries: Rust
+deliverables only, with the daemon and its published schema as the non-Rust
+integration point (ADR 0020). The clean summary: gonzalo is a candidate
 archival substrate *for* a Letta-style agent, not a competitor to its loop.
 
 ## Refresh process
