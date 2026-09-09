@@ -10,6 +10,7 @@
 //! and updating the project's Status single-select field on that issue's item.
 
 use crate::project_mapping::{GqlItems, GqlResponse, item_to_ticket};
+use crate::source::CheckStatus;
 use async_trait::async_trait;
 use gonzalo_domain::{StateCategory, Ticket};
 use gonzalo_ticket::{Capabilities, Cursor, Page, Result, SourceError, StateMapping, TicketSource};
@@ -137,8 +138,8 @@ impl GitHubProjectSource {
             .send()
             .await
             .map_err(be)?
-            .error_for_status()
-            .map_err(be)?
+            .check_status()
+            .await?
             .json()
             .await
             .map_err(be)
@@ -158,8 +159,8 @@ impl GitHubProjectSource {
                 .send()
                 .await
                 .map_err(be)?
-                .error_for_status()
-                .map_err(be)?;
+                .check_status()
+                .await?;
             let parsed: GqlResponse = resp.json().await.map_err(be)?;
             let items = items_or_error(parsed)?;
             out.extend(
