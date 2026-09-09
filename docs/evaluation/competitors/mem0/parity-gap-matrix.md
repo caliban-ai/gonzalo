@@ -69,8 +69,8 @@ out of scope for gonzalo's substrate layer, not a backlog item.
 | Capability | Gonzalo | Notes |
 |---|---|---|
 | Library embedding | ✅ | Single `gonzalo` facade crate; capabilities behind Cargo features (ADR 0009) |
-| Python SDK | 🔴 | Rust only today; a client could be generated from the daemon schema |
-| JS / TS SDK | 🔴 | As above |
+| Python SDK | 🔴 `by design` | Gonzalo ships Rust deliverables only; non-Rust consumers integrate over `gonzalod` and its published schema rather than a maintained SDK (ADR 0020) |
+| JS / TS SDK | 🔴 `by design` | As above (ADR 0020) |
 | REST API | ✅ | HTTP/JSON over the daemon (ADR 0007) |
 | gRPC API | ✅ | Second transport over one canonical schema (ADR 0007) — Mem0 has no gRPC surface |
 | CLI | ✅ | `gonzalo` admin/ops CLI (`list`/`get`/`status`/`migrate`/`sync`, `ticket …`) |
@@ -111,8 +111,13 @@ platform. Most of those are 🔴 `by design` for gonzalo — they are a memory
 *policy* that a caller (or a thin layer) would run *over* gonzalo, which
 supplies the durable, shareable, conflict-aware substrate underneath. The rows
 worth treating as a genuine backlog (not positioning) are: **BM25 / fusion
-retrieval** (C), an **external vector-store adapter** (D), and **Python/TS
-client SDKs** generated from the daemon schema (E).
+retrieval** (C) and an **external vector-store adapter** (D).
+
+The **Python/TS SDK** rows in E are *not* backlog. Gonzalo ships Rust
+deliverables only, and non-Rust consumers integrate over `gonzalod` and its
+published schema rather than an SDK we maintain (ADR 0020). The work that
+actually serves those users is making the schema artifacts easy to generate a
+client from, not writing the client.
 
 ## Refresh process
 

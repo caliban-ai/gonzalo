@@ -50,6 +50,11 @@ kept in sync when those are superseded.
 12. **Retrieval returns first-class records, never bare ids.** Vector, graph,
     knowledge, and ticket queries resolve back through the `Store` to whole
     records (ADR 0008, 0011).
+13. **Rust-native deliverables; the daemon is the non-Rust boundary.** We ship
+    Rust crates, the `gonzalod` image, and binaries of our own binary crates —
+    not client SDKs in other languages. Non-Rust consumers integrate over the
+    daemon and its published schema, which ADR 0007 already keeps from drifting
+    (ADR 0020).
 
 ## Inviolable invariants
 

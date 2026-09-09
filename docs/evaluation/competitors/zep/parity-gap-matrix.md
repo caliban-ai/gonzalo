@@ -68,7 +68,7 @@ out of scope for gonzalo's substrate layer, not a backlog item.
 | REST service | ✅ | HTTP/JSON over the daemon (ADR 0007) |
 | gRPC service | ✅ | Second transport over one canonical schema (ADR 0007) |
 | MCP server | 🔴 | No MCP surface today; a candidate for a thin adapter over the daemon |
-| Python library | 🔴 | Rust only; a client could be generated from the daemon schema |
+| Python library | 🔴 `by design` | Gonzalo ships Rust deliverables only; non-Rust consumers integrate over `gonzalod` and its published schema rather than a maintained SDK (ADR 0020) |
 | Self-hosted, fully open | ✅ | AGPL-3.0 daemon is the whole product — no managed tier held back; Zep's dashboarded experience is Cloud-only (commercial) |
 | Managed cloud + compliance (SOC 2 / HIPAA) | 🔴 `by design` | Not offered; gonzalo is self-hosted |
 
@@ -93,8 +93,10 @@ reasoning** (bi-temporal edges, automatic invalidation) and **LLM-driven graph
 construction** from raw episodes. Both are 🔴 `by design` for gonzalo — a
 temporal-KG memory *policy* could be built as a capability layer *over*
 gonzalo's records rather than adopted as the foundation. The rows that read as
-a real backlog are: an **MCP adapter** and **Python client** (E), and
-optionally a **hybrid ranker** unifying vector + graph recall (A). Graphiti's
+a real backlog are an **MCP adapter** (E) and optionally a **hybrid ranker**
+unifying vector + graph recall (A). The **Python client** row is not backlog —
+gonzalo ships Rust deliverables only, and non-Rust consumers integrate over the
+daemon and its published schema (ADR 0020). Graphiti's
 hard requirement of an external graph database is exactly the coupling
 gonzalo's substrate model is built to avoid.
 
