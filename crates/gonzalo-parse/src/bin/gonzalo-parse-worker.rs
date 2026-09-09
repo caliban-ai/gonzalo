@@ -18,11 +18,19 @@
 //! - `GONZALO_PARSE_HANG_TOKEN` — a request whose `source` equals it blocks
 //!   forever (a grammar hang).
 
-use gonzalo_graph::build;
+use gonzalo_graph::{EXTRACTION_VERSION, build};
 use gonzalo_parse::ParseRequest;
 use std::io::{BufRead, Write};
 
 fn main() {
+    // `--extraction-version`: print the format this worker produces and exit.
+    // The indexer is a separate binary and cannot otherwise tell whether the
+    // worker it found agrees with it about what a parse records (#228).
+    if std::env::args().nth(1).as_deref() == Some("--extraction-version") {
+        println!("{EXTRACTION_VERSION}");
+        return;
+    }
+
     let crash_token = std::env::var("GONZALO_PARSE_CRASH_TOKEN").ok();
     let hang_token = std::env::var("GONZALO_PARSE_HANG_TOKEN").ok();
     let stdin = std::io::stdin();

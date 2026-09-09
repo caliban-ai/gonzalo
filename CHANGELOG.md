@@ -20,6 +20,19 @@ the patch version for fixes.
   (#212, #228). `aarch64-apple-darwin` is the only target built; the container
   image covers Linux. See `docs/releasing.md`. (#229)
 
+### Fixed
+
+- A stale `gonzalo-parse-worker` no longer produces pre-upgrade extraction that
+  the view records as current. `EXTRACTION_VERSION` guarded the CLI, but the
+  worker is a separately installed binary and is what actually parses — so a
+  0.5.0 CLI driving a 0.4.0 worker emitted old-format slices and then stamped
+  the view with the new version, leaving it wrong *and* marked up to date, which
+  no later re-index would repair. The worker now answers
+  `--extraction-version`, the indexer asks before parsing, and a view is
+  credited to the version the parse path actually produced. A mismatch warns,
+  rebuilds in full, and self-heals once the worker is upgraded. A worker too old
+  to answer is recorded as unknown rather than assumed to agree. (#228)
+
 
 ## [0.5.0] - 2026-08-22
 
