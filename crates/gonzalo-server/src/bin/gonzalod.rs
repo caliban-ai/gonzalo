@@ -8,7 +8,10 @@
 //! - `GONZALO_S3_REGION` — s3 region override (optional)
 //! - `GONZALO_HTTP_ADDR` — HTTP/JSON bind address (default `127.0.0.1:8080`)
 //! - `GONZALO_GRPC_ADDR` — gRPC bind address (default `127.0.0.1:50051`)
-//! - `GONZALO_MAX_BLOB_SIZE` — max bytes per blob over the transports (default 64 MiB)
+//! - `GONZALO_MAX_BLOB_SIZE` — max bytes per blob over the transports (default 64 MiB).
+//!   Note this also raises the **gRPC decode ceiling for every RPC**, records
+//!   included: tonic's limit is per-server, not per-method (see `serve_grpc`).
+//!   HTTP is unaffected — its blob limit is scoped to the blob sub-router (#194).
 //! - `GONZALO_AUTH_FILE` — TOML principals file for namespace-scoped auth
 //! - `GONZALO_TOKEN`     — single admin token (used when no auth file is set)
 //!
