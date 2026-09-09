@@ -20,7 +20,60 @@ the patch version for fixes.
   (#212, #228). `aarch64-apple-darwin` is the only target built; the container
   image covers Linux. See `docs/releasing.md`. (#229)
 
+### Changed
+
+- `ParseMode` and `WorkerSource` are `#[non_exhaustive]`. They ship for the
+  first time this release, and the set of ways a worker can be located is
+  already known to be growing, so sealing them now avoids a breaking change
+  later. (#241)
+
+- Recorded the **Rust-native deliverables** principle as ADR 0020: gonzalo ships
+  Rust crates, the container image and its own binaries — not client SDKs in
+  other languages — and non-Rust consumers integrate over the daemon plus its
+  published schema. The decision was real but written down nowhere, so the
+  competitor parity evaluation kept ranking Python/TS SDKs as the single most
+  convergent gap in the whole evaluation. All five SDK rows are now marked
+  `by design` with the citation. (#196)
+
+- `docs/releasing.md` no longer claims version bumps are exempt from rate
+  limiting. crates.io enforces a second limit on updates to existing crates, and
+  a 24-crate workspace trips it on every release — `v0.5.0` stopped after 23 of
+  24. The expected 429-and-resume flow, and a check that every crate is live
+  before creating the Release, are now documented. (#227)
+
+- Documented that the gRPC decode ceiling is per-server, not per-method: raising
+  `GONZALO_MAX_BLOB_SIZE` also raises the decode limit for record RPCs, which
+  HTTP does not do. Bounded and authenticated, so documented rather than
+  closed. (#194)
+
 ### Fixed
+
+- Ticket connectors keep the provider's error message instead of discarding it.
+  `SourceError::Backend` is documented as carrying the provider's message, but
+  all five connectors reached it through reqwest's `error_for_status()`, which
+  drops the response body — so an expired token, a missing scope, a malformed
+  JQL query or a rate-limit hint all surfaced as a generic "HTTP status client
+  error". Twenty call sites across Jira, GitHub, GitLab, Asana and Linear now
+  report the status and the provider's own reason, bounded in length. (#240)
+
+- `gonzalo sync` expands a leading `~` in its two store roots. Those are
+  positional arguments and were the one place #211's expansion did not reach,
+  so `gonzalo sync '~/a' '~/b'` from a non-shell context silently operated on
+  two directories that did not exist and reported success. (#238)
+
+- The parse-worker version note no longer claims correct data is wrong, and no
+  longer repeats. A worker released before `--extraction-version` cannot report
+  one while still producing current extraction, so that case now reads as an
+  unconfirmed note rather than a warning to go fix your data; a worker that
+  reports a *different* version still warns plainly. It is also emitted once per
+  process rather than once per index, which under `--watch` meant once per file
+  save. (#239)
+
+- Remote reads report failures the way remote writes do. `ServerStore`'s read
+  paths used reqwest's `error_for_status()`, which discards the response body,
+  so a `403` on a read surfaced as a generic HTTP status line while the same
+  refusal on a write reported the daemon's reason. All four HTTP read paths now
+  carry status and body; `404` still means `Ok(None)` on `get`/`get_blob`. (#195)
 
 - A leading `~` in a store root is expanded to `$HOME` instead of being taken
   literally. `GONZALO_ROOT=~/.gonzalo` in an MCP client config reaches the
