@@ -9,6 +9,30 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`unreferenced` no longer reports live callbacks as dead code.** A function
+  passed as a value rather than called — `and_then(helper)`, `register(handler)`
+  — is a path expression, not a call expression, so it recorded no reference at
+  all and the function looked unused. That was the documented main false
+  positive of the one tool whose suggested action is deletion. On gonzalo's own
+  source it was flagging 98 symbols that are genuinely used, among them the test
+  fixtures handed to `build_rust` and constants passed to functions.
+
+  Such a reference is now recorded with its own kind and deliberately kept out of
+  the call graph: `callers`, `callees` and `top` stay call-only, because passing
+  a function is not calling it. `impact` counts them in a new `value_edges`
+  rather than walking them — a callback is a real dependency, so dropping it
+  silently would under-report, but extraction is per-file and cannot tell an
+  identifier naming a function from one naming a local, so traversing them would
+  put false edges back into the walk #207 and #223 cleaned up. Non-zero
+  `value_edges` means go look.
+
+  The over-inclusion is deliberate and one-directional: a local variable handed
+  to a call is recorded too, which for dead-code detection errs towards *not*
+  calling something dead. `EXTRACTION_VERSION` is 4, so each view re-walks once
+  on upgrade. (#250)
+
 ### Added
 
 - **Qualified symbol identity in the code graph.** A call site's path qualifier

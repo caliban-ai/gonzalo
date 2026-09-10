@@ -174,6 +174,16 @@ pub struct ImpactReport {
     /// `ambiguous_edges` because the cause differs: not "too many candidates"
     /// but "cannot claim any candidate" (#223).
     pub receiver_unknown_edges: usize,
+    /// Call-graph edges skipped because the reference names a function as a
+    /// *value* rather than calling it — `register(helper)`.
+    ///
+    /// Passing a function is a real dependency, so dropping these silently
+    /// would under-report. But a value reference is over-inclusive by
+    /// construction: extraction is per-file, so a local named like a function is
+    /// indistinguishable from the function, and traversing them would put false
+    /// edges back into the walk #207 and #223 cleaned up. Counted instead, so
+    /// non-zero means "go look" rather than nothing at all (#250).
+    pub value_edges: usize,
     /// Whether the walk stopped at `max_depth` with unexplored frontier left.
     ///
     /// This means "the set may be incomplete", not "more definitely exists":
@@ -233,6 +243,12 @@ pub fn resolved_impact(
         let mut next: Vec<ImpactNode> = Vec::new();
         for node in &frontier {
             for resolved in resolve_references_to(store, &node.name) {
+                // Naming a function is not calling it. Real dependency, but too
+                // over-inclusive to traverse — report it instead (#250).
+                if resolved.reference.item.kind == RefKind::Value {
+                    report.value_edges += 1;
+                    continue;
+                }
                 match resolved.resolution {
                     // Unattributable: report it, do not traverse it.
                     Resolution::Ambiguous => report.ambiguous_edges += 1,
@@ -674,5 +690,38 @@ mod tests {
             report.ambiguous_edges, 0,
             "and must not be counted as declined: {report:?}"
         );
+    }
+
+    // ---- functions passed as values (#250) --------------------------------
+
+    #[test]
+    fn resolved_impact_counts_a_value_reference_instead_of_traversing_it() {
+        // Passing a function *is* a real dependency, so dropping it silently
+        // would under-report exactly the way #207 and #223 were about not doing.
+        // But a value reference is over-inclusive by construction — a local
+        // named like a function is indistinguishable — so traversing it would
+        // put false edges back into the one tool those tickets cleaned up.
+        // Count it, and let the caller decide whether to go look.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn helper() {}"));
+        s.insert("b.rs", build_rust("fn g() { register(helper); }"));
+
+        let report = resolved_impact(&s, "helper", None);
+        assert!(
+            !names_of(&report).contains(&"g"),
+            "must not be traversed: {report:?}"
+        );
+        assert_eq!(report.value_edges, 1, "must be reported: {report:?}");
+        assert_eq!(report.ambiguous_edges, 0, "{report:?}");
+    }
+
+    #[test]
+    fn a_plain_call_is_not_counted_as_a_value_edge() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn helper() {}"));
+        s.insert("b.rs", build_rust("fn g() { helper(); }"));
+        let report = resolved_impact(&s, "helper", None);
+        assert!(names_of(&report).contains(&"g"), "{report:?}");
+        assert_eq!(report.value_edges, 0, "{report:?}");
     }
 }

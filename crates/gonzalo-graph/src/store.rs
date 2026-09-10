@@ -6,8 +6,8 @@
 
 use crate::builder::Language;
 use crate::model::{
-    CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, Reference, Symbol, SymbolFilter,
-    SymbolKind, ViewOverview,
+    CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, RefKind, Reference, Symbol,
+    SymbolFilter, SymbolKind, ViewOverview,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -135,7 +135,14 @@ pub trait GraphStore: Send + Sync {
                 .insert(located.path.as_str());
         }
 
-        let references = self.all_references();
+        // Call edges only, so these rankings agree with `callers`/`callees`. A
+        // fan-in of 2 beside a single caller is just confusing, and fan-out
+        // would otherwise count locals handed to a call as calls (#250).
+        let references: Vec<Located<Reference>> = self
+            .all_references()
+            .into_iter()
+            .filter(|located| located.item.kind != RefKind::Value)
+            .collect();
         let mut scores: BTreeMap<&str, usize> = BTreeMap::new();
         match ranking {
             Ranking::Definitions => {
@@ -335,7 +342,7 @@ impl GraphStore for InMemoryGraphStore {
             .slices
             .values()
             .flat_map(|g| g.references.iter())
-            .filter(|r| r.name == name)
+            .filter(|r| r.name == name && r.kind != RefKind::Value)
             .filter_map(|r| r.from.clone())
             .collect();
         callers.sort();
@@ -348,7 +355,7 @@ impl GraphStore for InMemoryGraphStore {
             .slices
             .values()
             .flat_map(|g| g.references.iter())
-            .filter(|r| r.from.as_deref() == Some(name))
+            .filter(|r| r.from.as_deref() == Some(name) && r.kind != RefKind::Value)
             .map(|r| r.name.clone())
             .collect();
         callees.sort();
@@ -385,7 +392,7 @@ impl GraphStore for InMemoryGraphStore {
 mod tests {
     use super::*;
     use crate::builder::{build, build_rust};
-    use crate::model::SymbolKind;
+    use crate::model::{RefKind, SymbolKind};
 
     const SRC: &str = r#"
 fn helper() {}
@@ -834,5 +841,87 @@ fn other() { leaf(); }
             seen,
             vec![("src/a.rs", "y"), ("src/a.rs", "x"), ("src/b.rs", "z")]
         );
+    }
+
+    // ---- functions passed as values (#250) --------------------------------
+
+    /// `helper` is never called, only handed to `register`.
+    fn passed_as_a_value() -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "src/lib.rs",
+            build_rust("fn helper() {}\nfn g() { register(helper); }\n"),
+        );
+        s
+    }
+
+    #[test]
+    fn unreferenced_does_not_flag_a_function_only_passed_as_a_value() {
+        // The documented main false positive of this tool: a live callback is
+        // a path expression, not a call, so it recorded no edge and was
+        // reported as deletable (#250).
+        let s = passed_as_a_value();
+        let page = s.unreferenced(&SymbolFilter::default(), true, 100);
+        assert!(
+            !names(&page).contains(&"helper"),
+            "helper is passed to register: {:?}",
+            names(&page)
+        );
+    }
+
+    #[test]
+    fn callers_of_ignores_a_function_passed_as_a_value() {
+        // Passing a function is not calling it. Letting a value reference into
+        // the call graph would trade one wrong answer for another.
+        let s = passed_as_a_value();
+        assert!(
+            s.callers_of("helper").is_empty(),
+            "{:?}",
+            s.callers_of("helper")
+        );
+    }
+
+    #[test]
+    fn callees_ignores_a_function_passed_as_a_value() {
+        let s = passed_as_a_value();
+        assert_eq!(s.callees("g"), vec!["register".to_string()]);
+    }
+
+    #[test]
+    fn references_to_still_reports_a_value_reference() {
+        // The raw query stays complete — the filtering belongs to the call-graph
+        // views, not to the reference index.
+        let s = passed_as_a_value();
+        let refs = s.references_to("helper");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].item.kind, RefKind::Value);
+    }
+
+    #[test]
+    fn fan_in_and_fan_out_stay_call_graph_metrics() {
+        // `top` has to agree with `callers`/`callees`: a fan-in of 2 next to one
+        // caller is just confusing, and counting locals handed to a call would
+        // inflate fan-out with things that are not calls at all (#250).
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "src/lib.rs",
+            build_rust("fn helper() {}\nfn g(x: u32) { register(helper); take(x); }\n"),
+        );
+
+        let fan_in = s.top(Ranking::FanIn, 50);
+        let helper_score = fan_in
+            .items
+            .iter()
+            .find(|r| r.name == "helper")
+            .map(|r| r.score);
+        assert_eq!(helper_score, None, "helper is never called: {fan_in:?}");
+
+        let fan_out = s.top(Ranking::FanOut, 50);
+        let g_score = fan_out
+            .items
+            .iter()
+            .find(|r| r.name == "g")
+            .map(|r| r.score);
+        assert_eq!(g_score, Some(2), "g calls register and take: {fan_out:?}");
     }
 }

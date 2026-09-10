@@ -260,7 +260,8 @@ impl GraphStore for SqliteGraphStore {
         let mut stmt = guard
             .prepare(
                 "SELECT DISTINCT from_fn FROM refs
-                 WHERE name = ?1 AND from_fn IS NOT NULL ORDER BY from_fn",
+                 WHERE name = ?1 AND from_fn IS NOT NULL AND kind != 'value'
+                 ORDER BY from_fn",
             )
             .expect("prepare callers_of");
         let rows = stmt
@@ -273,7 +274,10 @@ impl GraphStore for SqliteGraphStore {
     fn callees(&self, name: &str) -> Vec<String> {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
-            .prepare("SELECT DISTINCT name FROM refs WHERE from_fn = ?1 ORDER BY name")
+            .prepare(
+                "SELECT DISTINCT name FROM refs
+                 WHERE from_fn = ?1 AND kind != 'value' ORDER BY name",
+            )
             .expect("prepare callees");
         let rows = stmt
             .query_map(params![name], |row| row.get::<_, String>(0))
