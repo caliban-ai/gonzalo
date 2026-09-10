@@ -99,6 +99,24 @@ the patch version for fixes.
 
 ### Changed
 
+- **CommonJS `require()` is recorded as an import.** JavaScript and TypeScript
+  extraction handled the ES `import` statement only, so a Node codebase written
+  in the older module system got no import-aware resolution at all. All three
+  binding forms are covered: `const fs = require('fs')`, destructuring, and a
+  rename, which records under its local name as the ES `as` alias already does.
+  A computed `require(name)` records nothing, since there is no literal path to
+  key on.
+
+  On the one CommonJS-heavy repository available, imports went from 4 to 93
+  across 22 files, and relative paths resolve as expected — `require('../util/aws')`
+  records `util/aws`.
+
+  Worth stating plainly: that repository has **no name collisions among its
+  imported symbols**, so this resolved zero ambiguous references there. The
+  extraction is correct and the payoff is prospective — a CommonJS codebase with
+  internal collisions gains what #252 gives every other language. It is not
+  demonstrated on the corpus at hand. `EXTRACTION_VERSION` is 12. (#269)
+
 - **C and C++ `#include` directives are now recorded and used to resolve.**
   #252 and #260 gave import-aware resolution to six languages; C and C++ had
   none, even though an include is a *stronger* signal than any of them. A

@@ -549,6 +549,24 @@ impl Language {
                     });
                 }
             }
+            // CommonJS: `const fs = require('fs')` and its destructuring
+            // forms. The module system for a large amount of Node code, and
+            // invisible until now (#269).
+            Self::JavaScript | Self::TypeScript | Self::Tsx
+                if node.kind() == "variable_declarator" =>
+            {
+                let Some(path) = require_source(node, bytes) else {
+                    return out;
+                };
+                for name in require_bound_names(node, bytes) {
+                    out.push(Import {
+                        depth: 0,
+                        name,
+                        path: path.clone(),
+                        line,
+                    });
+                }
+            }
             Self::JavaScript | Self::TypeScript | Self::Tsx
                 if node.kind() == "import_statement" =>
             {
@@ -1243,6 +1261,58 @@ fn python_module_segments(node: Node<'_>, bytes: &[u8]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The module segments a `require(...)` initializer names, or `None` when the
+/// declarator is not a require or its argument is not a literal path.
+///
+/// A computed `require(name)` names no module, so it records nothing — the same
+/// reasoning as a glob import, which introduces names the file never spells out.
+fn require_source(declarator: Node<'_>, bytes: &[u8]) -> Option<Vec<String>> {
+    let value = declarator.child_by_field_name("value")?;
+    if value.kind() != "call_expression" {
+        return None;
+    }
+    let callee = value.child_by_field_name("function")?;
+    if callee.kind() != "identifier" || node_text(callee, bytes) != Some("require") {
+        return None;
+    }
+    let argument = value.child_by_field_name("arguments")?.named_child(0)?;
+    if argument.kind() != "string" {
+        return None;
+    }
+    let segments = js_module_segments(node_text(argument, bytes)?);
+    (!segments.is_empty()).then_some(segments)
+}
+
+/// The local names a `require` declarator binds: one for `const fs = ...`, one
+/// per property for `const { a, b } = ...`, and the *local* half of a rename.
+fn require_bound_names(declarator: Node<'_>, bytes: &[u8]) -> Vec<String> {
+    let Some(pattern) = declarator.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    match pattern.kind() {
+        "identifier" => node_text(pattern, bytes)
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default(),
+        "object_pattern" => {
+            let mut out = Vec::new();
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                let named = match child.kind() {
+                    "shorthand_property_identifier_pattern" => Some(child),
+                    // `{ a: c }` — `c` is what this file writes.
+                    "pair_pattern" => child.child_by_field_name("value"),
+                    _ => None,
+                };
+                if let Some(name) = named.and_then(|n| node_text(n, bytes)) {
+                    out.push(name.to_string());
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The path segments a C/C++ include names: `"engine/render/pipeline.h"` is
@@ -3424,5 +3494,71 @@ int main(void) { return helper(1) + abs(-2); }
     fn an_include_with_no_directory_records_its_stem() {
         let imports = includes_of(Language::C, "#include \"config.h\"\n");
         assert_eq!(imports, vec![(String::new(), vec!["config".to_string()])]);
+    }
+
+    // ---- CommonJS require (#269) -------------------------------------------
+
+    #[test]
+    fn js_records_a_plain_require() {
+        let imports = imports_of(Language::JavaScript, "const fs = require('fs');\n");
+        assert_eq!(imports, vec![("fs".to_string(), vec!["fs".to_string()])]);
+    }
+
+    #[test]
+    fn js_records_each_destructured_require_name() {
+        let imports = imports_of(
+            Language::JavaScript,
+            "const { getEnv, createLogger } = require('../util/env');\n",
+        );
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "getEnv".to_string(),
+                    vec!["util".to_string(), "env".to_string()]
+                ),
+                (
+                    "createLogger".to_string(),
+                    vec!["util".to_string(), "env".to_string()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn js_records_a_renamed_destructured_require_under_its_local_name() {
+        // `{ a: c }` means this file writes `c`, the same rule the ES `as`
+        // alias already follows.
+        let imports = imports_of(
+            Language::JavaScript,
+            "const { helper: localHelper } = require('./mod');\n",
+        );
+        assert_eq!(
+            imports,
+            vec![("localHelper".to_string(), vec!["mod".to_string()])]
+        );
+    }
+
+    #[test]
+    fn a_computed_require_records_nothing() {
+        // No literal path means no module to key on, the same way a glob import
+        // introduces no name.
+        assert!(imports_of(Language::JavaScript, "const m = require(name);\n").is_empty());
+        assert!(imports_of(Language::JavaScript, "const m = require(`./${x}`);\n").is_empty());
+    }
+
+    #[test]
+    fn a_binding_that_is_not_a_require_records_nothing() {
+        assert!(imports_of(Language::JavaScript, "const total = compute(1);\n").is_empty());
+        assert!(imports_of(Language::JavaScript, "const n = 1;\n").is_empty());
+    }
+
+    #[test]
+    fn typescript_records_a_require_too() {
+        let imports = imports_of(Language::TypeScript, "const fs = require('node:fs');\n");
+        assert_eq!(
+            imports,
+            vec![("fs".to_string(), vec!["node:fs".to_string()])]
+        );
     }
 }
