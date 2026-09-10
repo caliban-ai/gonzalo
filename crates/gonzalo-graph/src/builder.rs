@@ -428,8 +428,16 @@ impl Language {
             // `import pkg.model` binds `pkg`, which names no symbol, so it is
             // left alone.
             Self::Python if node.kind() == "import_from_statement" => {
-                let path = node
-                    .child_by_field_name("module_name")
+                let module_name = node.child_by_field_name("module_name");
+                // `from ..pkg import X` — the dots say how far up from this
+                // file's own package to anchor, and are the whole reason a
+                // relative import needs no project root (#261).
+                let depth = module_name
+                    .filter(|m| m.kind() == "relative_import")
+                    .and_then(|m| child_of_kind(m, "import_prefix"))
+                    .and_then(|prefix| node_text(prefix, bytes))
+                    .map_or(0, |dots| dots.chars().filter(|c| *c == '.').count());
+                let path = module_name
                     .map(|m| python_module_segments(m, bytes))
                     .unwrap_or_default();
                 let mut cursor = node.walk();
@@ -441,6 +449,7 @@ impl Language {
                     .and_then(|n| node_text(n, bytes));
                     if let Some(name) = name {
                         out.push(Import {
+                            depth,
                             name: name.to_string(),
                             path: path.clone(),
                             line,
@@ -464,6 +473,7 @@ impl Language {
                 let mut segments = java_path_segments(path_node, bytes);
                 if let Some(name) = segments.pop() {
                     out.push(Import {
+                        depth: 0,
                         name,
                         path: segments,
                         line,
@@ -505,6 +515,7 @@ impl Language {
                 };
                 if let Some(name) = name {
                     out.push(Import {
+                        depth: 0,
                         name,
                         path: segments,
                         line,
@@ -1038,6 +1049,7 @@ fn collect_js_import_names(
                     .and_then(|n| node_text(n, bytes));
                 if let Some(name) = name {
                     out.push(Import {
+                        depth: 0,
                         name: name.to_string(),
                         path: path.to_vec(),
                         line,
@@ -1048,6 +1060,7 @@ fn collect_js_import_names(
             "identifier" => {
                 if let Some(name) = node_text(child, bytes) {
                     out.push(Import {
+                        depth: 0,
                         name: name.to_string(),
                         path: path.to_vec(),
                         line,
@@ -1101,7 +1114,12 @@ fn collect_rust_uses(node: Node<'_>, bytes: &[u8], prefix: &[String], out: &mut 
             if let Some(name) = segments.pop() {
                 let mut path = prefix.to_vec();
                 path.append(&mut segments);
-                out.push(Import { name, path, line });
+                out.push(Import {
+                    depth: 0,
+                    name,
+                    path,
+                    line,
+                });
             }
         }
         "use_as_clause" => {
@@ -1119,6 +1137,7 @@ fn collect_rust_uses(node: Node<'_>, bytes: &[u8], prefix: &[String], out: &mut 
             let mut path = prefix.to_vec();
             path.append(&mut segments);
             out.push(Import {
+                depth: 0,
                 name: alias.to_string(),
                 path,
                 line,
@@ -1144,6 +1163,7 @@ fn collect_rust_uses(node: Node<'_>, bytes: &[u8], prefix: &[String], out: &mut 
         "identifier" => {
             if let Some(name) = node_text(node, bytes) {
                 out.push(Import {
+                    depth: 0,
                     name: name.to_string(),
                     path: prefix.to_vec(),
                     line,
@@ -3156,5 +3176,50 @@ object Config
             .find(|r| r.name == "cell")
             .expect("call recorded");
         assert_eq!(call.from.as_deref(), Some("render"));
+    }
+
+    // ---- relative import depth (#261) --------------------------------------
+
+    /// `(name, path, depth)` for every import in `src`.
+    fn imports_with_depth(language: Language, src: &str) -> Vec<(String, Vec<String>, usize)> {
+        build(language, src)
+            .imports
+            .iter()
+            .map(|i| (i.name.clone(), i.path.clone(), i.depth))
+            .collect()
+    }
+
+    #[test]
+    fn python_records_the_depth_of_a_relative_import() {
+        // `..pkg.sub` is two dots deep: the referencing file's parent package,
+        // then `pkg/sub` under it.
+        let imports = imports_with_depth(Language::Python, "from ..pkg.sub import C\n");
+        assert_eq!(
+            imports,
+            vec![(
+                "C".to_string(),
+                vec!["pkg".to_string(), "sub".to_string()],
+                2
+            )]
+        );
+    }
+
+    #[test]
+    fn python_records_a_bare_single_dot_import() {
+        let imports = imports_with_depth(Language::Python, "from . import A\n");
+        assert_eq!(imports, vec![("A".to_string(), vec![], 1)]);
+    }
+
+    #[test]
+    fn an_absolute_python_import_records_no_depth() {
+        let imports = imports_with_depth(Language::Python, "from pkg import D\n");
+        assert_eq!(imports, vec![("D".to_string(), vec!["pkg".to_string()], 0)]);
+    }
+
+    #[test]
+    fn a_slice_with_only_absolute_imports_serializes_without_depth() {
+        let g = build(Language::Python, "from pkg import D\n");
+        let json = serde_json::to_string(&g).expect("serialize");
+        assert!(!json.contains("depth"), "{json}");
     }
 }

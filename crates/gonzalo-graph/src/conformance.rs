@@ -3,7 +3,7 @@
 //! in-memory reference. Backend crates call [`run_graph_store_conformance`]
 //! from their tests with a factory that returns a fresh, empty store.
 
-use crate::{GraphStore, RefKind, build_rust};
+use crate::{GraphStore, Language, RefKind, build, build_rust};
 use std::collections::BTreeSet;
 
 /// Run the full suite against stores produced by `make` (a fresh, empty
@@ -204,6 +204,20 @@ fn imports_survive_a_round_trip_and_disambiguate<S: GraphStore>(s: &mut S) {
     assert!(
         s.imports_in_file("src/model.rs").is_empty(),
         "a file with no imports has none"
+    );
+
+    // A relative import's depth is what lets it be anchored at all; a backend
+    // that drops it turns the import back into a free-floating suffix (#261).
+    s.insert(
+        "pkg/app.py",
+        build(Language::Python, "from ..other import thing\n"),
+    );
+    let relative = s.imports_in_file("pkg/app.py");
+    assert_eq!(relative.len(), 1, "{relative:?}");
+    assert_eq!(relative[0].depth, 2, "{relative:?}");
+    assert_eq!(
+        imports[0].depth, 0,
+        "an absolute import stays at zero: {imports:?}"
     );
 
     // And the resolver can then tell the two `make`s apart.

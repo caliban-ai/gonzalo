@@ -43,6 +43,39 @@ the patch version for fixes.
 
 ### Changed
 
+- **Imports now anchor to the file that wrote them.** #252 matched an import's
+  module as a free-floating path suffix, which fails exactly where a codebase
+  holds two copies of the same tree — a vendored reference beside your own work,
+  or one package tree per assignment. Every copy matched, so the reference was
+  correctly but uselessly declined.
+
+  Two lexical rules fix it, neither needing a project root. A **Python relative
+  import** carries its dot count now, so `from ..DataTypes import Action`
+  resolves by walking up from the referencing file's own package — arithmetic on
+  a path gonzalo already has. And when an **absolute import** matches several
+  candidates, the one sharing the longest path prefix with the referencing file
+  wins, since a file means the copy in its own tree.
+
+  Measured on four repositories, counting ambiguous references whose file
+  imports the name:
+
+  | repo | candidates | resolved before | after |
+  |---|---|---|---|
+  | CS-5260 (Python) | 85 | 0 | 65 |
+  | cs-395-spring-2024 | 29 | 14 | 19 |
+  | cs-5253-fall-2023 | 701 | 0 | 185 |
+  | cs-5254-summer-2023 | 679 | 0 | 49 |
+
+  Confirmed through the server rather than only in tests: `impact` on a symbol
+  defined identically in two parallel trees now reaches 18 callers, all 18 in the
+  importing file's own tree and none in the other.
+
+  Both rules stay narrowing, as #248 established. A tie is left ambiguous rather
+  than broken by a coin flip, candidates sharing no prefix at all are not ranked,
+  and a relative import claiming more levels than the path has falls through to
+  the older rules. `EXTRACTION_VERSION` is 9, and the store gains an import depth
+  column. (#261)
+
 - **Java and Kotlin imports are now recorded.** #252 shipped import-aware
   resolution for Rust, Python, JavaScript and TypeScript and left out the two
   most import-dense languages gonzalo supports — every type from another package
