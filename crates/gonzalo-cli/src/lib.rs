@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod walk;
-pub use walk::{IgnoredCounts, IndexFilter};
+pub use walk::{IgnoredCounts, IndexFilter, SourceFiles, UnindexedCounts};
 
 mod watch;
 pub use watch::{WatchConfig, watch};
@@ -177,6 +177,10 @@ pub struct IndexSummary {
     /// generated files, dependency/output directories, and gitignored trees
     /// (#209). Distinct from `skipped`, which is a parse failure.
     pub ignored: IgnoredCounts,
+    /// Files gonzalo has no grammar for. Distinct from both of the above:
+    /// recognized as a file, would have been indexed, but its extension names
+    /// no language gonzalo parses (#259).
+    pub unindexed: UnindexedCounts,
     /// Whether this run used the git-diff-driven incremental driver (only the
     /// changed set re-parsed) rather than the full tree walk.
     pub incremental: bool,
@@ -528,7 +532,14 @@ pub async fn index_with_worker(
     // commits, so a concurrent-writer Conflict (below) leaves the graph
     // untouched rather than advanced ahead of a manifest that never landed (#153).
     let mut staging = GraphStaging::default();
-    let (desired, files, skipped, ignored, incremental) = match incremental_changed {
+    let DesiredView {
+        entries: desired,
+        files,
+        skipped,
+        ignored,
+        unindexed,
+        incremental,
+    } = match incremental_changed {
         Some(changed) => {
             build_desired_incremental(
                 &store,
@@ -615,6 +626,7 @@ pub async fn index_with_worker(
         deleted: recon.deleted.len(),
         skipped,
         ignored,
+        unindexed,
         incremental,
     })
 }
@@ -647,22 +659,37 @@ impl GraphStaging {
 
 /// Full-walk desired set: parse every supported source file under `src` that
 /// `filter` admits.
+/// What one indexing driver produced: the manifest entries the view should
+/// hold, plus the counts [`IndexSummary`] reports.
+///
+/// A named type rather than a tuple because the two drivers must agree on it
+/// exactly, and a six-element tuple says nothing about which `usize` is which.
+struct DesiredView {
+    entries: BTreeMap<String, ContentHash>,
+    /// Files parsed into the view this run.
+    files: usize,
+    /// Files a parse worker crashed or hung on.
+    skipped: usize,
+    ignored: IgnoredCounts,
+    unindexed: UnindexedCounts,
+    /// Whether the git-diff-driven driver produced this, rather than a full walk.
+    incremental: bool,
+}
+
 async fn build_desired_full(
     store: &FsStore,
     staging: &mut GraphStaging,
     pool: Option<&ParserPool>,
     src: &Path,
     filter: &IndexFilter,
-) -> Result<(
-    BTreeMap<String, ContentHash>,
-    usize,
-    usize,
-    IgnoredCounts,
-    bool,
-)> {
+) -> Result<DesiredView> {
     let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
     let mut skipped = 0usize;
-    let (sources, ignored) = walk::source_files(src, filter)?;
+    let walk::SourceFiles {
+        files: sources,
+        ignored,
+        unindexed,
+    } = walk::source_files(src, filter)?;
     for (path, language) in sources {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -680,7 +707,14 @@ async fn build_desired_full(
         desired.insert(rel, hash);
     }
     let files = desired.len();
-    Ok((desired, files, skipped, ignored, false))
+    Ok(DesiredView {
+        entries: desired,
+        files,
+        skipped,
+        ignored,
+        unindexed,
+        incremental: false,
+    })
 }
 
 /// Incremental desired set: start from the current manifest and apply only the
@@ -695,19 +729,14 @@ async fn build_desired_incremental(
     current: &Manifest,
     changed: &gonzalo_store_git::ChangedPaths,
     filter: &IndexFilter,
-) -> Result<(
-    BTreeMap<String, ContentHash>,
-    usize,
-    usize,
-    IgnoredCounts,
-    bool,
-)> {
+) -> Result<DesiredView> {
     let mut desired = current.entries.clone();
     let mut files = 0usize;
     let mut skipped = 0usize;
     // Gitignored paths never reach here — `git2`'s diff omits them — so only the
     // path-only rules apply, and only files are ever counted.
     let mut ignored = IgnoredCounts::default();
+    let mut unindexed = UnindexedCounts::default();
 
     // Re-apply the filter to paths carried forward from the previous run, not
     // just to changed ones. A view indexed under laxer rules keeps its vendored
@@ -738,7 +767,12 @@ async fn build_desired_incremental(
             .and_then(|e| e.to_str())
             .and_then(Language::from_extension)
         else {
-            continue; // not a source file
+            // Indexable, but gonzalo has no grammar for it. The filter check
+            // above already rejected anything deliberately excluded, so this
+            // counts exactly the files a user would expect to have been
+            // indexed and were not (#259).
+            unindexed.record(Path::new(rel).extension().and_then(|e| e.to_str()));
+            continue;
         };
         // A file git reports as changed but that we can no longer read (e.g.
         // it vanished between diff and read) is treated as a removal.
@@ -767,7 +801,14 @@ async fn build_desired_incremental(
         }
     }
 
-    Ok((desired, files, skipped, ignored, true))
+    Ok(DesiredView {
+        entries: desired,
+        files,
+        skipped,
+        ignored,
+        unindexed,
+        incremental: true,
+    })
 }
 
 // ─── gc ────────────────────────────────────────────────────────────────────
@@ -1432,7 +1473,12 @@ mod tests {
         let mut graph = SqliteGraphStore::open(&db_path).unwrap();
 
         let mut staging = GraphStaging::default();
-        let (desired, files, _skipped, _ignored, incremental) = build_desired_full(
+        let DesiredView {
+            entries: desired,
+            files,
+            incremental,
+            ..
+        } = build_desired_full(
             &store,
             &mut staging,
             None,
@@ -2163,5 +2209,73 @@ mod tests {
         .unwrap();
         let graph = gonzalo_graph::assemble(&manifest, &store).await.unwrap();
         assert_eq!(graph.definitions("shared")[0].path, "shared.rs");
+    }
+
+    // ---- files gonzalo cannot parse (#259) ---------------------------------
+
+    #[tokio::test]
+    async fn a_tree_of_unparseable_files_says_so_instead_of_reporting_nothing() {
+        // Indexing a Jupyter-notebook-only repository reported every count at
+        // zero with no hint why, so an empty view read as "the repo is empty"
+        // rather than "gonzalo does not parse this" (#259).
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "analysis.ipynb", "{ \"cells\": [] }");
+        write_file(src.path(), "notes.org", "* heading");
+
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.files, 0, "nothing was indexable");
+        assert_eq!(summary.unindexed.files, 2, "but two files were seen");
+        assert_eq!(
+            summary.unindexed.extensions(),
+            vec![("ipynb".to_string(), 1), ("org".to_string(), 1)],
+            "and the message can name them"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparseable_files_are_counted_beside_ones_that_index() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn helper() {}");
+        write_file(src.path(), "README.md", "# hi");
+
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.unindexed.files, 1);
+        assert_eq!(summary.unindexed.extensions(), vec![("md".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn extensions_are_reported_most_common_first() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        for name in ["a.md", "b.md", "c.md", "d.txt"] {
+            write_file(src.path(), name, "x");
+        }
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(
+            summary.unindexed.extensions(),
+            vec![("md".to_string(), 3), ("txt".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extensionless_file_is_counted_without_an_extension() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "LICENSE", "text");
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.unindexed.files, 1);
+        assert!(summary.unindexed.extensions().is_empty(), "nothing to name");
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_empty_tree_reports_no_unindexed_files() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.files, 0);
+        assert_eq!(summary.unindexed.files, 0);
     }
 }
