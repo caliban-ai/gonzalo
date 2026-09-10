@@ -55,6 +55,18 @@ pub struct Symbol {
     pub kind: SymbolKind,
     pub start_line: usize,
     pub end_line: usize,
+    /// The type or module this symbol is defined inside — `Foo` for a method in
+    /// `impl Foo`, `Widget` for a method in `class Widget`, `util` for a
+    /// function in an inline `mod util`.
+    ///
+    /// Without it `Foo::get` and `Bar::get` are one node, because a symbol's
+    /// identity is its bare name. Paired with [`Reference::qualifier`] it lets
+    /// the resolver keep two same-named methods apart with no type inference
+    /// (#248). Omitted from the serialized slice when absent, so a file of
+    /// plain free functions keeps the byte-identical slice — and therefore the
+    /// same content hash — it had before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// A name-based reference (e.g. a call) from within `from` (the enclosing
@@ -74,6 +86,17 @@ pub struct Reference {
     /// same content hash — it had before this field existed.
     #[serde(default, skip_serializing_if = "RefKind::is_free")]
     pub kind: RefKind,
+    /// The path segment immediately before the callee name at the call site —
+    /// `Language` for `Language::from_extension()`, `b` for `a::b::c()`.
+    ///
+    /// Recorded only for path-shaped calls. A method call's receiver is a
+    /// *value*, not a type, so it is deliberately left `None`: `x` says nothing
+    /// about which `helper` is meant, and storing it here would assert
+    /// something the graph does not know (#248).
+    ///
+    /// Omitted from the serialized slice when absent, like [`kind`](Self::kind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
 }
 
 /// The syntactic shape of a call site.

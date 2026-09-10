@@ -11,6 +11,21 @@ the patch version for fixes.
 
 ### Added
 
+- **Qualified symbol identity in the code graph.** A call site's path qualifier
+  and a definition's owning type are now both recorded, so `Beta::get()` is
+  attributed to `Beta`'s `get` instead of merging with every other `get` in the
+  view. Two pieces of disambiguating information were sitting in the syntax tree
+  and being discarded: a qualified callee was reduced to its trailing identifier,
+  and the walk tracked only the enclosing *function*, so a method in an `impl`
+  block was stored as a bare name with nothing recording what it hangs off. The
+  qualifier only ever narrows — when it names something the view does not own,
+  such as a file module or a dependency, it is ignored and the previous rules
+  apply, so no edge that resolved before stops resolving now. Recorded where a
+  grammar makes a path unambiguously a path (Rust, C++, PHP); Go's
+  `pkg.Func()` and Java's `Foo.bar()` cannot be told from a receiver call at
+  this level and stay unqualified rather than record a variable as a type.
+  `EXTRACTION_VERSION` is 3, so each view re-walks once on upgrade. (#248)
+
 - Prebuilt macOS Apple Silicon binaries on every tagged release. A `v*` tag now
   also builds `gonzalo-vX.Y.Z-aarch64-apple-darwin.tar.gz` (plus a `.sha256`) and
   attaches it to the GitHub Release. The archive holds `gonzalo`, `gonzalo-mcp`

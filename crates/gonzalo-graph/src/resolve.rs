@@ -5,14 +5,24 @@
 //! resolves each reference to the specific defining path it most likely means,
 //! disambiguating same-named symbols across files:
 //!
-//! 1. **Local** — a definition of the name in the reference's own file wins.
-//! 2. **Unique global** — otherwise, the sole definition across the view.
-//! 3. **Ambiguous** — multiple definitions and none local: left unresolved.
-//! 4. **Unresolved** — no definition in the view (honest dangling, ADR 0012).
+//! 1. **Qualified** — the call site named an owner (`Beta::get()`) and exactly
+//!    one definition in the view is owned by it (#248).
+//! 2. **Local** — a definition of the name in the reference's own file wins.
+//! 3. **Unique global** — otherwise, the sole definition across the view.
+//! 4. **Ambiguous** — multiple definitions and none local: left unresolved.
+//! 5. **Unresolved** — no definition in the view (honest dangling, ADR 0012).
+//!
+//! The qualifier rule only ever *narrows*. A Rust qualifier is as often a
+//! module as a type, and most modules are files rather than inline `mod`
+//! blocks, so nothing in the view is owned by them; declining those edges would
+//! lose attributions the view makes correctly today. When a qualifier matches
+//! no owner it is ignored and the remaining rules apply unchanged.
 //!
 //! Resolution is file-scoped (not yet import-aware); it is a pure function of a
 //! [`GraphStore`]'s query methods, so it works over any backend and adds no
-//! trait surface. Import-following resolution is a further step.
+//! trait surface. Import-following resolution is a further step, and is also
+//! what would let a module path be told from a type — at which point an
+//! unmatched qualifier could decline rather than fall through (#252).
 
 use crate::{GraphStore, Located, RefKind, Reference};
 use serde::{Deserialize, Serialize};
@@ -21,6 +31,12 @@ use std::collections::BTreeSet;
 /// How a reference was resolved to a definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
+    /// The call site named a qualifier (`Beta::get()`) and exactly one
+    /// definition in the view is owned by it.
+    ///
+    /// Outranks [`Local`](Resolution::Local): a call that says which type it
+    /// means says so whatever else sits in the same file (#248).
+    Qualified,
     /// A definition of the name exists in the reference's own file.
     Local,
     /// The name is defined exactly once across the view.
@@ -53,17 +69,42 @@ pub struct ResolvedReference {
 /// Resolve every reference to `name` to a defining path (see the module docs
 /// for the strategy).
 pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<ResolvedReference> {
-    let def_paths: BTreeSet<String> = store
-        .definitions(name)
-        .into_iter()
-        .map(|d| d.path)
-        .collect();
+    let defs = store.definitions(name);
+    let def_paths: BTreeSet<String> = defs.iter().map(|d| d.path.clone()).collect();
 
     store
         .references_to(name)
         .into_iter()
         .map(|located| {
-            let (target, resolution) = if def_paths.contains(&located.path) {
+            // A call that names its owner (`Beta::get()`) says which definition
+            // it means, whatever else happens to share the name — so this is
+            // consulted before the local rule.
+            //
+            // Only when the qualifier actually matches an owner in the view. A
+            // file module (`some_module::helper()`) owns nothing here, and
+            // declining that edge would throw away an attribution the view can
+            // make perfectly well. So the qualifier only ever *narrows*: it can
+            // turn ambiguity into an answer, never an answer into ambiguity
+            // (#248). Telling a module path from a type is what #252 is for.
+            let qualified: BTreeSet<&str> = match located.item.qualifier.as_deref() {
+                Some(q) => defs
+                    .iter()
+                    .filter(|d| d.item.owner.as_deref() == Some(q))
+                    .map(|d| d.path.as_str())
+                    .collect(),
+                None => BTreeSet::new(),
+            };
+
+            let (target, resolution) = if qualified.len() == 1 {
+                (
+                    qualified.iter().next().map(|p| (*p).to_string()),
+                    Resolution::Qualified,
+                )
+            } else if !qualified.is_empty() {
+                // Same owner name defined in several files: the qualifier
+                // narrowed the candidates but did not settle them.
+                (None, Resolution::Ambiguous)
+            } else if def_paths.contains(&located.path) {
                 // A definition in the caller's own file wins for either shape:
                 // `self.foo()` next to `fn foo` is the one thing about a
                 // receiver we can reasonably assume.
@@ -546,6 +587,92 @@ mod tests {
         assert_eq!(
             resolved_callers_of(&s, "b.rs", "foo"),
             vec!["cb".to_string()]
+        );
+    }
+
+    // ---- qualified references (#248) --------------------------------------
+
+    /// Two types, in separate files, each with a `get` method; a third file
+    /// calls one of them by name.
+    fn two_gets() -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "a.rs",
+            build_rust("struct Alpha; impl Alpha { fn get() {} }"),
+        );
+        s.insert("b.rs", build_rust("struct Beta; impl Beta { fn get() {} }"));
+        s
+    }
+
+    #[test]
+    fn a_qualified_reference_resolves_to_the_matching_owner() {
+        let mut s = two_gets();
+        s.insert("c.rs", build_rust("fn caller() { Beta::get(); }"));
+        let r = resolve_references_to(&s, "get")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Qualified);
+        assert_eq!(r.target.as_deref(), Some("b.rs"));
+    }
+
+    #[test]
+    fn an_unqualified_reference_to_an_overloaded_name_stays_ambiguous() {
+        let mut s = two_gets();
+        s.insert("c.rs", build_rust("fn plain() { get(); }"));
+        let r = resolve_references_to(&s, "get")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("plain"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Ambiguous);
+        assert_eq!(r.target, None);
+    }
+
+    #[test]
+    fn a_qualified_reference_beats_a_local_definition_of_the_same_name() {
+        // The call says `Beta`, so the free `get` sitting in the same file is
+        // not what it means — the qualifier has to outrank the local rule.
+        let mut s = two_gets();
+        s.insert(
+            "c.rs",
+            build_rust("fn get() {}\nfn caller() { Beta::get(); }"),
+        );
+        let r = resolve_references_to(&s, "get")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Qualified);
+        assert_eq!(r.target.as_deref(), Some("b.rs"));
+    }
+
+    #[test]
+    fn a_qualifier_that_matches_no_owner_falls_back_to_the_existing_ladder() {
+        // `some_module` is a file module, so nothing in the view is *owned* by
+        // it. The qualifier must then be ignored rather than declining an edge
+        // that resolves perfectly well today: this pass only ever narrows.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn helper() {}"));
+        s.insert("b.rs", build_rust("fn caller() { some_module::helper(); }"));
+        let r = resolve_references_to(&s, "helper")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::UniqueGlobal);
+        assert_eq!(r.target.as_deref(), Some("a.rs"));
+    }
+
+    #[test]
+    fn resolved_impact_follows_a_qualified_edge_it_used_to_decline() {
+        let mut s = two_gets();
+        s.insert("c.rs", build_rust("fn caller() { Beta::get(); }"));
+        let report = resolved_impact(&s, "get", None);
+        assert!(
+            names_of(&report).contains(&"caller"),
+            "qualified edge must be traversed: {report:?}"
+        );
+        assert_eq!(
+            report.ambiguous_edges, 0,
+            "and must not be counted as declined: {report:?}"
         );
     }
 }
