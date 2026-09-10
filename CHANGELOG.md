@@ -9,7 +9,30 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-10
+
+Resolution that uses what the syntax already says, and prebuilt binaries to run
+it with. The code graph stops identifying every symbol by its bare name: a call
+site's qualifier, a definition's owning type, a receiver's written type, and a
+file's own imports are all recorded and consulted, so `Foo::get` and `Bar::get`
+stop being one node. Each rule only ever narrows — where it cannot settle a
+question it declines and says so, and the counts of what it declined travel with
+the answer.
+
+Much of this was found by pointing gonzalo at code it was not designed against.
+Seven of the sixteen tickets here came from indexing a C++ engine, a Next.js
+app, a Node service, three Java and Kotlin course repositories and two Python
+projects — `.h` headers parsed as C, `#include` ignored entirely, Java and Kotlin
+imports unrecorded, React's wrapper idiom yielding zero symbols per file. Two of
+them corrected tickets written from inside this repository.
+
 ### Fixed
+
+- **The guide's binary install example no longer pins a tag.** It pointed at
+  `v0.5.0`, which carries no release assets — prebuilt binaries start with this
+  release — so the documented install 404'd from the moment it was published,
+  and pinning any concrete tag would re-create that on every release. It now
+  reads the latest tag, with a note that archives begin after `v0.5.0`. (#242)
 
 - **A skipped file now says which file.** When an isolated parse worker dies on
   a file, the CLI reported `skipping a file — parse worker error: ...` without
@@ -877,7 +900,8 @@ milestone (M1–M6).
   ADRs 0001–0009; added CI (fmt/clippy/build/test), a line-coverage gate, the
   Kanban label taxonomy, and board/triage automation.
 
-[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/caliban-ai/gonzalo/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/caliban-ai/gonzalo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/gonzalo/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/caliban-ai/gonzalo/compare/v0.2.0...v0.3.0
