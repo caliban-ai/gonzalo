@@ -6,6 +6,7 @@
 
 use crate::model::{CodeGraph, RefKind, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 /// A source language the graph builder understands.
@@ -824,6 +825,7 @@ pub fn build(language: Language, src: &str) -> CodeGraph {
         src.as_bytes(),
         None,
         None,
+        &BTreeMap::new(),
         &mut graph,
     );
     graph
@@ -844,16 +846,189 @@ fn name_field(node: Node<'_>, bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The base type a Rust type node names, or `None` when it needs inference:
+/// `Widget` for `Widget`, `&Widget`, `&mut Widget` and `a::b::Widget`, `Vec` for
+/// `Vec<T>`. `impl Trait`, `dyn Trait` and tuples yield nothing (#251).
+fn rust_type_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => node_text(node, bytes).map(str::to_string),
+        "reference_type" => node
+            .child_by_field_name("type")
+            .and_then(|t| rust_type_name(t, bytes)),
+        // `generic_type` names its base in `type`; `scoped_type_identifier`
+        // names its last segment in `name`.
+        "generic_type" | "scoped_type_identifier" => node
+            .child_by_field_name("type")
+            .or_else(|| node.child_by_field_name("name"))
+            .and_then(|t| rust_type_name(t, bytes)),
+        _ => None,
+    }
+}
+
+/// The type a Rust initializer expression obviously produces, syntactically:
+/// `Widget::new(..)` and `Widget { .. }` both name `Widget`.
+///
+/// A plain call (`make()`) names nothing without a return type, and a chain
+/// (`Widget::new().wrap()`) is deliberately not followed — the last call decides
+/// the type and the graph cannot know it (#251).
+fn rust_value_type(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            (func.kind() == "scoped_identifier")
+                .then(|| func.child_by_field_name("path"))
+                .flatten()
+                .and_then(|path| trailing_path_segment(path, bytes))
+        }
+        "struct_expression" => node
+            .child_by_field_name("name")
+            .and_then(|n| rust_type_name(n, bytes)),
+        "reference_expression" => node
+            .child_by_field_name("value")
+            .and_then(|v| rust_value_type(v, bytes)),
+        _ => None,
+    }
+}
+
+/// Type parameters declared on a Rust function (`fn g<T: Tr>`).
+///
+/// A receiver typed `T` names no type in the view, and recording it would
+/// invite the resolver to pick an impl — the guess #223 removed. Excluded so
+/// those receivers keep declining.
+fn rust_type_parameters(func: Node<'_>, bytes: &[u8]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(params) = func.child_by_field_name("type_parameters") else {
+        return out;
+    };
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        // `T`, `T: Bound`, `T = Default`, `T: A + B` all lead with the
+        // parameter's own name, so the first `type_identifier` in the subtree is
+        // it. Lifetimes and const parameters have none and drop out.
+        let name = first_type_identifier(child, bytes);
+        if let Some(name) = name {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// The first `type_identifier` in `node`'s subtree, depth-first.
+fn first_type_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    if node.kind() == "type_identifier" {
+        return node_text(node, bytes).map(str::to_string);
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| first_type_identifier(child, bytes))
+}
+
+/// `let` bindings in a Rust body whose type is written or obvious, added to
+/// `out`. Does not descend into a nested `function_item`: that body is its own
+/// scope and gets its own table.
+fn collect_rust_lets(
+    node: Node<'_>,
+    bytes: &[u8],
+    generics: &BTreeSet<String>,
+    out: &mut BTreeMap<String, String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "function_item" {
+            continue;
+        }
+        if child.kind() == "let_declaration"
+            && let Some(pattern) = child.child_by_field_name("pattern")
+            && pattern.kind() == "identifier"
+            && let Some(name) = node_text(pattern, bytes)
+        {
+            // An explicit annotation beats the initializer.
+            let ty = child
+                .child_by_field_name("type")
+                .and_then(|t| rust_type_name(t, bytes))
+                .or_else(|| {
+                    child
+                        .child_by_field_name("value")
+                        .and_then(|v| rust_value_type(v, bytes))
+                });
+            if let Some(ty) = ty
+                && !generics.contains(&ty)
+            {
+                out.insert(name.to_string(), ty);
+            }
+        }
+        collect_rust_lets(child, bytes, generics, out);
+    }
+}
+
+/// Receiver types visible inside one Rust function body, by binding name.
+///
+/// Three shapes carry most of the volume and are all purely syntactic: a
+/// parameter with a written type, a binding initialized from a constructor-style
+/// call, and a binding initialized from a struct literal. Anything needing
+/// inference — a return type, a generic, a trait object — is left out, so those
+/// receivers keep declining and keep being counted (#251).
+///
+/// Rust only. Every other language records no receiver type and behaves exactly
+/// as it did.
+fn rust_receiver_types(func: Node<'_>, bytes: &[u8]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let generics = rust_type_parameters(func, bytes);
+
+    if let Some(params) = func.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            let (Some(pattern), Some(ty)) = (
+                param.child_by_field_name("pattern"),
+                param.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            if let Some(name) = node_text(pattern, bytes)
+                && let Some(ty) = rust_type_name(ty, bytes)
+                && !generics.contains(&ty)
+            {
+                out.insert(name.to_string(), ty);
+            }
+        }
+    }
+
+    if let Some(body) = func.child_by_field_name("body") {
+        collect_rust_lets(body, bytes, &generics, &mut out);
+    }
+    out
+}
+
+/// The bare receiver of a Rust method call — `w` in `w.get()` — or `None` when
+/// the receiver is an expression rather than a name.
+fn rust_receiver_name(call: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "field_expression" {
+        return None;
+    }
+    let value = func.child_by_field_name("value")?;
+    matches!(value.kind(), "identifier" | "self")
+        .then(|| node_text(value, bytes))
+        .flatten()
+        .map(str::to_string)
+}
+
 fn walk(
     language: Language,
     node: Node<'_>,
     bytes: &[u8],
     current_fn: Option<&str>,
     current_type: Option<&str>,
+    current_receivers: &BTreeMap<String, String>,
     graph: &mut CodeGraph,
 ) {
     let mut enclosing = current_fn.map(str::to_string);
     let mut owner = current_type.map(str::to_string);
+    // Assigned only when this node opens a function body, and only then does
+    // `receivers` point at it — so the table is scoped to the body it came from
+    // and cannot leak into a sibling function (#251).
+    let scoped_receivers;
+    let mut receivers = current_receivers;
 
     if let Some(kind) = language.item_kind(node, bytes)
         && let Some(name) = language.item_name(node, kind, bytes)
@@ -869,6 +1044,10 @@ fn walk(
         });
         if kind == SymbolKind::Function {
             enclosing = Some(name.clone());
+            if language == Language::Rust {
+                scoped_receivers = rust_receiver_types(node, bytes);
+                receivers = &scoped_receivers;
+            }
         }
         if establishes_ownership(kind) {
             owner = Some(owner_key(&name));
@@ -887,7 +1066,15 @@ fn walk(
             // A receiver is a value, not a type (#248); a value reference is
             // not a call site at all (#250).
             qualifier: match kind {
-                RefKind::Method | RefKind::Value => None,
+                RefKind::Value => None,
+                // `x.foo()` belongs to whatever `x` is. Where the body says so
+                // outright, say so; otherwise keep declining (#251).
+                RefKind::Method if language == Language::Rust => rust_receiver_name(node, bytes)
+                    .and_then(|recv| match recv.as_str() {
+                        "self" => owner.clone(),
+                        other => receivers.get(other).cloned(),
+                    }),
+                RefKind::Method => None,
                 RefKind::Free => language.callee_qualifier(node, bytes),
             },
         });
@@ -927,6 +1114,7 @@ fn walk(
             bytes,
             enclosing.as_deref(),
             owner.as_deref(),
+            receivers,
             graph,
         );
     }
@@ -2002,13 +2190,21 @@ object Config
     }
 
     #[test]
-    fn rust_records_no_qualifier_for_a_method_call() {
-        // The receiver is a value, not a type: `x` says nothing about which
-        // `helper` is meant, so recording it as a qualifier would assert
-        // something the graph does not know. #251 fills this in where the
-        // receiver's type is syntactically visible.
-        let g = build_rust("fn g(x: Thing) { x.helper(); }");
-        let r = g
+    fn rust_never_records_a_receiver_name_as_a_qualifier() {
+        // The receiver is a value, so `x` itself must never be the qualifier.
+        // #251 types the receiver where the body says what it is, and the
+        // qualifier is then the *type*; where it does not, nothing is recorded.
+        let typed = build_rust("fn g(x: Thing) { x.helper(); }");
+        let r = typed
+            .references
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("call recorded");
+        assert_eq!(r.qualifier.as_deref(), Some("Thing"), "the type, not `x`");
+        assert_eq!(r.kind, RefKind::Method);
+
+        let untyped = build_rust("fn g() { let x = make(); x.helper(); }");
+        let r = untyped
             .references
             .iter()
             .find(|r| r.name == "helper")
@@ -2166,5 +2362,108 @@ object Config
             refs.contains(&("x".to_string(), RefKind::Value)),
             "{refs:?}"
         );
+    }
+
+    // ---- syntactic receiver typing (#251) ---------------------------------
+
+    /// The qualifier recorded on the reference named `name`.
+    fn rust_qualifier_of(src: &str, name: &str) -> Option<String> {
+        build_rust(src)
+            .references
+            .iter()
+            .find(|r| r.name == name)
+            .expect("reference recorded")
+            .qualifier
+            .clone()
+    }
+
+    #[test]
+    fn a_receiver_bound_from_a_constructor_is_typed() {
+        let q = rust_qualifier_of("fn g() { let w = Widget::new(); w.get(); }", "get");
+        assert_eq!(q.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn a_receiver_bound_from_a_struct_literal_is_typed() {
+        let q = rust_qualifier_of("fn g() { let w = Widget { n: 1 }; w.get(); }", "get");
+        assert_eq!(q.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn a_receiver_from_a_typed_parameter_is_typed() {
+        let q = rust_qualifier_of("fn g(w: Widget) { w.get(); }", "get");
+        assert_eq!(q.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn a_receiver_from_a_reference_parameter_is_typed() {
+        // `&Widget` and `&mut Widget` are the common shapes; the type is what
+        // matters, not how it is borrowed.
+        assert_eq!(
+            rust_qualifier_of("fn g(w: &Widget) { w.get(); }", "get").as_deref(),
+            Some("Widget")
+        );
+        assert_eq!(
+            rust_qualifier_of("fn g(w: &mut Widget) { w.get(); }", "get").as_deref(),
+            Some("Widget")
+        );
+    }
+
+    #[test]
+    fn a_receiver_of_unknown_origin_stays_unqualified() {
+        // `make()` says nothing about what it returns without a type system.
+        let q = rust_qualifier_of("fn g() { let w = make(); w.get(); }", "get");
+        assert_eq!(q, None);
+    }
+
+    #[test]
+    fn a_generic_receiver_stays_unqualified() {
+        // Explicitly out of scope: a type parameter names no type in the view,
+        // and guessing an impl is the thing #223 stopped doing.
+        let q = rust_qualifier_of("fn g<T: Tr>(w: T) { w.get(); }", "get");
+        assert_eq!(q, None);
+    }
+
+    #[test]
+    fn receiver_types_do_not_leak_between_functions() {
+        // `w` means something different in each body; a flat table would carry
+        // the first one into the second.
+        let src = "fn a() { let w = Widget::new(); }\nfn b(w: Other) { w.get(); }";
+        assert_eq!(rust_qualifier_of(src, "get").as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn a_plain_method_call_is_still_a_method_reference() {
+        // Typing the receiver must not turn it into a free call: the shape is
+        // what stops a std method being credited to a project function (#223).
+        let g = build_rust("fn g(w: Widget) { w.get(); }");
+        let r = g.references.iter().find(|r| r.name == "get").unwrap();
+        assert_eq!(r.kind, RefKind::Method);
+    }
+
+    #[test]
+    fn a_self_receiver_takes_the_enclosing_type() {
+        // `self` is the one receiver whose type is always written down: it is
+        // the impl block the call sits in.
+        let g = build_rust("impl Widget { fn get(&self) { self.helper(); } }");
+        let r = g
+            .references
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("call recorded");
+        assert_eq!(r.qualifier.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn a_non_rust_method_call_records_no_receiver_type() {
+        // Receiver typing is Rust-only for now; every other language behaves
+        // exactly as it did rather than guessing (#251).
+        let g = build(Language::Python, "def g(w):\n    w.get()\n");
+        let r = g
+            .references
+            .iter()
+            .find(|r| r.name == "get")
+            .expect("call recorded");
+        assert_eq!(r.qualifier, None);
     }
 }

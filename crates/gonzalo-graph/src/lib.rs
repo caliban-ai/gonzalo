@@ -13,8 +13,8 @@
 ///
 /// History: 1 = calls in macro arguments (#216); 2 = call-shape on references
 /// (#223); 3 = call-site qualifiers and definition owners (#248); 4 = functions
-/// named as values (#250).
-pub const EXTRACTION_VERSION: u32 = 4;
+/// named as values (#250); 5 = syntactic receiver types on method calls (#251).
+pub const EXTRACTION_VERSION: u32 = 5;
 
 pub mod assembly;
 pub mod builder;

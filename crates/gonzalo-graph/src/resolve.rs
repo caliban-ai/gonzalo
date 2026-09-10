@@ -724,4 +724,69 @@ mod tests {
         assert!(names_of(&report).contains(&"g"), "{report:?}");
         assert_eq!(report.value_edges, 0, "{report:?}");
     }
+
+    // ---- syntactic receiver typing (#251) ---------------------------------
+
+    #[test]
+    fn a_typed_receiver_resolves_to_its_own_type() {
+        // The payoff: `b.get()` used to decline because the receiver's type was
+        // unknown. The body says what `b` is, so it resolves like a written
+        // `Beta::get()` would.
+        let mut s = two_gets();
+        s.insert(
+            "c.rs",
+            build_rust("fn caller() { let b = Beta::new(); b.get(); }"),
+        );
+        let r = resolve_references_to(&s, "get")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Qualified);
+        assert_eq!(r.target.as_deref(), Some("b.rs"));
+        assert_eq!(
+            r.reference.item.kind,
+            RefKind::Method,
+            "still a method call: the shape is what guards #223"
+        );
+    }
+
+    #[test]
+    fn an_untyped_receiver_still_declines_and_is_counted() {
+        let mut s = two_gets();
+        s.insert(
+            "c.rs",
+            build_rust("fn caller() { let b = make(); b.get(); }"),
+        );
+        let r = resolve_references_to(&s, "get")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::ReceiverUnknown);
+
+        let report = resolved_impact(&s, "get", None);
+        assert!(
+            report.receiver_unknown_edges > 0,
+            "still reported: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_typed_as_something_outside_the_view_falls_through() {
+        // `String::new()` types `s`, but nothing in the view is owned by
+        // `String`, so the qualifier is ignored rather than declining an edge
+        // the older rules resolve — the monotonicity #248 established.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a.rs", build_rust("fn len() -> usize { 0 }"));
+        s.insert(
+            "b.rs",
+            build_rust("fn caller() { let s = String::new(); s.len(); }"),
+        );
+        let r = resolve_references_to(&s, "len")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        // A method call on a receiver typed outside the view is exactly the
+        // #223 case: one same-named project function must not be credited.
+        assert_eq!(r.resolution, Resolution::ReceiverUnknown);
+    }
 }

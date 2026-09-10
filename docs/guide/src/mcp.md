@@ -250,6 +250,15 @@ same-named project function
 ([#223](https://github.com/caliban-ai/gonzalo/issues/223)). Treat the closure as a lead
 list and confirm the load-bearing edges with `callers`.
 
+**A method call is attributed when the body says what the receiver is.** `b.get()`
+resolves to `Beta`'s `get` when `b` came from `Beta::new()`, a `Beta { .. }` literal, or
+a parameter written `b: Beta` / `&Beta`, and `self.foo()` takes the enclosing `impl`
+([#251](https://github.com/caliban-ai/gonzalo/issues/251)). This is syntax, not
+inference: a receiver from a plain call (`let b = make()`), a generic, or a trait object
+still declines and is still counted in `receiver_unknown_edges`. Rust only for now;
+other languages record no receiver type. On gonzalo's own source `impact` on `insert`
+went from 60 symbols reached to 219.
+
 **A call that names its type is now attributed to it.** `Beta::get()` resolves to
 `Beta`'s `get` even when several types in the view define one, because the call site's
 qualifier is recorded alongside each definition's owning type
