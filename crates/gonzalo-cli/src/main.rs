@@ -320,6 +320,12 @@ async fn main() -> Result<()> {
             println!("modified: {}", summary.modified);
             println!("deleted:  {}", summary.deleted);
             println!("skipped:  {}", summary.skipped);
+            if !summary.skipped_paths.is_empty() {
+                println!(
+                    "          {}",
+                    gonzalo_cli::named_skips(&summary.skipped_paths)
+                );
+            }
             println!(
                 "ignored:  {} files, {} dirs not descended",
                 summary.ignored.files, summary.ignored.dirs

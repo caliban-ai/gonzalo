@@ -11,6 +11,22 @@ the patch version for fixes.
 
 ### Fixed
 
+- **A skipped file now says which file.** When an isolated parse worker dies on
+  a file, the CLI reported `skipping a file — parse worker error: ...` without
+  naming it. On a 2000-file tree that left no way to find the offender but
+  bisecting by directory, which is exactly what landing #266 cost: four rounds
+  of re-indexing subtrees to locate one 13843-line generated header that aborts
+  tree-sitter-cpp.
+
+  That matters more than the inconvenience. A skipped file is silently absent
+  from the view — `search` finds none of its symbols, `callers` misses every
+  call it makes — so the one line saying it happened has to say where.
+
+  The message names the path, and `IndexSummary` carries `skipped_paths` so a
+  caller can list them rather than only count them. The summary listing is
+  bounded at five with a count of what it left out, matching how #259 bounds its
+  extension list. No extraction change. (#270)
+
 - **`.h` headers are parsed as C++, not C.** `.h` is the conventional header
   extension for C++ as much as for C, and the C grammar mis-parses C++ rather
   than failing: `enum class Color { Red };` recorded `Color` as a *function* and

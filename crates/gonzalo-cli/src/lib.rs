@@ -173,6 +173,9 @@ pub struct IndexSummary {
     /// Files skipped because an isolated parse worker crashed or hung on them
     /// (only possible when parsing through the pool).
     pub skipped: usize,
+    /// Which files those were. Counting them without naming them leaves no way
+    /// to find the offender but bisecting by directory (#270).
+    pub skipped_paths: Vec<String>,
     /// Paths excluded from the view by an [`IndexFilter`] rule — vendored or
     /// generated files, dependency/output directories, and gitignored trees
     /// (#209). Distinct from `skipped`, which is a parse failure.
@@ -364,16 +367,48 @@ async fn parse_file(
     pool: Option<&ParserPool>,
     language: Language,
     content: &str,
+    rel: &str,
 ) -> Option<CodeGraph> {
     match pool {
         Some(pool) => match pool.parse(language, content).await {
             Ok(graph) => Some(graph),
             Err(e) => {
-                eprintln!("gonzalo index: skipping a file — parse worker error: {e}");
+                eprintln!("{}", skip_message(rel, &e.to_string()));
                 None
             }
         },
         None => Some(build(language, content)),
+    }
+}
+
+/// The line printed when a file is skipped, naming it.
+///
+/// A skipped file is silently absent from the view — `search` finds none of its
+/// symbols, `callers` misses every call it makes — so the one line saying that
+/// happened has to say *where*. Without the path the only way to find the
+/// offender is bisecting by directory, which is what landing #266 cost (#270).
+fn skip_message(rel: &str, error: &str) -> String {
+    format!("gonzalo index: skipping {rel} — parse worker error: {error}")
+}
+
+/// Skipped paths for the index summary, bounded, with a count of what was left
+/// out so a tree full of crashes does not become a wall of text.
+pub fn named_skips(paths: &[String]) -> String {
+    const MOST: usize = 5;
+    if paths.is_empty() {
+        return String::new();
+    }
+    let listed = paths
+        .iter()
+        .take(MOST)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = paths.len().saturating_sub(MOST);
+    if more > 0 {
+        format!("{listed}, and {more} more")
+    } else {
+        listed
     }
 }
 
@@ -535,7 +570,7 @@ pub async fn index_with_worker(
     let DesiredView {
         entries: desired,
         files,
-        skipped,
+        skipped_paths,
         ignored,
         unindexed,
         incremental,
@@ -624,7 +659,8 @@ pub async fn index_with_worker(
         added: recon.added.len(),
         modified: recon.modified.len(),
         deleted: recon.deleted.len(),
-        skipped,
+        skipped: skipped_paths.len(),
+        skipped_paths,
         ignored,
         unindexed,
         incremental,
@@ -668,8 +704,8 @@ struct DesiredView {
     entries: BTreeMap<String, ContentHash>,
     /// Files parsed into the view this run.
     files: usize,
-    /// Files a parse worker crashed or hung on.
-    skipped: usize,
+    /// Files a parse worker crashed or hung on, by path (#270).
+    skipped_paths: Vec<String>,
     ignored: IgnoredCounts,
     unindexed: UnindexedCounts,
     /// Whether the git-diff-driven driver produced this, rather than a full walk.
@@ -684,7 +720,7 @@ async fn build_desired_full(
     filter: &IndexFilter,
 ) -> Result<DesiredView> {
     let mut desired: BTreeMap<String, ContentHash> = BTreeMap::new();
-    let mut skipped = 0usize;
+    let mut skipped_paths: Vec<String> = Vec::new();
     let walk::SourceFiles {
         files: sources,
         ignored,
@@ -698,8 +734,8 @@ async fn build_desired_full(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let Some(slice) = parse_file(pool, language, &content).await else {
-            skipped += 1;
+        let Some(slice) = parse_file(pool, language, &content, &rel).await else {
+            skipped_paths.push(rel.clone());
             continue;
         };
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
@@ -710,7 +746,7 @@ async fn build_desired_full(
     Ok(DesiredView {
         entries: desired,
         files,
-        skipped,
+        skipped_paths,
         ignored,
         unindexed,
         incremental: false,
@@ -732,7 +768,7 @@ async fn build_desired_incremental(
 ) -> Result<DesiredView> {
     let mut desired = current.entries.clone();
     let mut files = 0usize;
-    let mut skipped = 0usize;
+    let mut skipped_paths: Vec<String> = Vec::new();
     // Gitignored paths never reach here — `git2`'s diff omits them — so only the
     // path-only rules apply, and only files are ever counted.
     let mut ignored = IgnoredCounts::default();
@@ -785,8 +821,8 @@ async fn build_desired_incremental(
                 continue;
             }
         };
-        let Some(slice) = parse_file(pool, language, &content).await else {
-            skipped += 1;
+        let Some(slice) = parse_file(pool, language, &content, rel).await else {
+            skipped_paths.push(rel.clone());
             continue;
         };
         let hash = store.put_blob(&slice.to_slice_bytes()).await?;
@@ -804,7 +840,7 @@ async fn build_desired_incremental(
     Ok(DesiredView {
         entries: desired,
         files,
-        skipped,
+        skipped_paths,
         ignored,
         unindexed,
         incremental: true,
@@ -2277,5 +2313,51 @@ mod tests {
         let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
         assert_eq!(summary.files, 0);
         assert_eq!(summary.unindexed.files, 0);
+    }
+
+    // ---- naming a skipped file (#270) --------------------------------------
+
+    #[test]
+    fn a_skip_message_names_the_file() {
+        // Without the path there is no way to find the offender but bisecting
+        // by directory, which is what landing #266 actually cost.
+        let msg = skip_message("src/gpu/pipeline_state_cache.h", "parse worker died");
+        assert!(msg.contains("src/gpu/pipeline_state_cache.h"), "{msg}");
+        assert!(msg.contains("parse worker died"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_clean_index_reports_no_skipped_paths() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn helper() {}");
+
+        let summary = index(root.path(), src.path(), "r", "main").await.unwrap();
+        assert_eq!(summary.skipped, 0);
+        assert!(summary.skipped_paths.is_empty());
+    }
+
+    #[test]
+    fn the_skipped_listing_is_bounded_and_says_how_many_it_left_out() {
+        let few: Vec<String> = vec!["a.rs".into(), "b.rs".into()];
+        let listed = named_skips(&few);
+        assert!(
+            listed.contains("a.rs") && listed.contains("b.rs"),
+            "{listed}"
+        );
+        assert!(!listed.contains("more"), "nothing was left out: {listed}");
+
+        let many: Vec<String> = (0..12).map(|i| format!("f{i}.rs")).collect();
+        let listed = named_skips(&many);
+        assert!(listed.contains("f0.rs"), "{listed}");
+        assert!(
+            listed.contains("7 more"),
+            "must say what it left out: {listed}"
+        );
+    }
+
+    #[test]
+    fn no_skips_lists_nothing() {
+        assert_eq!(named_skips(&[]), String::new());
     }
 }
