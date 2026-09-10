@@ -256,9 +256,11 @@ crate::model::make` prefers the `make` under `model.rs`
 ([#252](https://github.com/caliban-ai/gonzalo/issues/252)). This is lexical, not a
 resolved module path — an import says which *module* a name came from, and that module
 name almost always appears in its own file's path. If the import fits several candidates
-the reference stays ambiguous, so this only ever narrows. Recorded for Rust, Python,
-JavaScript and TypeScript; a glob import contributes nothing, since it introduces names
-the file never spells out.
+the reference stays ambiguous, so this only ever narrows. Recorded for Rust, Python, Java,
+Kotlin, JavaScript and TypeScript; a wildcard or glob import contributes nothing, since
+it introduces names the file never spells out. An import naming something outside the
+view — a JDK or npm type — matches nothing and the reference stays ambiguous, which is
+the honest answer.
 
 **A method call is attributed when the body says what the receiver is.** `b.get()`
 resolves to `Beta`'s `get` when `b` came from `Beta::new()`, a `Beta { .. }` literal, or

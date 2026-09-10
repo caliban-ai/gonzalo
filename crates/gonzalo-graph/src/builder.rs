@@ -404,8 +404,8 @@ impl Language {
     /// definition over another without knowing where a crate root is — and so
     /// without extraction reading any file but this one (ADR 0012, #252).
     ///
-    /// Rust, Python, JavaScript and TypeScript. Every other language records
-    /// nothing and resolves exactly as it did.
+    /// Rust, Python, Java, Kotlin, JavaScript and TypeScript. Every other
+    /// language records nothing and resolves exactly as it did.
     fn imports_at(self, node: Node<'_>, bytes: &[u8]) -> Vec<Import> {
         let line = node.start_position().row + 1;
         let mut out = Vec::new();
@@ -437,6 +437,69 @@ impl Language {
                             line,
                         });
                     }
+                }
+            }
+            // `import a.b.C;` and `import static a.b.C.d;` share one shape: the
+            // trailing segment is the name brought into scope — the class in the
+            // first case, the member in the second — and the rest is its path.
+            Self::Java if node.kind() == "import_declaration" => {
+                // `import a.b.*;` introduces names the file never spells out.
+                if child_of_kind(node, "asterisk").is_some() {
+                    return out;
+                }
+                let Some(path_node) = child_of_kind(node, "scoped_identifier")
+                    .or_else(|| child_of_kind(node, "identifier"))
+                else {
+                    return out;
+                };
+                let mut segments = java_path_segments(path_node, bytes);
+                if let Some(name) = segments.pop() {
+                    out.push(Import {
+                        name,
+                        path: segments,
+                        line,
+                    });
+                }
+            }
+            Self::Kotlin if node.kind() == "import" => {
+                // The grammar drops the `*`, so `import a.b.*` and `import a.b`
+                // parse identically — the source text is the only way to tell
+                // them apart.
+                if node_text(node, bytes).is_some_and(|t| t.trim_end().ends_with(".*")) {
+                    return out;
+                }
+                let Some(qualified) = child_of_kind(node, "qualified_identifier") else {
+                    return out;
+                };
+                let mut segments: Vec<String> = Vec::new();
+                let mut cursor = qualified.walk();
+                for child in qualified.named_children(&mut cursor) {
+                    if let Some(text) = node_text(child, bytes) {
+                        segments.push(text.to_string());
+                    }
+                }
+                // `import a.b.Thing as Other` puts the alias in a bare
+                // identifier beside the qualified name; it is the name this
+                // file will actually write.
+                let mut outer = node.walk();
+                let alias = node
+                    .named_children(&mut outer)
+                    .find(|c| c.kind() == "identifier")
+                    .and_then(|n| node_text(n, bytes))
+                    .map(str::to_string);
+                let name = match alias {
+                    Some(alias) => {
+                        segments.pop();
+                        Some(alias)
+                    }
+                    None => segments.pop(),
+                };
+                if let Some(name) = name {
+                    out.push(Import {
+                        name,
+                        path: segments,
+                        line,
+                    });
                 }
             }
             Self::JavaScript | Self::TypeScript | Self::Tsx
@@ -1035,6 +1098,30 @@ fn collect_rust_uses(node: Node<'_>, bytes: &[u8], prefix: &[String], out: &mut 
             }
         }
         _ => {}
+    }
+}
+
+/// The dotted segments a Java `scoped_identifier` names, outermost first.
+/// Same shape as Rust's, under different field names (`scope`/`name`).
+fn java_path_segments(node: Node<'_>, bytes: &[u8]) -> Vec<String> {
+    match node.kind() {
+        "scoped_identifier" => {
+            let mut segments = node
+                .child_by_field_name("scope")
+                .map(|s| java_path_segments(s, bytes))
+                .unwrap_or_default();
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| node_text(n, bytes))
+            {
+                segments.push(name.to_string());
+            }
+            segments
+        }
+        _ => node_text(node, bytes)
+            .filter(|t| !t.contains('.'))
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
     }
 }
 
@@ -2815,5 +2902,67 @@ object Config
                 vec!["@testing-library".to_string(), "react".to_string()]
             )]
         );
+    }
+
+    // ---- Java / Kotlin imports (#260) --------------------------------------
+
+    #[test]
+    fn java_records_an_import_declaration() {
+        let imports = imports_of(Language::Java, "import java.util.List;\n");
+        assert_eq!(
+            imports,
+            vec![(
+                "List".to_string(),
+                vec!["java".to_string(), "util".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn java_records_a_static_import_under_the_member_name() {
+        // `import static a.b.C.d;` brings `d` into scope, not `C`.
+        let imports = imports_of(
+            Language::Java,
+            "import static org.junit.Assert.assertEquals;\n",
+        );
+        assert_eq!(
+            imports,
+            vec![(
+                "assertEquals".to_string(),
+                vec!["org".to_string(), "junit".to_string(), "Assert".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn java_records_nothing_for_a_wildcard_import() {
+        assert!(imports_of(Language::Java, "import java.util.*;\n").is_empty());
+        assert!(imports_of(Language::Java, "import static java.util.Map.*;\n").is_empty());
+    }
+
+    #[test]
+    fn kotlin_records_an_import_header() {
+        let imports = imports_of(Language::Kotlin, "import kotlin.collections.List\n");
+        assert_eq!(
+            imports,
+            vec![(
+                "List".to_string(),
+                vec!["kotlin".to_string(), "collections".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn kotlin_records_an_aliased_import_under_its_local_name() {
+        let imports = imports_of(Language::Kotlin, "import a.b.Thing as Other\n");
+        assert_eq!(
+            imports,
+            vec![("Other".to_string(), vec!["a".to_string(), "b".to_string()])]
+        );
+    }
+
+    #[test]
+    fn kotlin_records_nothing_for_a_wildcard_import() {
+        assert!(imports_of(Language::Kotlin, "import a.b.*\n").is_empty());
     }
 }
