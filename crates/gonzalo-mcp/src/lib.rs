@@ -36,6 +36,10 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
+/// Most defining paths listed beside a call-graph answer. Past this the list is
+/// noise rather than a lead, and `definition_count` alone carries the warning.
+const MAX_DEFINED_IN: usize = 10;
+
 /// An MCP server backed by a gonzalo [`Service`].
 #[derive(Clone)]
 pub struct GonzaloMcp {
@@ -80,12 +84,20 @@ impl GonzaloMcp {
             ),
             Tool::new(
                 "callers",
-                "List the enclosing functions that call `name` in a view.",
+                "The enclosing functions that call `name` in a view, in `callers`. This is a raw \
+                 name match, so read `definition_count` with it: above 1 means `name` is defined \
+                 in several places and the list merges callers of all of them, which is not the \
+                 same question you asked. `defined_in` names those files while there are few \
+                 enough to be useful. A count of 0 means the name is defined nowhere in the view, \
+                 which is what makes an empty list readable.",
                 view_query_schema(),
             ),
             Tool::new(
                 "callees",
-                "List the names called from within `name` in a view.",
+                "The names called from within `name` in a view, in `callees`. Like `callers` this \
+                 is a raw name match, so `definition_count` above 1 means several functions share \
+                 the name and the list merges what all of them call. `defined_in` names those \
+                 files while the count is small.",
                 view_query_schema(),
             ),
             Tool::new(
@@ -97,8 +109,8 @@ impl GonzaloMcp {
                  non-zero count means the true set may be larger. A function handed to a call \
                  rather than called (`register(handler)`) is a real dependency but too \
                  over-inclusive to walk, so it is counted in `value_edges` instead — non-zero \
-                 there means go look. Each result carries the path defining it. `truncated` means the walk stopped at `max_depth` with frontier \
-                 left, so completeness is unknown. Note that only calls are edges: `impact` on a \
+                 there means go look. Each result carries the path defining it. `truncated` means \
+                 the walk stopped at `max_depth` with frontier left, so completeness is unknown. Note that only calls are edges: `impact` on a \
                  struct, trait, or type is empty because type usage is not recorded, which means \
                  \"not applicable\" rather than \"nothing depends on it\".",
                 impact_schema(),
@@ -247,8 +259,7 @@ impl GonzaloMcp {
 
         match name {
             "search" => self.result(self.service.graph_definitions(&repo, &view, &sym).await),
-            "callers" => self.result(self.service.graph_callers_of(&repo, &view, &sym).await),
-            "callees" => self.result(self.service.graph_callees(&repo, &view, &sym).await),
+            "callers" | "callees" => self.call_graph(&repo, &view, &sym, name).await,
             "impact" => {
                 let max_depth = match usize_arg(&arguments, "max_depth", 0) {
                     Ok(0) => None,
@@ -371,6 +382,50 @@ impl GonzaloMcp {
             // Unreachable: the caller already matched on these four names.
             _ => Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>()),
         }
+    }
+
+    /// `callers`/`callees`, answered with how many definitions the queried name
+    /// has.
+    ///
+    /// These are raw name matches: a name defined in several places returns the
+    /// merged answer for all of them, and a bare list says nothing about that.
+    /// It is the point where a caller is most likely to read a heuristic result
+    /// as a precise one, so the count travels with the answer (#249). The
+    /// defining paths come too while there are few enough to be a lead rather
+    /// than noise.
+    async fn call_graph(
+        &self,
+        repo: &str,
+        view: &str,
+        sym: &str,
+        tool: &str,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let names = if tool == "callers" {
+            self.service.graph_callers_of(repo, view, sym).await
+        } else {
+            self.service.graph_callees(repo, view, sym).await
+        };
+        let names = match names {
+            Ok(n) => n,
+            Err(e) => return Ok(tool_error(e.to_string())),
+        };
+        let defs = match self.service.graph_definitions(repo, view, sym).await {
+            Ok(d) => d,
+            Err(e) => return Ok(tool_error(e.to_string())),
+        };
+
+        let mut paths: Vec<&str> = defs.iter().map(|d| d.path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+
+        let mut payload = serde_json::json!({
+            tool: names,
+            "definition_count": defs.len(),
+        });
+        if paths.len() <= MAX_DEFINED_IN {
+            payload["defined_in"] = serde_json::json!(paths);
+        }
+        Ok(success_json(&payload))
     }
 
     /// The `node` aggregate: definitions + callers + callees for one symbol.
@@ -1157,10 +1212,11 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(result.is_error, Some(true), "a real miss is not an error");
-        assert_eq!(
-            serde_json::from_str::<Value>(&result_text(&result)).unwrap(),
-            serde_json::json!([])
-        );
+        let v: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["callers"], serde_json::json!([]));
+        // And the answer says the name is defined nowhere, which is what makes
+        // the empty list readable (#249).
+        assert_eq!(v["definition_count"], 0);
     }
 
     #[tokio::test]
@@ -1422,8 +1478,9 @@ mod tests {
             .dispatch("callees", args("r", "main", "main"))
             .await
             .unwrap();
-        let names: Value = serde_json::from_str(&result_text(&callees)).unwrap();
-        assert_eq!(names, serde_json::json!(["helper"]));
+        let v: Value = serde_json::from_str(&result_text(&callees)).unwrap();
+        assert_eq!(v["callees"], serde_json::json!(["helper"]));
+        assert_eq!(v["definition_count"], 1, "`main` is defined once");
     }
 
     // ---- resolution-gated impact (#207) ------------------------------------
@@ -1531,5 +1588,70 @@ mod tests {
     async fn dispatch_unknown_tool_is_method_not_found() {
         let s = server("/r");
         assert!(s.dispatch("no_such_tool", None).await.is_err());
+    }
+
+    // ---- ambiguity signal on callers/callees (#249) -----------------------
+
+    /// Two files define `foo`; a third calls it. Asking for callers of `foo`
+    /// merges callers of both, with nothing in the answer saying so.
+    async fn overloaded() -> GonzaloMcp {
+        seeded_with(&[
+            ("a.rs", "fn foo() {}"),
+            ("b.rs", "fn foo() {}"),
+            ("c.rs", "fn caller() { foo(); }"),
+        ])
+        .await
+    }
+
+    #[tokio::test]
+    async fn callers_reports_how_many_definitions_the_name_has() {
+        let s = overloaded().await;
+        let v = call_on(&s, "callers", serde_json::json!({ "name": "foo" })).await;
+        assert_eq!(v["callers"], serde_json::json!(["caller"]));
+        assert_eq!(
+            v["definition_count"], 2,
+            "the result merges two symbols: {v}"
+        );
+        assert_eq!(v["defined_in"], serde_json::json!(["a.rs", "b.rs"]));
+    }
+
+    #[tokio::test]
+    async fn callees_reports_how_many_definitions_the_name_has() {
+        let s = overloaded().await;
+        let v = call_on(&s, "callees", serde_json::json!({ "name": "foo" })).await;
+        assert_eq!(v["definition_count"], 2, "{v}");
+    }
+
+    #[tokio::test]
+    async fn an_unambiguous_name_reports_one_definition() {
+        // Not zero, and not absent: the field always answers.
+        let v = call("callers", serde_json::json!({ "name": "helper" })).await;
+        assert_eq!(v["callers"], serde_json::json!(["main"]));
+        assert_eq!(v["definition_count"], 1, "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_name_defined_nowhere_reports_zero_definitions() {
+        let v = call("callers", serde_json::json!({ "name": "absent" })).await;
+        assert_eq!(v["callers"], serde_json::json!([]));
+        assert_eq!(v["definition_count"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn the_defining_paths_are_dropped_once_the_name_is_hopeless() {
+        // Past a handful the list stops being a lead and becomes noise; the
+        // count alone already says "do not read this as precise".
+        let slices: Vec<(String, String)> = (0..MAX_DEFINED_IN + 2)
+            .map(|i| (format!("f{i}.rs"), "fn foo() {}".to_string()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = slices
+            .iter()
+            .map(|(p, src)| (p.as_str(), src.as_str()))
+            .collect();
+        let s = seeded_with(&borrowed).await;
+
+        let v = call_on(&s, "callers", serde_json::json!({ "name": "foo" })).await;
+        assert_eq!(v["definition_count"], MAX_DEFINED_IN + 2, "{v}");
+        assert!(v["defined_in"].is_null(), "paths dropped: {v}");
     }
 }
