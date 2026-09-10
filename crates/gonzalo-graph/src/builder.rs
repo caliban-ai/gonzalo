@@ -529,6 +529,26 @@ impl Language {
                     });
                 }
             }
+            // `#include "a/b.h"` names a *file*, and every declaration in it
+            // becomes visible — a stronger signal than any package path,
+            // because the file is the thing rather than a convention a path is
+            // assumed to mirror. Recorded with no name; resolution matches it
+            // by path (#267).
+            Self::C | Self::Cpp if node.kind() == "preproc_include" => {
+                let path = node
+                    .child_by_field_name("path")
+                    .and_then(|p| node_text(p, bytes))
+                    .map(include_segments)
+                    .unwrap_or_default();
+                if !path.is_empty() {
+                    out.push(Import {
+                        depth: 0,
+                        name: String::new(),
+                        path,
+                        line,
+                    });
+                }
+            }
             Self::JavaScript | Self::TypeScript | Self::Tsx
                 if node.kind() == "import_statement" =>
             {
@@ -1223,6 +1243,22 @@ fn python_module_segments(node: Node<'_>, bytes: &[u8]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The path segments a C/C++ include names: `"engine/render/pipeline.h"` is
+/// `["engine", "render", "pipeline"]`, `<vector>` is `["vector"]`.
+///
+/// The extension is dropped so an include of a header matches the translation
+/// unit that defines what it declares — a prototype in a `.h` is not a symbol,
+/// the definition in the `.c` is, and both live at the same path stem (#267).
+fn include_segments(raw: &str) -> Vec<String> {
+    raw.trim_matches(|c| c == '"' || c == '<' || c == '>')
+        .split('/')
+        .filter(|part| !matches!(*part, "" | "." | ".."))
+        .map(|part| part.rsplit_once('.').map_or(part, |(stem, _)| stem))
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The module segments a JS/TS import source string names: `'./model'` is
@@ -3327,5 +3363,66 @@ int main(void) { return helper(1) + abs(-2); }
             out
         };
         assert_eq!(names(Language::C), names(Language::Cpp));
+    }
+
+    // ---- C/C++ includes (#267) ---------------------------------------------
+
+    /// `(name, path)` for every import in `src` under `language`.
+    fn includes_of(language: Language, src: &str) -> Vec<(String, Vec<String>)> {
+        build(language, src)
+            .imports
+            .iter()
+            .map(|i| (i.name.clone(), i.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn c_records_a_quoted_include_as_a_path() {
+        // An include names a *file*, not a name, so it carries no name — a
+        // stronger signal than any package path, because the file is the thing
+        // rather than a convention a path is assumed to mirror (#267).
+        let imports = includes_of(Language::C, "#include \"engine/render/pipeline.h\"\n");
+        assert_eq!(
+            imports,
+            vec![(
+                String::new(),
+                vec![
+                    "engine".to_string(),
+                    "render".to_string(),
+                    "pipeline".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn an_include_is_marked_as_bringing_a_whole_file() {
+        let g = build(Language::C, "#include \"a/b.h\"\n");
+        assert!(g.imports[0].brings_whole_file());
+        let py = build(Language::Python, "from pkg import thing\n");
+        assert!(!py.imports[0].brings_whole_file());
+    }
+
+    #[test]
+    fn c_records_an_angled_include() {
+        // A system header matches nothing in the view, exactly as
+        // `import java.io.File` does after #260 — recorded, and correctly inert.
+        let imports = includes_of(Language::C, "#include <vector>\n");
+        assert_eq!(imports, vec![(String::new(), vec!["vector".to_string()])]);
+    }
+
+    #[test]
+    fn cpp_records_includes_the_same_way_as_c() {
+        let src = "#include \"a/b.hpp\"\n#include <memory>\n";
+        assert_eq!(
+            includes_of(Language::C, src),
+            includes_of(Language::Cpp, src)
+        );
+    }
+
+    #[test]
+    fn an_include_with_no_directory_records_its_stem() {
+        let imports = includes_of(Language::C, "#include \"config.h\"\n");
+        assert_eq!(imports, vec![(String::new(), vec!["config".to_string()])]);
     }
 }

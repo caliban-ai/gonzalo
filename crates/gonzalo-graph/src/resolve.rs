@@ -168,7 +168,12 @@ fn imported_target(
     from_path: &str,
     candidates: &BTreeSet<String>,
 ) -> Option<String> {
-    let import = imports.iter().find(|i| i.name == name)?;
+    let Some(import) = imports.iter().find(|i| i.name == name) else {
+        // No import names this symbol. A C/C++ `#include` names a whole file
+        // instead, so match by path: any candidate under an included path is
+        // what this file meant by the name (#267).
+        return included_target(imports, from_path, candidates);
+    };
 
     let matched: Vec<&str> = if import.depth > 0 {
         // A relative import needs no project root: count dots up from the
@@ -195,6 +200,41 @@ fn imported_target(
         [only] => Some((*only).to_string()),
         // Several identical copies of one package tree — one per assignment,
         // a vendored reference beside your own code. The nearest is meant.
+        several => nearest_to(several, from_path),
+    }
+}
+
+/// The single candidate covered by one of this file's whole-file imports.
+///
+/// An include names a path, and dropping the extension is what makes it useful:
+/// a prototype in a header is not a symbol, the definition in the translation
+/// unit is, and both sit at the same path stem. Narrowing only, like every
+/// other rule here — several matches leave the reference ambiguous unless one
+/// is unambiguously nearer.
+fn included_target(
+    imports: &[Import],
+    from_path: &str,
+    candidates: &BTreeSet<String>,
+) -> Option<String> {
+    let included: Vec<&Import> = imports
+        .iter()
+        .filter(|i| i.brings_whole_file() && !i.path.is_empty())
+        .collect();
+    if included.is_empty() {
+        return None;
+    }
+    let matched: Vec<&str> = candidates
+        .iter()
+        .filter(|path| {
+            included
+                .iter()
+                .any(|import| path_ends_with_module(path, &import.path))
+        })
+        .map(String::as_str)
+        .collect();
+    match matched.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
         several => nearest_to(several, from_path),
     }
 }
@@ -1200,5 +1240,89 @@ mod tests {
         );
         let r = resolved_from(&s, "helper", "run");
         assert_eq!(r.resolution, Resolution::UniqueGlobal);
+    }
+
+    // ---- C/C++ includes (#267) ---------------------------------------------
+
+    fn c(src: &str) -> crate::CodeGraph {
+        crate::build(crate::Language::C, src)
+    }
+
+    #[test]
+    fn an_include_narrows_an_ambiguous_reference() {
+        // Including a header means calling into what that translation unit
+        // defines. The include names the file directly (#267).
+        let mut s = InMemoryGraphStore::new();
+        s.insert("engine/render/pipeline.c", c("void draw(void) {}"));
+        s.insert("tools/preview/pipeline.c", c("void draw(void) {}"));
+        s.insert(
+            "app/main.c",
+            c("#include \"engine/render/pipeline.h\"\nvoid run(void) { draw(); }"),
+        );
+
+        let r = resolved_from(&s, "draw", "run");
+        assert_eq!(r.resolution, Resolution::Imported);
+        assert_eq!(r.target.as_deref(), Some("engine/render/pipeline.c"));
+    }
+
+    #[test]
+    fn without_the_include_the_same_c_call_stays_ambiguous() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("engine/render/pipeline.c", c("void draw(void) {}"));
+        s.insert("tools/preview/pipeline.c", c("void draw(void) {}"));
+        s.insert("app/main.c", c("void run(void) { draw(); }"));
+
+        assert_eq!(
+            resolved_from(&s, "draw", "run").resolution,
+            Resolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn an_include_fitting_several_candidates_falls_through() {
+        // Two files at the same path stem: the include cannot say which.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a/pipeline.c", c("void draw(void) {}"));
+        s.insert("b/pipeline.c", c("void draw(void) {}"));
+        s.insert(
+            "app/main.c",
+            c("#include \"pipeline.h\"\nvoid run(void) { draw(); }"),
+        );
+
+        assert_eq!(
+            resolved_from(&s, "draw", "run").resolution,
+            Resolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn a_system_include_matches_nothing_in_the_view() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a/x.c", c("void printf_impl(void) {}"));
+        s.insert("b/x.c", c("void printf_impl(void) {}"));
+        s.insert(
+            "app/main.c",
+            c("#include <stdio.h>\nvoid run(void) { printf_impl(); }"),
+        );
+
+        assert_eq!(
+            resolved_from(&s, "printf_impl", "run").resolution,
+            Resolution::Ambiguous,
+            "stdio is not in the view"
+        );
+    }
+
+    #[test]
+    fn a_named_import_still_wins_where_a_language_has_one() {
+        // Guard: the include path must not displace the named lookup every
+        // other language depends on.
+        let s = two_makes(
+            "src/app.rs",
+            "use crate::model::make;\nfn caller() { make(); }",
+        );
+        assert_eq!(
+            resolved_from(&s, "make", "caller").target.as_deref(),
+            Some("src/model.rs")
+        );
     }
 }

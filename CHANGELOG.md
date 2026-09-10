@@ -99,6 +99,29 @@ the patch version for fixes.
 
 ### Changed
 
+- **C and C++ `#include` directives are now recorded and used to resolve.**
+  #252 and #260 gave import-aware resolution to six languages; C and C++ had
+  none, even though an include is a *stronger* signal than any of them. A
+  package import names a package that a file path is assumed to mirror; an
+  include names the file.
+
+  On a real C++ project (2017 files), 9860 includes recorded across 1614 files.
+  Of the 17884 ambiguous references in files that include something, 4905 have
+  an include pointing at a candidate and **4749 now resolve** — the largest
+  single resolution gain of any change in this cycle.
+
+  An include names a path rather than a symbol, so it is recorded with no name
+  and matched by path. `Import::brings_whole_file` says so explicitly rather
+  than callers testing for an empty string. Dropping the extension is what makes
+  it work: a prototype in a header is not a symbol, the definition in the
+  translation unit is, and both sit at the same path stem, so including
+  `render/pipeline.h` resolves to `render/pipeline.c`.
+
+  Narrowing only, as established in #248: a system header matches nothing in the
+  view and leaves the reference ambiguous, and an include fitting several
+  candidates declines unless one is unambiguously nearer.
+  `EXTRACTION_VERSION` is 11. (#267)
+
 - **Imports now anchor to the file that wrote them.** #252 matched an import's
   module as a free-floating path suffix, which fails exactly where a codebase
   holds two copies of the same tree — a vendored reference beside your own work,
