@@ -396,6 +396,49 @@ impl Language {
             .and_then(|n| trailing_path_segment(n, bytes))
     }
 
+    /// Bare names appearing in a call's argument list, as `(name, line)` —
+    /// `helper` in `and_then(helper)`.
+    ///
+    /// A function used as a value is a path expression, not a call expression,
+    /// so it records no edge at all. A function only ever passed as a callback
+    /// therefore looked unused, and `unreferenced` reported it as deletable
+    /// (#250).
+    ///
+    /// Only the argument list's own children are inspected, one wrapper deep. A
+    /// nested call is its own node and [`walk`] reaches it separately, so
+    /// nothing is counted twice, and the callee itself lives in a different
+    /// field so it is never picked up here.
+    ///
+    /// Deliberately over-inclusive: extraction is per-file, so it cannot tell an
+    /// identifier naming a function from one naming a local, and records both.
+    /// See [`RefKind::Value`] for why that is the safe direction.
+    fn value_args(self, call: Node<'_>, bytes: &[u8]) -> Vec<(String, usize)> {
+        let Some(args) = call.child_by_field_name("arguments") else {
+            return Vec::new();
+        };
+        let is_ident = |node: &Node<'_>| matches!(node.kind(), "identifier" | "simple_identifier");
+        let mut out = Vec::new();
+        let mut cursor = args.walk();
+        for child in args.named_children(&mut cursor) {
+            // Some grammars wrap each argument (C#'s and PHP's `argument`), and
+            // `&helper` wraps the name it borrows. Look one level in, never
+            // further: a deeper expression is not a bare name.
+            let leaf = if is_ident(&child) {
+                Some(child)
+            } else if child.named_child_count() == 1 {
+                child.named_child(0).filter(is_ident)
+            } else {
+                None
+            };
+            if let Some(leaf) = leaf
+                && let Some(name) = node_text(leaf, bytes)
+            {
+                out.push((name.to_string(), leaf.start_position().row + 1));
+            }
+        }
+        out
+    }
+
     /// Calls hidden inside an opaque macro-argument node, as `(name, line)`.
     ///
     /// Rust macro arguments parse as a `token_tree` of raw tokens rather than
@@ -841,12 +884,27 @@ fn walk(
             from: enclosing.clone(),
             line: node.start_position().row + 1,
             kind,
-            // A receiver is a value, not a type (#248).
+            // A receiver is a value, not a type (#248); a value reference is
+            // not a call site at all (#250).
             qualifier: match kind {
-                RefKind::Method => None,
+                RefKind::Method | RefKind::Value => None,
                 RefKind::Free => language.callee_qualifier(node, bytes),
             },
         });
+    }
+
+    // Names handed to a call as values rather than called — `and_then(helper)`
+    // records no call edge, so without this a live callback looks dead (#250).
+    if language.is_call(node.kind()) {
+        for (name, line) in language.value_args(node, bytes) {
+            graph.references.push(Reference {
+                name,
+                from: enclosing.clone(),
+                line,
+                kind: RefKind::Value,
+                qualifier: None,
+            });
+        }
     }
 
     // Calls the grammar hides inside an opaque macro-argument node (#216).
@@ -2041,5 +2099,72 @@ object Config
             .find(|s| s.name == "get")
             .expect("method recorded");
         assert_eq!(s.owner.as_deref(), Some("Widget"));
+    }
+
+    // ---- functions passed as values (#250) --------------------------------
+
+    /// `(name, kind)` for every reference in `src`.
+    fn rust_refs(src: &str) -> Vec<(String, RefKind)> {
+        build_rust(src)
+            .references
+            .iter()
+            .map(|r| (r.name.clone(), r.kind))
+            .collect()
+    }
+
+    #[test]
+    fn rust_records_a_function_passed_as_a_call_argument() {
+        let refs = rust_refs("fn g(o: Opt) { o.and_then(helper); }");
+        assert!(
+            refs.contains(&("helper".to_string(), RefKind::Value)),
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn rust_records_a_function_passed_to_a_free_call() {
+        let refs = rust_refs("fn g() { register(handler); }");
+        assert!(
+            refs.contains(&("handler".to_string(), RefKind::Value)),
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_called_function_is_not_also_recorded_as_a_value() {
+        let refs = rust_refs("fn g() { helper(); }");
+        assert_eq!(
+            refs.iter().filter(|(n, _)| n == "helper").count(),
+            1,
+            "{refs:?}"
+        );
+        assert!(
+            refs.contains(&("helper".to_string(), RefKind::Free)),
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_literal_argument_records_nothing() {
+        let refs = rust_refs("fn g() { take(1); }");
+        assert_eq!(
+            refs.iter().filter(|(n, _)| n != "take").count(),
+            0,
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_variable_passed_as_an_argument_is_recorded_too() {
+        // Deliberate over-inclusion, pinned so it is a decision rather than a
+        // surprise: extraction is per-file and cannot know whether `x` names a
+        // local or a function. It costs a row and, for `unreferenced`, errs
+        // towards *not* calling something dead — the safe direction for a tool
+        // whose suggested action is deletion.
+        let refs = rust_refs("fn g(x: u32) { take(x); }");
+        assert!(
+            refs.contains(&("x".to_string(), RefKind::Value)),
+            "{refs:?}"
+        );
     }
 }

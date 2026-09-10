@@ -259,9 +259,17 @@ traits, and structs have no inbound edges. Empty there means "not applicable", n
 "unused".
 
 **`unreferenced` is a heuristic.** A function used only as a value — `and_then(f)`,
-`map_err(be)` — is a path expression rather than a call, so it records no reference and
-will be reported as dead when it is not. An unused name is also hidden by any
-same-named symbol that *is* used. Confirm every hit against the source.
+`map_err(be)` — is now recorded and no longer reported as dead
+([#250](https://github.com/caliban-ai/gonzalo/issues/250)). An unused name is still
+hidden by any same-named symbol that *is* used. Confirm every hit against the source.
+
+**Passing a function is not calling it.** A name handed to a call is recorded as a
+value reference: it keeps `unreferenced` honest, and it is deliberately kept out of
+`callers`, `callees` and `top`, so those stay call-graph answers. `impact` counts them
+in `value_edges` rather than walking them, because extraction is per-file and cannot
+tell an identifier naming a function from one naming a local — traversing them would
+put false edges back into the walk. A non-zero `value_edges` means something depends on
+the seed through a callback and is worth a look.
 
 **Calls inside Rust macro arguments are recorded**, including in `assert_eq!` and
 `println!`, but by a token-level rule: an identifier followed by a parenthesised token

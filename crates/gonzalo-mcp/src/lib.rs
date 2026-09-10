@@ -94,8 +94,10 @@ impl GonzaloMcp {
                  call edges that resolve to a specific definition are followed, so the walk does \
                  not merge unrelated code that happens to share an identifier; edges that cannot \
                  be attributed are counted in `ambiguous_edges` rather than traversed, and a \
-                 non-zero count means the true set may be larger. Each result carries the path \
-                 defining it. `truncated` means the walk stopped at `max_depth` with frontier \
+                 non-zero count means the true set may be larger. A function handed to a call \
+                 rather than called (`register(handler)`) is a real dependency but too \
+                 over-inclusive to walk, so it is counted in `value_edges` instead — non-zero \
+                 there means go look. Each result carries the path defining it. `truncated` means the walk stopped at `max_depth` with frontier \
                  left, so completeness is unknown. Note that only calls are edges: `impact` on a \
                  struct, trait, or type is empty because type usage is not recorded, which means \
                  \"not applicable\" rather than \"nothing depends on it\".",
@@ -144,12 +146,11 @@ impl GonzaloMcp {
                 "unreferenced",
                 "Symbols with no inbound reference — dead-code CANDIDATES, not dead code. This is \
                  a heuristic over a name-matched graph and it does produce false positives. A \
-                 function used only as a value (higher-order usage, e.g. `map_err(be)`) is a path \
-                 expression rather than a call, so it registers nothing and will be reported \
-                 wrongly; and an unused name is hidden by any same-named symbol that is used. \
-                 References from tests and from the symbol itself do count, so test-only and \
-                 recursive-only functions are never reported. Confirm every hit against the \
-                 source before acting on it.",
+                 function used only as a value (higher-order usage, e.g. `map_err(be)`) now counts \
+                 as referenced and is no longer reported wrongly, but an unused name is still \
+                 hidden by any same-named symbol that is used. References from tests and from the \
+                 symbol itself do count, so test-only and recursive-only functions are never \
+                 reported. Confirm every hit against the source before acting on it.",
                 unreferenced_schema(),
             ),
         ]

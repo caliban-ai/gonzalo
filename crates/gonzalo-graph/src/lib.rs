@@ -12,8 +12,9 @@
 /// a view permanently half-upgraded.
 ///
 /// History: 1 = calls in macro arguments (#216); 2 = call-shape on references
-/// (#223); 3 = call-site qualifiers and definition owners (#248).
-pub const EXTRACTION_VERSION: u32 = 3;
+/// (#223); 3 = call-site qualifiers and definition owners (#248); 4 = functions
+/// named as values (#250).
+pub const EXTRACTION_VERSION: u32 = 4;
 
 pub mod assembly;
 pub mod builder;

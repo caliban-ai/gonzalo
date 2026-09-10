@@ -3,7 +3,7 @@
 //! in-memory reference. Backend crates call [`run_graph_store_conformance`]
 //! from their tests with a factory that returns a fresh, empty store.
 
-use crate::{GraphStore, build_rust};
+use crate::{GraphStore, RefKind, build_rust};
 use std::collections::BTreeSet;
 
 /// Run the full suite against stores produced by `make` (a fresh, empty
@@ -16,6 +16,7 @@ pub fn run_graph_store_conformance<S: GraphStore>(make: impl Fn() -> S) {
     reinsert_replaces_a_path(&mut seeded(&make));
     enumerates_all_symbols_and_references(&mut seeded(&make));
     qualifier_and_owner_survive_a_round_trip(&mut seeded(&make));
+    a_value_reference_is_stored_but_kept_out_of_the_call_graph(&mut seeded(&make));
     empty_store_answers_are_empty(&mut make());
 }
 
@@ -145,4 +146,41 @@ fn qualifier_and_owner_survive_a_round_trip<S: GraphStore>(s: &mut S) {
     // A free function and a plain call carry neither.
     assert!(s.definitions("caller")[0].item.owner.is_none());
     assert!(s.references_to("mid")[0].item.qualifier.is_none());
+}
+
+/// A function passed as a value must reach the store (or `unreferenced` calls a
+/// live callback dead again) while staying out of `callers`/`callees` (or
+/// passing a function reads as calling it). A backend that persists the row but
+/// forgets the filter looks correct on `unreferenced` and wrong on the call
+/// graph, so both halves are checked here rather than only in the in-memory
+/// reference (#250).
+fn a_value_reference_is_stored_but_kept_out_of_the_call_graph<S: GraphStore>(s: &mut S) {
+    s.insert(
+        "cb.rs",
+        build_rust("fn handler() {}\nfn wire() { register(handler); }"),
+    );
+
+    // Stored, and marked as a value.
+    let refs = s.references_to("handler");
+    assert_eq!(refs.len(), 1, "value reference persisted");
+    assert_eq!(refs[0].item.kind, RefKind::Value);
+
+    // But not a call edge in either direction.
+    assert!(
+        s.callers_of("handler").is_empty(),
+        "passing is not calling: {:?}",
+        s.callers_of("handler")
+    );
+    assert_eq!(
+        s.callees("wire"),
+        vec!["register".to_string()],
+        "only the real call"
+    );
+
+    // And it still counts as a reference, so `handler` is not reported dead.
+    let dead = s.unreferenced(&crate::model::SymbolFilter::default(), false, 100);
+    assert!(
+        !dead.items.iter().any(|l| l.item.name == "handler"),
+        "handler is referenced: {dead:?}"
+    );
 }

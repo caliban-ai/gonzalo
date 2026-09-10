@@ -115,6 +115,18 @@ pub enum RefKind {
     /// belongs to whatever `x` is, which the graph does not know, so it may well
     /// be defined outside the view entirely.
     Method,
+    /// A name used as a *value* rather than called — `and_then(helper)`.
+    ///
+    /// Not a call edge, and deliberately kept out of `callers`/`callees` and the
+    /// impact walk. It exists so `unreferenced` can tell a live callback from a
+    /// dead function: a path expression records no call, so a function only ever
+    /// passed as a value looked unused and was reported as deletable (#250).
+    ///
+    /// Over-inclusive by construction. Extraction is per-file, so it cannot tell
+    /// an identifier naming a function from one naming a local; both are
+    /// recorded. For `unreferenced` that errs towards not calling something
+    /// dead, which is the safe direction.
+    Value,
 }
 
 impl RefKind {
@@ -129,6 +141,7 @@ impl RefKind {
         match self {
             Self::Free => "free",
             Self::Method => "method",
+            Self::Value => "value",
         }
     }
 
@@ -138,6 +151,7 @@ impl RefKind {
     pub fn from_str_or_free(raw: &str) -> Self {
         match raw {
             "method" => Self::Method,
+            "value" => Self::Value,
             _ => Self::Free,
         }
     }
