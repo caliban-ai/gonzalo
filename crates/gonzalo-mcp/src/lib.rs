@@ -89,7 +89,9 @@ impl GonzaloMcp {
                  in several places and the list merges callers of all of them, which is not the \
                  same question you asked. `defined_in` names those files while there are few \
                  enough to be useful. A count of 0 means the name is defined nowhere in the view, \
-                 which is what makes an empty list readable.",
+                 which is what makes an empty list readable. `callers` is functions only; a call \
+                 sitting in a module-level declaration (a Zod schema, a tRPC handler) appears in \
+                 `module_callers` instead, so the two questions stay separable.",
                 view_query_schema(),
             ),
             Tool::new(
@@ -400,14 +402,33 @@ impl GonzaloMcp {
         sym: &str,
         tool: &str,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let names = if tool == "callers" {
-            self.service.graph_callers_of(repo, view, sym).await
+        // `callers` splits by what the caller *is*: a function, or a
+        // module-level binding such as a Zod schema or a tRPC handler. Kept as
+        // two fields rather than one list of objects so `callers` means exactly
+        // what it meant before — functions that call this (#268).
+        let (names, module_names) = if tool == "callers" {
+            match self.service.graph_callers_scoped(repo, view, sym).await {
+                Ok(scoped) => {
+                    let (functions, modules): (Vec<_>, Vec<_>) = scoped
+                        .into_iter()
+                        .partition(|(_, scope)| scope.is_function());
+                    (
+                        functions.into_iter().map(|(name, _)| name).collect(),
+                        Some(
+                            modules
+                                .into_iter()
+                                .map(|(name, _)| name)
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                }
+                Err(e) => return Ok(tool_error(e.to_string())),
+            }
         } else {
-            self.service.graph_callees(repo, view, sym).await
-        };
-        let names = match names {
-            Ok(n) => n,
-            Err(e) => return Ok(tool_error(e.to_string())),
+            match self.service.graph_callees(repo, view, sym).await {
+                Ok(names) => (names, None),
+                Err(e) => return Ok(tool_error(e.to_string())),
+            }
         };
         let defs = match self.service.graph_definitions(repo, view, sym).await {
             Ok(d) => d,
@@ -422,6 +443,9 @@ impl GonzaloMcp {
             tool: names,
             "definition_count": defs.len(),
         });
+        if let Some(module_names) = module_names {
+            payload["module_callers"] = serde_json::json!(module_names);
+        }
         if paths.len() <= MAX_DEFINED_IN {
             payload["defined_in"] = serde_json::json!(paths);
         }
@@ -882,14 +906,26 @@ mod tests {
     }
 
     /// A server whose store holds view `r`/`main` assembled from `slices`.
+    /// Like [`seeded_with`], for a language other than Rust.
+    async fn seeded_with_language(
+        language: gonzalo_graph::Language,
+        slices: &[(&str, &str)],
+    ) -> GonzaloMcp {
+        seeded_from(slices, |src| gonzalo_graph::build(language, src)).await
+    }
+
     async fn seeded_with(slices: &[(&str, &str)]) -> GonzaloMcp {
+        seeded_from(slices, build_rust).await
+    }
+
+    async fn seeded_from(
+        slices: &[(&str, &str)],
+        parse: impl Fn(&str) -> gonzalo_graph::CodeGraph,
+    ) -> GonzaloMcp {
         let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
         let mut manifest = Manifest::new();
         for &(path, src) in slices {
-            let hash = fs
-                .put_blob(&build_rust(src).to_slice_bytes())
-                .await
-                .unwrap();
+            let hash = fs.put_blob(&parse(src).to_slice_bytes()).await.unwrap();
             manifest.insert(path, hash);
         }
         let body = manifest.to_body();
@@ -1653,5 +1689,34 @@ mod tests {
         let v = call_on(&s, "callers", serde_json::json!({ "name": "foo" })).await;
         assert_eq!(v["definition_count"], MAX_DEFINED_IN + 2, "{v}");
         assert!(v["defined_in"].is_null(), "paths dropped: {v}");
+    }
+
+    // ---- module-level callers (#268) ---------------------------------------
+
+    #[tokio::test]
+    async fn callers_separates_functions_from_module_level_declarations() {
+        // `callers` must keep meaning what it meant — functions that call this.
+        // The module-level ones are real dependencies but a different question,
+        // so they travel in their own field (#268).
+        let s = seeded_with_language(
+            gonzalo_graph::Language::TypeScript,
+            &[(
+                "app.ts",
+                "const schema = z.object({});\nconst run = () => { z.object({}); };",
+            )],
+        )
+        .await;
+        let v = call_on(&s, "callers", serde_json::json!({ "name": "object" })).await;
+        assert_eq!(v["callers"], serde_json::json!(["run"]));
+        assert_eq!(v["module_callers"], serde_json::json!(["schema"]));
+    }
+
+    #[tokio::test]
+    async fn callees_carries_no_module_field() {
+        // The split is meaningful for callers only: `callees` asks what one
+        // named thing calls, and its scope is whatever that thing is.
+        let v = call("callees", serde_json::json!({ "name": "main" })).await;
+        assert_eq!(v["callees"], serde_json::json!(["helper"]));
+        assert!(v["module_callers"].is_null(), "{v}");
     }
 }

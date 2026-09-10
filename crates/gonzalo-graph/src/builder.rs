@@ -4,7 +4,7 @@
 //! Scala, and Elixir are supported, and a new grammar is a matter of adding its
 //! node-kind mappings.
 
-use crate::model::{CodeGraph, Import, RefKind, Reference, Symbol, SymbolKind};
+use crate::model::{CodeGraph, FromScope, Import, RefKind, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
@@ -582,6 +582,39 @@ impl Language {
         out
     }
 
+    /// The name a module-level binding gives to the calls in its initializer,
+    /// when that binding is not itself a function.
+    ///
+    /// `const schema = z.object({..})` and a handler keyed in a router object
+    /// both name their contents; #257 correctly refuses to call them functions,
+    /// which left every call inside them with no caller at all (#268).
+    ///
+    /// JS/TS only. Every other language attributes exactly as it did — Python's
+    /// module-level tables and Rust's `static` initializers are the same shape
+    /// and worth revisiting, but each needs its own evidence.
+    fn module_binding_name(self, node: Node<'_>, bytes: &[u8]) -> Option<String> {
+        if !matches!(self, Self::JavaScript | Self::TypeScript | Self::Tsx) {
+            return None;
+        }
+        if !matches!(
+            node.kind(),
+            "variable_declarator" | "pair" | "public_field_definition"
+        ) {
+            return None;
+        }
+        // A binding that *is* a function already became a symbol and set the
+        // enclosing name itself; this is only for the ones that did not.
+        let value = node.child_by_field_name("value")?;
+        if js_binds_a_function(value, bytes, 3) {
+            return None;
+        }
+        name_field(node, bytes).or_else(|| {
+            node.child_by_field_name("key")
+                .and_then(|n| node_text(n, bytes))
+                .map(str::to_string)
+        })
+    }
+
     /// Bare names appearing in a call's argument list, as `(name, line)` —
     /// `helper` in `and_then(helper)`.
     ///
@@ -1055,6 +1088,7 @@ pub fn build(language: Language, src: &str) -> CodeGraph {
         None,
         None,
         &BTreeMap::new(),
+        FromScope::Function,
         &mut graph,
     );
     graph
@@ -1521,9 +1555,11 @@ fn walk(
     current_fn: Option<&str>,
     current_type: Option<&str>,
     current_receivers: &BTreeMap<String, String>,
+    current_scope: FromScope,
     graph: &mut CodeGraph,
 ) {
     let mut enclosing = current_fn.map(str::to_string);
+    let mut scope = current_scope;
     let mut owner = current_type.map(str::to_string);
     // Assigned only when this node opens a function body, and only then does
     // `receivers` point at it — so the table is scoped to the body it came from
@@ -1545,6 +1581,7 @@ fn walk(
         });
         if kind == SymbolKind::Function {
             enclosing = Some(name.clone());
+            scope = FromScope::Function;
             if language == Language::Rust {
                 scoped_receivers = rust_receiver_types(node, bytes);
                 receivers = &scoped_receivers;
@@ -1560,6 +1597,7 @@ fn walk(
     {
         let kind = language.callee_kind(node);
         graph.references.push(Reference {
+            from_scope: scope,
             name,
             from: enclosing.clone(),
             line: node.start_position().row + 1,
@@ -1581,6 +1619,18 @@ fn walk(
         });
     }
 
+    // A module-level binding that is not a function still names the calls in
+    // its initializer — a Zod schema, a tRPC handler (#268). Fires only where
+    // there is no enclosing *function*, so every existing attribution is
+    // untouched; a nested binding takes over from an outer one, since the
+    // nearest name is the useful one.
+    if (enclosing.is_none() || scope == FromScope::Module)
+        && let Some(name) = language.module_binding_name(node, bytes)
+    {
+        enclosing = Some(name);
+        scope = FromScope::Module;
+    }
+
     // Names this file brings into scope (#252).
     for import in language.imports_at(node, bytes) {
         graph.imports.push(import);
@@ -1591,6 +1641,7 @@ fn walk(
     if language.is_call(node.kind()) {
         for (name, line) in language.value_args(node, bytes) {
             graph.references.push(Reference {
+                from_scope: scope,
                 name,
                 from: enclosing.clone(),
                 line,
@@ -1603,6 +1654,7 @@ fn walk(
     // Calls the grammar hides inside an opaque macro-argument node (#216).
     for (name, line) in language.macro_arg_calls(node, bytes) {
         graph.references.push(Reference {
+            from_scope: scope,
             name,
             from: enclosing.clone(),
             line,
@@ -1621,6 +1673,7 @@ fn walk(
             enclosing.as_deref(),
             owner.as_deref(),
             receivers,
+            scope,
             graph,
         );
     }
@@ -3560,5 +3613,92 @@ int main(void) { return helper(1) + abs(-2); }
             imports,
             vec![("fs".to_string(), vec!["node:fs".to_string()])]
         );
+    }
+
+    // ---- module-level attribution (#268) -----------------------------------
+
+    /// `(name, from, scope)` for every reference in `src`.
+    fn attributed(language: Language, src: &str) -> Vec<(String, Option<String>, FromScope)> {
+        build(language, src)
+            .references
+            .iter()
+            .map(|r| (r.name.clone(), r.from.clone(), r.from_scope))
+            .collect()
+    }
+
+    /// The `from` and scope recorded for the reference named `name`.
+    fn attribution_of(src: &str, name: &str) -> (Option<String>, FromScope) {
+        attributed(Language::TypeScript, src)
+            .into_iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, from, scope)| (from, scope))
+            .expect("reference recorded")
+    }
+
+    #[test]
+    fn a_module_level_binding_names_the_calls_in_its_initializer() {
+        // A Zod schema: `z.object(..)` is a call on a lowercase receiver, so
+        // #257's wrapper rule correctly refuses to call `allEnv` a function —
+        // and every call inside it used to be orphaned (#268).
+        let src = "const allEnv = z.object({ PORT: z.string() });";
+
+        // The call in the binding's own initializer takes the binding.
+        let (from, scope) = attribution_of(src, "object");
+        assert_eq!(from.as_deref(), Some("allEnv"));
+        assert_eq!(scope, FromScope::Module);
+
+        // A call nested under a keyed property takes that key, because it is
+        // nearer and says more: `PORT` names which setting this call builds.
+        let (from, scope) = attribution_of(src, "string");
+        assert_eq!(from.as_deref(), Some("PORT"));
+        assert_eq!(scope, FromScope::Module);
+    }
+
+    #[test]
+    fn a_call_inside_a_real_function_is_unchanged() {
+        // The guarantee that makes this strictly additive: an enclosing
+        // function still wins, and still reports itself as a function.
+        let (from, scope) = attribution_of("const render = () => { cell(); };", "cell");
+        assert_eq!(from.as_deref(), Some("render"));
+        assert_eq!(scope, FromScope::Function);
+    }
+
+    #[test]
+    fn an_iterator_inside_a_function_keeps_the_function() {
+        // #257's guard still holds where it matters: inside a function the
+        // alternative was a correct answer, not nothing.
+        let (from, scope) = attribution_of(
+            "const render = () => { const rows = items.map((x) => cell(x)); };",
+            "cell",
+        );
+        assert_eq!(from.as_deref(), Some("render"));
+        assert_eq!(scope, FromScope::Function);
+    }
+
+    #[test]
+    fn the_nearest_module_binding_wins() {
+        // A tRPC router: the handler's own key names it, not the whole router.
+        let (from, scope) = attribution_of(
+            "export const router = make({ createBookmark: proc.input(z.string()) });",
+            "string",
+        );
+        assert_eq!(from.as_deref(), Some("createBookmark"));
+        assert_eq!(scope, FromScope::Module);
+    }
+
+    #[test]
+    fn a_top_level_call_in_no_binding_stays_unattributed() {
+        // `export default memo(X)` has no name to give it, and inventing one
+        // would be worse than reporting none.
+        let (from, scope) = attribution_of("export default memo(Widget);", "memo");
+        assert_eq!(from, None);
+        assert_eq!(scope, FromScope::Function, "the default, meaning nothing");
+    }
+
+    #[test]
+    fn a_module_scope_slice_still_serializes_without_the_field_when_absent() {
+        let g = build(Language::TypeScript, "const render = () => { cell(); };");
+        let json = serde_json::to_string(&g).expect("serialize");
+        assert!(!json.contains("from_scope"), "{json}");
     }
 }

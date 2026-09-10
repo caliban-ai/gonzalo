@@ -13,7 +13,9 @@
 //! `Connection` is `Send` but not `Sync`, and `GraphStore` requires `Sync`);
 //! read concurrency via a connection pool is a follow-on.
 
-use gonzalo_graph::{CodeGraph, GraphStore, Import, Located, RefKind, Reference, Symbol};
+use gonzalo_graph::{
+    CodeGraph, FromScope, GraphStore, Import, Located, RefKind, Reference, Symbol,
+};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -32,8 +34,9 @@ CREATE TABLE IF NOT EXISTS refs (
     name    TEXT    NOT NULL,
     from_fn TEXT,
     line      INTEGER NOT NULL,
-    kind      TEXT    NOT NULL DEFAULT 'free',
-    qualifier TEXT
+    kind       TEXT    NOT NULL DEFAULT 'free',
+    qualifier  TEXT,
+    from_scope TEXT    NOT NULL DEFAULT 'function'
 );
 CREATE TABLE IF NOT EXISTS imports (
     path   TEXT    NOT NULL,
@@ -107,6 +110,13 @@ impl SqliteGraphStore {
         }
         // A row written before #261 was an absolute import, which is depth 0 —
         // exactly what the default gives it.
+        // A row written before #268 had a function for its `from`, which is
+        // exactly what the default gives it.
+        if !has("refs", "from_scope")? {
+            conn.execute_batch(
+                "ALTER TABLE refs ADD COLUMN from_scope TEXT NOT NULL DEFAULT 'function'",
+            )?;
+        }
         if !has("imports", "depth")? {
             conn.execute_batch("ALTER TABLE imports ADD COLUMN depth INTEGER NOT NULL DEFAULT 0")?;
         }
@@ -212,15 +222,16 @@ impl GraphStore for SqliteGraphStore {
         }
         for r in &graph.references {
             tx.execute(
-                "INSERT INTO refs (path, name, from_fn, line, kind, qualifier)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO refs (path, name, from_fn, line, kind, qualifier, from_scope)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     path,
                     r.name,
                     r.from,
                     r.line as i64,
                     r.kind.as_str(),
-                    r.qualifier
+                    r.qualifier,
+                    r.from_scope.as_str()
                 ],
             )
             .expect("insert reference");
@@ -297,7 +308,7 @@ impl GraphStore for SqliteGraphStore {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
             .prepare(
-                "SELECT path, name, from_fn, line, kind, qualifier FROM refs
+                "SELECT path, name, from_fn, line, kind, qualifier, from_scope FROM refs
                  WHERE name = ?1 ORDER BY path, line",
             )
             .expect("prepare references_to");
@@ -306,6 +317,7 @@ impl GraphStore for SqliteGraphStore {
                 Ok(Located {
                     path: row.get(0)?,
                     item: Reference {
+                        from_scope: FromScope::from_str_or_function(&row.get::<_, String>(6)?),
                         name: row.get(1)?,
                         from: row.get::<_, Option<String>>(2)?,
                         line: row.get::<_, i64>(3)? as usize,
@@ -373,7 +385,8 @@ impl GraphStore for SqliteGraphStore {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
             .prepare(
-                "SELECT path, name, from_fn, line, kind, qualifier FROM refs ORDER BY path, line",
+                "SELECT path, name, from_fn, line, kind, qualifier, from_scope FROM refs
+                 ORDER BY path, line",
             )
             .expect("prepare all_references");
         let rows = stmt
@@ -381,6 +394,7 @@ impl GraphStore for SqliteGraphStore {
                 Ok(Located {
                     path: row.get(0)?,
                     item: Reference {
+                        from_scope: FromScope::from_str_or_function(&row.get::<_, String>(6)?),
                         name: row.get(1)?,
                         from: row.get::<_, Option<String>>(2)?,
                         line: row.get::<_, i64>(3)? as usize,

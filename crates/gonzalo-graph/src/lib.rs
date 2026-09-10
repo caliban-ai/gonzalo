@@ -17,8 +17,9 @@
 /// 6 = per-file imports (#252); 7 = Java/Kotlin imports (#260); 8 = JS/TS
 /// functions bound through a higher-order call, and object properties (#257);
 /// 9 = relative-import depth (#261); 10 = `.h` headers parsed as C++ (#266);
-/// 11 = C/C++ includes (#267); 12 = CommonJS `require` (#269).
-pub const EXTRACTION_VERSION: u32 = 12;
+/// 11 = C/C++ includes (#267); 12 = CommonJS `require` (#269); 13 = module-level
+/// attribution and its scope (#268).
+pub const EXTRACTION_VERSION: u32 = 13;
 
 pub mod assembly;
 pub mod builder;
@@ -31,8 +32,8 @@ pub use assembly::assemble;
 pub use builder::{Language, build, build_rust};
 pub use diff::{GraphDiff, diff};
 pub use model::{
-    CodeGraph, FileSummary, Import, Located, Page, RankedSymbol, Ranking, RefKind, Reference,
-    Symbol, SymbolFilter, SymbolKind, ViewOverview,
+    CodeGraph, FileSummary, FromScope, Import, Located, Page, RankedSymbol, Ranking, RefKind,
+    Reference, Symbol, SymbolFilter, SymbolKind, ViewOverview,
 };
 pub use resolve::{
     ImpactNode, ImpactReport, Resolution, ResolvedReference, resolve_references_to,

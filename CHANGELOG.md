@@ -99,6 +99,39 @@ the patch version for fixes.
 
 ### Changed
 
+- **Calls in module-level declarations are attributed, and say so.** A great
+  deal of modern TypeScript lives in module-level builder objects — a Zod
+  schema, a tRPC router — where a call sits inside a named binding but not
+  inside a function. Those calls reached neither `callers` nor `impact`.
+
+  They are now attributed to the nearest named binding. Since that widens what a
+  reference's `from` means, the scope travels with it rather than the meaning
+  changing silently: `Reference::from_scope` distinguishes `Function` from
+  `Module`, and the MCP `callers` tool keeps its exact previous meaning —
+  functions that call this — with the module-level ones in a new
+  `module_callers`.
+
+  On a real Next.js/tRPC codebase (815 files):
+
+  | | before | after |
+  |---|---|---|
+  | production references with a caller | 20754 | 27524 |
+  | production references orphaned | 7795 | 1025 |
+  | production orphan rate | 27% | 3.6% |
+
+  **Strictly additive, and measured as such**: function-scope attributions came
+  to 20754 — exactly the number that had a caller before, not one changed. The
+  6770 module-scope attributions are pure addition. A call inside a real
+  function keeps today's answer, including the iterator case #257 guards.
+
+  The nearest binding wins, so `z.string()` under a `PORT:` key reports `PORT`
+  rather than the enclosing schema. Deliberately over-inclusive in the same way
+  `RefKind::Value` is, which is exactly why the scope is a separate field rather
+  than folded in. Test files are unchanged: their calls sit in anonymous Jest
+  callbacks, which genuinely have no name. JS/TS only; Python's module-level
+  tables and Rust's `static` initializers are the same shape and each needs its
+  own evidence. `EXTRACTION_VERSION` is 13. (#268)
+
 - **CommonJS `require()` is recorded as an import.** JavaScript and TypeScript
   extraction handled the ES `import` statement only, so a Node codebase written
   in the older module system got no import-aware resolution at all. All three

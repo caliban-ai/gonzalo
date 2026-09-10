@@ -9,7 +9,7 @@ use gonzalo_core::{
     RecordKey, Result, Revision, Store,
 };
 use gonzalo_graph::{
-    GraphStore, ImpactReport, Located, Page, RankedSymbol, Ranking, Reference, Symbol,
+    FromScope, GraphStore, ImpactReport, Located, Page, RankedSymbol, Ranking, Reference, Symbol,
     SymbolFilter, ViewOverview, assemble, resolved_impact,
 };
 use gonzalo_graph_sqlite::{SqliteGraphStore, view_db_path};
@@ -264,6 +264,17 @@ impl Service {
         name: &str,
     ) -> Result<Vec<String>> {
         Ok(self.view(repo, view_id).await?.callers_of(name))
+    }
+
+    /// Callers of `name`, each with whether it is a function or a module-level
+    /// binding (#268).
+    pub async fn graph_callers_scoped(
+        &self,
+        repo: &str,
+        view_id: &str,
+        name: &str,
+    ) -> Result<Vec<(String, FromScope)>> {
+        Ok(self.view(repo, view_id).await?.callers_scoped(name))
     }
 
     /// Names called from within `name` in the view.
