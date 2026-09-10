@@ -242,6 +242,18 @@ same-named project function
 ([#223](https://github.com/caliban-ai/gonzalo/issues/223)). Treat the closure as a lead
 list and confirm the load-bearing edges with `callers`.
 
+**A call that names its type is now attributed to it.** `Beta::get()` resolves to
+`Beta`'s `get` even when several types in the view define one, because the call site's
+qualifier is recorded alongside each definition's owning type
+([#248](https://github.com/caliban-ai/gonzalo/issues/248)). Two limits are worth
+knowing. The qualifier only ever *narrows*: when it names something the view does not
+own — a file module, a dependency — it is ignored and the older rules apply, so this
+never turns an answer into a decline. And it is recorded only where the grammar makes a
+path unambiguously a path, currently Rust, C++, and PHP. Go's `pkg.Func()` and Java's
+`Foo.bar()` are indistinguishable from a receiver call at this level, so they stay
+unqualified rather than record a variable name as a type. A definition's `owner` shows
+up in `search` and `node` results when it has one.
+
 **`callers` on a type is always empty.** Only call expressions are edges, so types,
 traits, and structs have no inbound edges. Empty there means "not applicable", not
 "unused".

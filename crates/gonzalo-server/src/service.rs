@@ -476,6 +476,35 @@ mod tests {
         assert!(svc.graph_impact("r", "absent", "x", None).await.is_err());
     }
 
+    /// The owning type has to survive the whole path — extraction, the
+    /// persistent graph, and the service query — or `search` answers with a
+    /// bare name again and nothing says the owner was dropped (#248).
+    #[tokio::test]
+    async fn definitions_report_the_owning_type_of_a_method() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let fs = Arc::new(FsStore::new(&dir));
+        let graph_root = dir.join("graphs");
+        {
+            let mut g = SqliteGraphStore::open(view_db_path(&graph_root, "r", "main")).unwrap();
+            g.insert(
+                "beta.rs",
+                build_rust("struct Beta; impl Beta { fn get() {} }"),
+            );
+            g.insert("free.rs", build_rust("fn helper() {}"));
+        }
+        let svc = Service::new(fs.clone(), fs).with_graph_root(graph_root);
+
+        let defs = svc.graph_definitions("r", "main", "get").await.unwrap();
+        assert_eq!(defs[0].item.owner.as_deref(), Some("Beta"));
+
+        // A free function has none, and the field is omitted from the answer
+        // rather than sent as an explicit null.
+        let free = svc.graph_definitions("r", "main", "helper").await.unwrap();
+        assert_eq!(free[0].item.owner, None);
+        let json = serde_json::to_string(&free).unwrap();
+        assert!(!json.contains("owner"), "{json}");
+    }
+
     #[tokio::test]
     async fn graph_queries_answer_over_an_assembled_view() {
         let fs = fresh_fs();

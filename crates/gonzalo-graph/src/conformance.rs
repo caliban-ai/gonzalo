@@ -15,6 +15,7 @@ pub fn run_graph_store_conformance<S: GraphStore>(make: impl Fn() -> S) {
     references_to_reports_paths(&mut seeded(&make));
     reinsert_replaces_a_path(&mut seeded(&make));
     enumerates_all_symbols_and_references(&mut seeded(&make));
+    qualifier_and_owner_survive_a_round_trip(&mut seeded(&make));
     empty_store_answers_are_empty(&mut make());
 }
 
@@ -100,4 +101,48 @@ fn empty_store_answers_are_empty<S: GraphStore>(s: &mut S) {
     assert!(s.references_to("anything").is_empty());
     assert!(s.all_symbols().is_empty());
     assert!(s.all_references().is_empty());
+}
+
+/// A backend that drops [`Symbol::owner`] or [`Reference::qualifier`] silently
+/// resolves everything by bare name again, and would still pass every other
+/// case in this suite. Both fields are optional, so a lossy backend looks
+/// exactly like a file that simply had none (#248).
+fn qualifier_and_owner_survive_a_round_trip<S: GraphStore>(s: &mut S) {
+    s.insert(
+        "beta.rs",
+        build_rust("struct Beta; impl Beta { fn get() {} }"),
+    );
+    s.insert("call.rs", build_rust("fn caller() { Beta::get(); }"));
+
+    let owned = s
+        .definitions("get")
+        .into_iter()
+        .find(|d| d.path == "beta.rs")
+        .expect("method definition stored");
+    assert_eq!(owned.item.owner.as_deref(), Some("Beta"));
+
+    let call = s
+        .references_to("get")
+        .into_iter()
+        .find(|r| r.path == "call.rs")
+        .expect("qualified call stored");
+    assert_eq!(call.item.qualifier.as_deref(), Some("Beta"));
+
+    // The whole-view enumerations read through their own queries.
+    let all_owned = s
+        .all_symbols()
+        .into_iter()
+        .find(|d| d.path == "beta.rs" && d.item.name == "get")
+        .expect("method in all_symbols");
+    assert_eq!(all_owned.item.owner.as_deref(), Some("Beta"));
+    let all_call = s
+        .all_references()
+        .into_iter()
+        .find(|r| r.path == "call.rs" && r.item.name == "get")
+        .expect("call in all_references");
+    assert_eq!(all_call.item.qualifier.as_deref(), Some("Beta"));
+
+    // A free function and a plain call carry neither.
+    assert!(s.definitions("caller")[0].item.owner.is_none());
+    assert!(s.references_to("mid")[0].item.qualifier.is_none());
 }

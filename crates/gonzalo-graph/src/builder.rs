@@ -360,6 +360,42 @@ impl Language {
         }
     }
 
+    /// The path segment immediately before the callee name, for a path-shaped
+    /// call — `Language` in `Language::from_extension()`, `b` in `a::b::c()`.
+    ///
+    /// Only grammars that make a path *unambiguously* a path are handled. Go's
+    /// `selector_expression` covers both `pkg.Func()` and `x.Method()` with no
+    /// way to tell them apart here, and Java's `object` field likewise covers a
+    /// static call and a receiver call — recording `pkg` or `x` as a qualifier
+    /// would name a value, not a type. Every other language falls through to
+    /// `None`, which is the behaviour it had before this existed (#248).
+    ///
+    /// A [`RefKind::Method`] call never has one: its receiver is a value whose
+    /// type the graph does not know. #251 fills that in where the type is
+    /// syntactically visible.
+    fn callee_qualifier(self, call: Node<'_>, bytes: &[u8]) -> Option<String> {
+        // PHP marks a static call with its own node kind, and puts the scope on
+        // the call node rather than on a nested callee.
+        if self == Self::Php {
+            return (call.kind() == "scoped_call_expression")
+                .then(|| call.child_by_field_name("scope"))
+                .flatten()
+                .and_then(|n| trailing_path_segment(n, bytes));
+        }
+        let (path_kind, scope_field) = match self {
+            Self::Rust => ("scoped_identifier", "path"),
+            Self::Cpp => ("qualified_identifier", "scope"),
+            _ => return None,
+        };
+        let callee = call.child_by_field_name("function")?;
+        if callee.kind() != path_kind {
+            return None;
+        }
+        callee
+            .child_by_field_name(scope_field)
+            .and_then(|n| trailing_path_segment(n, bytes))
+    }
+
     /// Calls hidden inside an opaque macro-argument node, as `(name, line)`.
     ///
     /// Rust macro arguments parse as a `token_tree` of raw tokens rather than
@@ -574,6 +610,44 @@ fn last_identifier(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     result
 }
 
+/// The trailing segment of a path node: `b` for `a::b`, `Language` for a bare
+/// `Language`. A nested path names its own last segment in a `name` field; a
+/// leaf is its own text (#248).
+fn trailing_path_segment(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|n| node_text(n, bytes))
+        .or_else(|| node_text(node, bytes))
+        .map(str::to_string)
+}
+
+/// The name a call site would use to qualify a member of this item: the base
+/// type, without generic arguments and without a leading path. `impl<T>
+/// Holder<T>` owns `Holder`, and `impl crate::model::Widget` owns `Widget`.
+///
+/// A call is written `Holder::get()`, never `Holder<T>::get()`, and its
+/// qualifier is a single segment, so the stored owner has to be reduced to the
+/// same shape or it could never match (#248).
+fn owner_key(name: &str) -> String {
+    let base = name.split('<').next().unwrap_or(name).trim();
+    base.rsplit("::").next().unwrap_or(base).trim().to_string()
+}
+
+/// Whether a symbol of this kind owns the symbols defined inside it, so a
+/// method records the type it hangs off and a function in an inline module
+/// records the module (#248).
+fn establishes_ownership(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Impl
+            | SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Module
+    )
+}
+
 /// The first named child of `node` whose kind is `kind`, if any.
 fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
@@ -701,7 +775,14 @@ pub fn build(language: Language, src: &str) -> CodeGraph {
         return CodeGraph::default();
     };
     let mut graph = CodeGraph::default();
-    walk(language, tree.root_node(), src.as_bytes(), None, &mut graph);
+    walk(
+        language,
+        tree.root_node(),
+        src.as_bytes(),
+        None,
+        None,
+        &mut graph,
+    );
     graph
 }
 
@@ -725,9 +806,11 @@ fn walk(
     node: Node<'_>,
     bytes: &[u8],
     current_fn: Option<&str>,
+    current_type: Option<&str>,
     graph: &mut CodeGraph,
 ) {
     let mut enclosing = current_fn.map(str::to_string);
+    let mut owner = current_type.map(str::to_string);
 
     if let Some(kind) = language.item_kind(node, bytes)
         && let Some(name) = language.item_name(node, kind, bytes)
@@ -737,20 +820,32 @@ fn walk(
             kind,
             start_line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
+            // The owner in scope *around* this item — an item is not its own
+            // owner, exactly as a function is not its own enclosing function.
+            owner: owner.clone(),
         });
         if kind == SymbolKind::Function {
-            enclosing = Some(name);
+            enclosing = Some(name.clone());
+        }
+        if establishes_ownership(kind) {
+            owner = Some(owner_key(&name));
         }
     }
 
     if language.is_call(node.kind())
         && let Some(name) = language.callee_name(node, bytes)
     {
+        let kind = language.callee_kind(node);
         graph.references.push(Reference {
             name,
             from: enclosing.clone(),
             line: node.start_position().row + 1,
-            kind: language.callee_kind(node),
+            kind,
+            // A receiver is a value, not a type (#248).
+            qualifier: match kind {
+                RefKind::Method => None,
+                RefKind::Free => language.callee_qualifier(node, bytes),
+            },
         });
     }
 
@@ -762,12 +857,20 @@ fn walk(
             line,
             // A token-tree call is a bare `ident(` by construction (#216).
             kind: RefKind::Free,
+            qualifier: None,
         });
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(language, child, bytes, enclosing.as_deref(), graph);
+        walk(
+            language,
+            child,
+            bytes,
+            enclosing.as_deref(),
+            owner.as_deref(),
+            graph,
+        );
     }
 }
 
@@ -1803,5 +1906,140 @@ object Config
         assert_eq!(named("Shape"), Some(SymbolKind::Interface));
         assert_eq!(named("Widget"), Some(SymbolKind::Class));
         assert_eq!(named("Config"), Some(SymbolKind::Class)); // `object` singleton
+    }
+
+    // ---- qualified symbol identity (#248) ---------------------------------
+
+    #[test]
+    fn rust_records_the_qualifier_of_a_path_call() {
+        let g = build_rust(r#"fn g() { Language::from_extension("rs"); }"#);
+        let r = g
+            .references
+            .iter()
+            .find(|r| r.name == "from_extension")
+            .expect("call recorded");
+        assert_eq!(r.qualifier.as_deref(), Some("Language"));
+    }
+
+    #[test]
+    fn rust_records_the_last_path_segment_as_the_qualifier() {
+        let g = build_rust("fn g() { a::b::c(); }");
+        let r = g
+            .references
+            .iter()
+            .find(|r| r.name == "c")
+            .expect("call recorded");
+        assert_eq!(r.qualifier.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn rust_records_no_qualifier_for_a_bare_call() {
+        let g = build_rust("fn g() { helper(); }");
+        let r = g
+            .references
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("call recorded");
+        assert_eq!(r.qualifier, None);
+    }
+
+    #[test]
+    fn rust_records_no_qualifier_for_a_method_call() {
+        // The receiver is a value, not a type: `x` says nothing about which
+        // `helper` is meant, so recording it as a qualifier would assert
+        // something the graph does not know. #251 fills this in where the
+        // receiver's type is syntactically visible.
+        let g = build_rust("fn g(x: Thing) { x.helper(); }");
+        let r = g
+            .references
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("call recorded");
+        assert_eq!(r.qualifier, None);
+        assert_eq!(r.kind, RefKind::Method);
+    }
+
+    #[test]
+    fn rust_records_the_owning_type_of_a_method() {
+        let g = build_rust("struct Widget; impl Widget { fn get(&self) {} }");
+        let s = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "get")
+            .expect("method recorded");
+        assert_eq!(s.owner.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn rust_records_no_owner_for_a_free_function() {
+        let g = build_rust("fn helper() {}");
+        let s = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("fn recorded");
+        assert_eq!(s.owner, None);
+    }
+
+    #[test]
+    fn rust_records_an_inline_module_as_the_owner() {
+        // `util::helper()` names the module, so the module has to be an owner
+        // for the qualifier to match anything.
+        let g = build_rust("mod util { pub fn helper() {} }");
+        let s = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("fn recorded");
+        assert_eq!(s.owner.as_deref(), Some("util"));
+    }
+
+    #[test]
+    fn python_records_the_owning_class_of_a_method() {
+        let g = build(
+            Language::Python,
+            "class Widget:\n    def get(self):\n        pass\n",
+        );
+        let s = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "get")
+            .expect("method recorded");
+        assert_eq!(s.owner.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn a_slice_with_no_qualifier_or_owner_serializes_unchanged() {
+        // Both new fields are skipped when absent, so a file of plain free
+        // functions keeps the byte-identical slice — and therefore the content
+        // hash — it had before #248, exactly as `RefKind` did in #223.
+        let g = build_rust("fn helper() -> u32 { 1 } fn main() { helper(); }");
+        let json = serde_json::to_string(&g).expect("serialize");
+        assert!(!json.contains("qualifier"), "{json}");
+        assert!(!json.contains("owner"), "{json}");
+    }
+
+    #[test]
+    fn rust_records_a_generic_impl_by_its_base_type() {
+        // A call site writes `Holder::get()`, never `Holder<T>::get()`, so the
+        // owner has to be the bare type name or the qualifier never matches.
+        let g = build_rust("struct Holder<T>(T); impl<T> Holder<T> { fn get(&self) {} }");
+        let s = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "get")
+            .expect("method recorded");
+        assert_eq!(s.owner.as_deref(), Some("Holder"));
+    }
+
+    #[test]
+    fn rust_records_a_path_qualified_impl_by_its_last_segment() {
+        let g = build_rust("impl crate::model::Widget { fn get(&self) {} }");
+        let s = g
+            .symbols
+            .iter()
+            .find(|s| s.name == "get")
+            .expect("method recorded");
+        assert_eq!(s.owner.as_deref(), Some("Widget"));
     }
 }

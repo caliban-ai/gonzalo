@@ -24,14 +24,16 @@ CREATE TABLE IF NOT EXISTS symbols (
     name       TEXT    NOT NULL,
     kind       TEXT    NOT NULL,
     start_line INTEGER NOT NULL,
-    end_line   INTEGER NOT NULL
+    end_line   INTEGER NOT NULL,
+    owner      TEXT
 );
 CREATE TABLE IF NOT EXISTS refs (
     path    TEXT    NOT NULL,
     name    TEXT    NOT NULL,
     from_fn TEXT,
-    line    INTEGER NOT NULL,
-    kind    TEXT    NOT NULL DEFAULT 'free'
+    line      INTEGER NOT NULL,
+    kind      TEXT    NOT NULL DEFAULT 'free',
+    qualifier TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
@@ -77,11 +79,23 @@ impl SqliteGraphStore {
     /// explicitly. Rows already there default to `free`, which is exactly the
     /// shape they were assumed to have (#223).
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-        let has_kind = conn
-            .prepare("SELECT 1 FROM pragma_table_info('refs') WHERE name = 'kind'")?
-            .exists([])?;
-        if !has_kind {
+        let has = |table: &str, column: &str| -> rusqlite::Result<bool> {
+            conn.prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
+            ))?
+            .exists([])
+        };
+        if !has("refs", "kind")? {
             conn.execute_batch("ALTER TABLE refs ADD COLUMN kind TEXT NOT NULL DEFAULT 'free'")?;
+        }
+        // #248's two columns are nullable with no default: a row written before
+        // them reads back as `None`, which is exactly "this file had neither",
+        // the shape those rows were assumed to have.
+        if !has("symbols", "owner")? {
+            conn.execute_batch("ALTER TABLE symbols ADD COLUMN owner TEXT")?;
+        }
+        if !has("refs", "qualifier")? {
+            conn.execute_batch("ALTER TABLE refs ADD COLUMN qualifier TEXT")?;
         }
         Ok(())
     }
@@ -138,6 +152,7 @@ fn symbol_from_row(row: &rusqlite::Row, base: usize) -> rusqlite::Result<Symbol>
         kind: serde_json::from_str(&kind_text).expect("stored SymbolKind is valid"),
         start_line: start as usize,
         end_line: end as usize,
+        owner: row.get(base + 4)?,
     })
 }
 
@@ -151,22 +166,31 @@ impl GraphStore for SqliteGraphStore {
             .expect("clear refs for path");
         for s in &graph.symbols {
             tx.execute(
-                "INSERT INTO symbols (path, name, kind, start_line, end_line)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO symbols (path, name, kind, start_line, end_line, owner)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     path,
                     s.name,
                     kind_to_text(s),
                     s.start_line as i64,
-                    s.end_line as i64
+                    s.end_line as i64,
+                    s.owner
                 ],
             )
             .expect("insert symbol");
         }
         for r in &graph.references {
             tx.execute(
-                "INSERT INTO refs (path, name, from_fn, line, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![path, r.name, r.from, r.line as i64, r.kind.as_str()],
+                "INSERT INTO refs (path, name, from_fn, line, kind, qualifier)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    path,
+                    r.name,
+                    r.from,
+                    r.line as i64,
+                    r.kind.as_str(),
+                    r.qualifier
+                ],
             )
             .expect("insert reference");
         }
@@ -176,7 +200,7 @@ impl GraphStore for SqliteGraphStore {
     fn symbols_in_file(&self, path: &str) -> Vec<Symbol> {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
-            .prepare("SELECT name, kind, start_line, end_line FROM symbols WHERE path = ?1")
+            .prepare("SELECT name, kind, start_line, end_line, owner FROM symbols WHERE path = ?1")
             .expect("prepare symbols_in_file");
         let rows = stmt
             .query_map(params![path], |row| symbol_from_row(row, 0))
@@ -189,7 +213,7 @@ impl GraphStore for SqliteGraphStore {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
             .prepare(
-                "SELECT path, name, kind, start_line, end_line FROM symbols
+                "SELECT path, name, kind, start_line, end_line, owner FROM symbols
                  WHERE name = ?1 ORDER BY path",
             )
             .expect("prepare definitions");
@@ -209,7 +233,7 @@ impl GraphStore for SqliteGraphStore {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
             .prepare(
-                "SELECT path, name, from_fn, line, kind FROM refs
+                "SELECT path, name, from_fn, line, kind, qualifier FROM refs
                  WHERE name = ?1 ORDER BY path, line",
             )
             .expect("prepare references_to");
@@ -222,6 +246,7 @@ impl GraphStore for SqliteGraphStore {
                         from: row.get::<_, Option<String>>(2)?,
                         line: row.get::<_, i64>(3)? as usize,
                         kind: RefKind::from_str_or_free(&row.get::<_, String>(4)?),
+                        qualifier: row.get(5)?,
                     },
                 })
             })
@@ -260,7 +285,9 @@ impl GraphStore for SqliteGraphStore {
     fn all_symbols(&self) -> Vec<Located<Symbol>> {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
-            .prepare("SELECT path, name, kind, start_line, end_line FROM symbols ORDER BY path")
+            .prepare(
+                "SELECT path, name, kind, start_line, end_line, owner FROM symbols ORDER BY path",
+            )
             .expect("prepare all_symbols");
         let rows = stmt
             .query_map([], |row| {
@@ -277,7 +304,9 @@ impl GraphStore for SqliteGraphStore {
     fn all_references(&self) -> Vec<Located<Reference>> {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
-            .prepare("SELECT path, name, from_fn, line, kind FROM refs ORDER BY path, line")
+            .prepare(
+                "SELECT path, name, from_fn, line, kind, qualifier FROM refs ORDER BY path, line",
+            )
             .expect("prepare all_references");
         let rows = stmt
             .query_map([], |row| {
@@ -288,6 +317,7 @@ impl GraphStore for SqliteGraphStore {
                         from: row.get::<_, Option<String>>(2)?,
                         line: row.get::<_, i64>(3)? as usize,
                         kind: RefKind::from_str_or_free(&row.get::<_, String>(4)?),
+                        qualifier: row.get(5)?,
                     },
                 })
             })
@@ -323,5 +353,52 @@ mod tests {
         let c = view_db_path(root, "org/repo", "v1.0");
         let d = view_db_path(root, "org/repo", "v1_0");
         assert_ne!(c, d, "distinct views must not collide onto one db file");
+    }
+
+    /// A database written before #248 has neither new column. `CREATE TABLE IF
+    /// NOT EXISTS` leaves an existing table untouched, so opening one must add
+    /// them — otherwise every insert fails against a view that indexed fine
+    /// yesterday, which is the failure mode the `refs.kind` migration was
+    /// written for in #223.
+    #[test]
+    fn opening_a_pre_248_database_adds_the_new_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&db).expect("create old db");
+            conn.execute_batch(
+                "CREATE TABLE symbols (
+                     path TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+                     start_line INTEGER NOT NULL, end_line INTEGER NOT NULL);
+                 CREATE TABLE refs (
+                     path TEXT NOT NULL, name TEXT NOT NULL, from_fn TEXT,
+                     line INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'free');
+                 INSERT INTO symbols VALUES ('old.rs', 'legacy', '\"function\"', 1, 2);",
+            )
+            .expect("seed a pre-248 schema");
+        }
+
+        let mut store = SqliteGraphStore::open(&db).expect("open upgrades in place");
+
+        // A row written before the column existed reads as "this file had none".
+        assert_eq!(store.definitions("legacy")[0].item.owner, None);
+
+        // And a fresh insert into the upgraded table round-trips both fields.
+        store.insert(
+            "beta.rs",
+            gonzalo_graph::build_rust("struct Beta; impl Beta { fn get() {} }"),
+        );
+        store.insert(
+            "call.rs",
+            gonzalo_graph::build_rust("fn caller() { Beta::get(); }"),
+        );
+        assert_eq!(
+            store.definitions("get")[0].item.owner.as_deref(),
+            Some("Beta")
+        );
+        assert_eq!(
+            store.references_to("get")[0].item.qualifier.as_deref(),
+            Some("Beta")
+        );
     }
 }
