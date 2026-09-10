@@ -15,8 +15,9 @@
 /// (#223); 3 = call-site qualifiers and definition owners (#248); 4 = functions
 /// named as values (#250); 5 = syntactic receiver types on method calls (#251);
 /// 6 = per-file imports (#252); 7 = Java/Kotlin imports (#260); 8 = JS/TS
-/// functions bound through a higher-order call, and object properties (#257).
-pub const EXTRACTION_VERSION: u32 = 8;
+/// functions bound through a higher-order call, and object properties (#257);
+/// 9 = relative-import depth (#261).
+pub const EXTRACTION_VERSION: u32 = 9;
 
 pub mod assembly;
 pub mod builder;

@@ -262,6 +262,14 @@ it introduces names the file never spells out. An import naming something outsid
 view — a JDK or npm type — matches nothing and the reference stays ambiguous, which is
 the honest answer.
 
+**An import is read relative to the file that wrote it.** A Python relative import
+(`from ..DataTypes import Action`) anchors at the referencing file's own package, and an
+absolute import matching several identical copies of a package tree resolves to the copy
+nearest the referencing file
+([#261](https://github.com/caliban-ai/gonzalo/issues/261)). This is what makes a repo
+holding a vendored reference tree beside your own work, or one package tree per
+assignment, resolvable at all. A genuine tie is still left ambiguous.
+
 **A method call is attributed when the body says what the receiver is.** `b.get()`
 resolves to `Beta`'s `get` when `b` came from `Beta::new()`, a `Beta { .. }` literal, or
 a parameter written `b: Beta` / `&Beta`, and `self.foo()` takes the enclosing `impl`

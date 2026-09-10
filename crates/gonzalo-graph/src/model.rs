@@ -197,7 +197,24 @@ pub struct Import {
     pub name: String,
     /// The module path segments before the name, outermost first.
     pub path: Vec<String>,
+    /// How many dots a relative import leads with; 0 when absolute.
+    ///
+    /// A Python relative import is the one module path resolvable with no
+    /// project root at all: `from ..pkg import X` means "my parent package,
+    /// then `pkg`", which is arithmetic on the referencing file's own path.
+    /// Dropping the dots threw that away and left the module to be matched as a
+    /// free-floating suffix against every candidate (#261).
+    ///
+    /// Omitted from the serialized slice when zero, so a file with only
+    /// absolute imports keeps a byte-identical slice.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub depth: usize,
     pub line: usize,
+}
+
+/// Whether a count is zero, for `skip_serializing_if`.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl CodeGraph {

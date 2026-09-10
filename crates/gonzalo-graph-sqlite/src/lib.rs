@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS imports (
     path   TEXT    NOT NULL,
     name   TEXT    NOT NULL,
     module TEXT    NOT NULL,
+    depth  INTEGER NOT NULL DEFAULT 0,
     line   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -103,6 +104,11 @@ impl SqliteGraphStore {
         }
         if !has("refs", "qualifier")? {
             conn.execute_batch("ALTER TABLE refs ADD COLUMN qualifier TEXT")?;
+        }
+        // A row written before #261 was an absolute import, which is depth 0 —
+        // exactly what the default gives it.
+        if !has("imports", "depth")? {
+            conn.execute_batch("ALTER TABLE imports ADD COLUMN depth INTEGER NOT NULL DEFAULT 0")?;
         }
         Ok(())
     }
@@ -221,8 +227,15 @@ impl GraphStore for SqliteGraphStore {
         }
         for i in &graph.imports {
             tx.execute(
-                "INSERT INTO imports (path, name, module, line) VALUES (?1, ?2, ?3, ?4)",
-                params![path, i.name, join_module(&i.path), i.line as i64],
+                "INSERT INTO imports (path, name, module, depth, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    path,
+                    i.name,
+                    join_module(&i.path),
+                    i.depth as i64,
+                    i.line as i64
+                ],
             )
             .expect("insert import");
         }
@@ -232,14 +245,15 @@ impl GraphStore for SqliteGraphStore {
     fn imports_in_file(&self, path: &str) -> Vec<Import> {
         let guard = self.conn.lock().expect("connection poisoned");
         let mut stmt = guard
-            .prepare("SELECT name, module, line FROM imports WHERE path = ?1 ORDER BY line")
+            .prepare("SELECT name, module, depth, line FROM imports WHERE path = ?1 ORDER BY line")
             .expect("prepare imports_in_file");
         let rows = stmt
             .query_map(params![path], |row| {
                 Ok(Import {
                     name: row.get(0)?,
                     path: split_module(&row.get::<_, String>(1)?),
-                    line: row.get::<_, i64>(2)? as usize,
+                    depth: row.get::<_, i64>(2)? as usize,
+                    line: row.get::<_, i64>(3)? as usize,
                 })
             })
             .expect("query imports_in_file");

@@ -140,7 +140,7 @@ pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<Resolved
                 (def_paths.iter().next().cloned(), Resolution::UniqueGlobal)
             } else if let Some(path) = imports_by_path
                 .get(&located.path)
-                .and_then(|imports| imported_target(imports, name, &def_paths))
+                .and_then(|imports| imported_target(imports, name, &located.path, &def_paths))
             {
                 (Some(path), Resolution::Imported)
             } else {
@@ -165,17 +165,94 @@ pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<Resolved
 fn imported_target(
     imports: &[Import],
     name: &str,
+    from_path: &str,
     candidates: &BTreeSet<String>,
 ) -> Option<String> {
     let import = imports.iter().find(|i| i.name == name)?;
-    if import.path.is_empty() {
+
+    let matched: Vec<&str> = if import.depth > 0 {
+        // A relative import needs no project root: count dots up from the
+        // referencing file's own package and the answer is a path (#261).
+        let anchor = relative_anchor(from_path, import.depth, &import.path)?;
+        candidates
+            .iter()
+            .filter(|path| path_under(path, &anchor))
+            .map(String::as_str)
+            .collect()
+    } else {
+        if import.path.is_empty() {
+            return None;
+        }
+        candidates
+            .iter()
+            .filter(|path| path_ends_with_module(path, &import.path))
+            .map(String::as_str)
+            .collect()
+    };
+
+    match matched.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
+        // Several identical copies of one package tree — one per assignment,
+        // a vendored reference beside your own code. The nearest is meant.
+        several => nearest_to(several, from_path),
+    }
+}
+
+/// The directory a relative import points at: the referencing file's own
+/// package, one level up per dot beyond the first, then the module segments.
+///
+/// `None` when the path has fewer levels than the import claims, which leaves
+/// the older rules to run unchanged rather than dropping the edge.
+fn relative_anchor(from_path: &str, depth: usize, module: &[String]) -> Option<Vec<String>> {
+    let mut components: Vec<&str> = from_path.split('/').filter(|c| !c.is_empty()).collect();
+    components.pop()?; // the file itself; what remains is its package
+    for _ in 1..depth {
+        components.pop()?;
+    }
+    let mut anchor: Vec<String> = components.into_iter().map(str::to_string).collect();
+    anchor.extend(module.iter().cloned());
+    Some(anchor)
+}
+
+/// Whether `file` sits at or under the package directory `anchor`.
+fn path_under(file: &str, anchor: &[String]) -> bool {
+    let mut components: Vec<&str> = file.split('/').filter(|c| !c.is_empty()).collect();
+    if let Some(last) = components.pop() {
+        let stem = last.rsplit_once('.').map_or(last, |(stem, _)| stem);
+        // `pkg/__init__.py` *is* `pkg`, so it adds no segment of its own.
+        if stem != "__init__" {
+            components.push(stem);
+        }
+    }
+    components.len() >= anchor.len()
+        && components
+            .iter()
+            .zip(anchor)
+            .all(|(component, segment)| same_segment(component, segment))
+}
+
+/// The one candidate sharing the longest path prefix with `from_path`.
+///
+/// `None` on a tie, and `None` when nothing shares a prefix at all: two copies
+/// equally far away say nothing about which was meant, and guessing there is
+/// the coin flip this whole layer exists to avoid.
+fn nearest_to(candidates: &[&str], from_path: &str) -> Option<String> {
+    let from: Vec<&str> = from_path.split('/').filter(|c| !c.is_empty()).collect();
+    let shared = |path: &str| {
+        path.split('/')
+            .filter(|c| !c.is_empty())
+            .zip(from.iter())
+            .take_while(|(component, own)| same_segment(component, own))
+            .count()
+    };
+    let best = candidates.iter().map(|path| shared(path)).max()?;
+    if best == 0 {
         return None;
     }
-    let mut matched = candidates
-        .iter()
-        .filter(|path| path_ends_with_module(path, &import.path));
-    let only = matched.next()?;
-    matched.next().is_none().then(|| only.clone())
+    let mut winners = candidates.iter().filter(|path| shared(path) == best);
+    let only = winners.next()?;
+    winners.next().is_none().then(|| (*only).to_string())
 }
 
 /// Whether `file`'s path components end with the module segments `module`.
@@ -1006,5 +1083,122 @@ mod tests {
             .find(|r| r.reference.item.from.as_deref() == Some("caller"))
             .expect("call recorded");
         assert_eq!(r.target.as_deref(), Some("my-pkg/src/model.rs"));
+    }
+
+    // ---- anchored and local imports (#261) --------------------------------
+
+    fn py(src: &str) -> crate::CodeGraph {
+        crate::build(crate::Language::Python, src)
+    }
+
+    fn java(src: &str) -> crate::CodeGraph {
+        crate::build(crate::Language::Java, src)
+    }
+
+    fn resolved_from(s: &InMemoryGraphStore, name: &str, caller: &str) -> ResolvedReference {
+        resolve_references_to(s, name)
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some(caller))
+            .expect("call recorded")
+    }
+
+    #[test]
+    fn a_relative_import_anchors_to_the_referencing_package() {
+        // The CS-5260 shape: a vendored reference copy beside your own tree, so
+        // the same module path exists twice and a bare suffix match hits both.
+        // `from ..DataTypes import Action` means *my* parent package's copy.
+        let mut s = InMemoryGraphStore::new();
+        s.insert(
+            "ReferenceCode/src/cs5260/DataTypes/Action.py",
+            py("def Action():\n    pass\n"),
+        );
+        s.insert(
+            "WorldTraderSim/src/WorldTraderSim/DataTypes/Action.py",
+            py("def Action():\n    pass\n"),
+        );
+        s.insert(
+            "ReferenceCode/src/cs5260/Examples/HW2_1.py",
+            py("from ..DataTypes import Action\ndef run():\n    Action()\n"),
+        );
+
+        let r = resolved_from(&s, "Action", "run");
+        assert_eq!(r.resolution, Resolution::Imported);
+        assert_eq!(
+            r.target.as_deref(),
+            Some("ReferenceCode/src/cs5260/DataTypes/Action.py")
+        );
+    }
+
+    #[test]
+    fn a_single_dot_import_anchors_to_the_files_own_package() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a/pkg/util.py", py("def helper():\n    pass\n"));
+        s.insert("b/pkg/util.py", py("def helper():\n    pass\n"));
+        s.insert(
+            "a/pkg/main.py",
+            py("from .util import helper\ndef run():\n    helper()\n"),
+        );
+
+        let r = resolved_from(&s, "helper", "run");
+        assert_eq!(r.target.as_deref(), Some("a/pkg/util.py"));
+    }
+
+    #[test]
+    fn an_absolute_import_matching_several_copies_prefers_the_nearest() {
+        // The Vanderbilt course shape: one package tree per assignment, so an
+        // absolute import matches every copy. The one in the referencing file's
+        // own tree is what it means.
+        let mut s = InMemoryGraphStore::new();
+        for tree in ["assignment1", "assignment2"] {
+            s.insert(
+                &format!("{tree}/src/main/java/edu/vandy/util/Helper.java"),
+                java("class Helper { static void go() {} }"),
+            );
+        }
+        s.insert(
+            "assignment2/src/main/java/edu/vandy/app/Main.java",
+            java("import static edu.vandy.util.Helper.go;\nclass Main { void run() { go(); } }"),
+        );
+
+        let r = resolved_from(&s, "go", "run");
+        assert_eq!(r.resolution, Resolution::Imported);
+        assert_eq!(
+            r.target.as_deref(),
+            Some("assignment2/src/main/java/edu/vandy/util/Helper.java")
+        );
+    }
+
+    #[test]
+    fn two_equally_near_copies_stay_ambiguous() {
+        // Nothing distinguishes them, so picking one would be a coin flip.
+        let mut s = InMemoryGraphStore::new();
+        for tree in ["one", "two"] {
+            s.insert(
+                &format!("{tree}/src/main/java/edu/vandy/util/Helper.java"),
+                java("class Helper { static void go() {} }"),
+            );
+        }
+        s.insert(
+            "apps/src/main/java/edu/vandy/app/Main.java",
+            java("import static edu.vandy.util.Helper.go;\nclass Main { void run() { go(); } }"),
+        );
+
+        let r = resolved_from(&s, "go", "run");
+        assert_eq!(r.resolution, Resolution::Ambiguous);
+        assert_eq!(r.target, None);
+    }
+
+    #[test]
+    fn a_relative_import_that_anchors_nowhere_falls_through() {
+        // More dots than the path has levels: the anchor cannot be computed, so
+        // the older rules run unchanged rather than the edge being dropped.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("util.py", py("def helper():\n    pass\n"));
+        s.insert(
+            "main.py",
+            py("from ...deep import helper\ndef run():\n    helper()\n"),
+        );
+        let r = resolved_from(&s, "helper", "run");
+        assert_eq!(r.resolution, Resolution::UniqueGlobal);
     }
 }
