@@ -250,6 +250,16 @@ same-named project function
 ([#223](https://github.com/caliban-ai/gonzalo/issues/223)). Treat the closure as a lead
 list and confirm the load-bearing edges with `callers`.
 
+**Imports narrow an otherwise ambiguous name.** When several files define a name and
+the calling file has none of them, gonzalo consults that file's imports: `use
+crate::model::make` prefers the `make` under `model.rs`
+([#252](https://github.com/caliban-ai/gonzalo/issues/252)). This is lexical, not a
+resolved module path — an import says which *module* a name came from, and that module
+name almost always appears in its own file's path. If the import fits several candidates
+the reference stays ambiguous, so this only ever narrows. Recorded for Rust, Python,
+JavaScript and TypeScript; a glob import contributes nothing, since it introduces names
+the file never spells out.
+
 **A method call is attributed when the body says what the receiver is.** `b.get()`
 resolves to `Beta`'s `get` when `b` came from `Beta::new()`, a `Beta { .. }` literal, or
 a parameter written `b: Beta` / `&Beta`, and `self.foo()` takes the enclosing `impl`

@@ -24,9 +24,9 @@
 //! what would let a module path be told from a type — at which point an
 //! unmatched qualifier could decline rather than fall through (#252).
 
-use crate::{GraphStore, Located, RefKind, Reference};
+use crate::{GraphStore, Import, Located, RefKind, Reference};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How a reference was resolved to a definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,9 @@ pub enum Resolution {
     Local,
     /// The name is defined exactly once across the view.
     UniqueGlobal,
+    /// Several definitions, none local, and the referencing file imports the
+    /// name from a module that exactly one of them lives under (#252).
+    Imported,
     /// Several definitions and none in the reference's file — not resolved.
     Ambiguous,
     /// A method call (`x.foo()`) whose receiver type is unknown, so no
@@ -71,9 +74,21 @@ pub struct ResolvedReference {
 pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<ResolvedReference> {
     let defs = store.definitions(name);
     let def_paths: BTreeSet<String> = defs.iter().map(|d| d.path.clone()).collect();
+    let references = store.references_to(name);
 
-    store
-        .references_to(name)
+    // Imports only matter where the name is ambiguous, and only for the files
+    // that actually reference it — so fetch once per such file rather than once
+    // per call site (#252).
+    let mut imports_by_path: BTreeMap<String, Vec<Import>> = BTreeMap::new();
+    if def_paths.len() > 1 {
+        for located in &references {
+            if !imports_by_path.contains_key(&located.path) {
+                imports_by_path.insert(located.path.clone(), store.imports_in_file(&located.path));
+            }
+        }
+    }
+
+    references
         .into_iter()
         .map(|located| {
             // A call that names its owner (`Beta::get()`) says which definition
@@ -123,6 +138,11 @@ pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<Resolved
                 (None, Resolution::ReceiverUnknown)
             } else if def_paths.len() == 1 {
                 (def_paths.iter().next().cloned(), Resolution::UniqueGlobal)
+            } else if let Some(path) = imports_by_path
+                .get(&located.path)
+                .and_then(|imports| imported_target(imports, name, &def_paths))
+            {
+                (Some(path), Resolution::Imported)
             } else {
                 (None, Resolution::Ambiguous)
             };
@@ -133,6 +153,67 @@ pub fn resolve_references_to(store: &dyn GraphStore, name: &str) -> Vec<Resolved
             }
         })
         .collect()
+}
+
+/// The single candidate an import in the referencing file points at, or `None`
+/// when the file imports the name from nowhere or the import fits several
+/// candidates.
+///
+/// Narrowing only: an import that does not settle the question is ignored and
+/// the reference stays ambiguous, which is the honest answer and keeps this from
+/// ever turning a resolved edge into an unresolved one (#248, #252).
+fn imported_target(
+    imports: &[Import],
+    name: &str,
+    candidates: &BTreeSet<String>,
+) -> Option<String> {
+    let import = imports.iter().find(|i| i.name == name)?;
+    if import.path.is_empty() {
+        return None;
+    }
+    let mut matched = candidates
+        .iter()
+        .filter(|path| path_ends_with_module(path, &import.path));
+    let only = matched.next()?;
+    matched.next().is_none().then(|| only.clone())
+}
+
+/// Whether `file`'s path components end with the module segments `module`.
+///
+/// `src/model.rs` ends with `["model"]`; `a/b/c.rs` ends with `["b", "c"]`.
+///
+/// Three conventions are folded in because they are near-universal and the rule
+/// is close to useless without them. An entry file names its container rather
+/// than itself, so `mod.rs`, `lib.rs`, `main.rs`, `__init__.py` and `index.ts`
+/// contribute no segment of their own. A `src` directory is build layout rather
+/// than a module, so it is skipped — `my-pkg/src/model.rs` is `my_pkg::model`.
+/// And segments compare with `-` and `_` alike, because a Rust crate is written
+/// `gonzalo_cli` in code and lives in `gonzalo-cli` on disk.
+fn path_ends_with_module(file: &str, module: &[String]) -> bool {
+    let mut components: Vec<&str> = file
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != "src")
+        .collect();
+    if let Some(last) = components.pop() {
+        let stem = last.rsplit_once('.').map_or(last, |(stem, _)| stem);
+        if !matches!(stem, "mod" | "lib" | "main" | "__init__" | "index") {
+            components.push(stem);
+        }
+    }
+    components.len() >= module.len()
+        && components[components.len() - module.len()..]
+            .iter()
+            .zip(module)
+            .all(|(component, segment)| same_segment(component, segment))
+}
+
+/// Whether two path segments name the same thing, treating `-` and `_` alike.
+fn same_segment(component: &str, segment: &str) -> bool {
+    component.len() == segment.len()
+        && component
+            .bytes()
+            .zip(segment.bytes())
+            .all(|(a, b)| a == b || (a == b'-' || a == b'_') && (b == b'-' || b == b'_'))
 }
 
 /// Enclosing functions that call the `name` **defined at `defining_path`** — the
@@ -788,5 +869,142 @@ mod tests {
         // A method call on a receiver typed outside the view is exactly the
         // #223 case: one same-named project function must not be credited.
         assert_eq!(r.resolution, Resolution::ReceiverUnknown);
+    }
+
+    // ---- import-aware resolution (#252) -----------------------------------
+
+    /// Two files define `make`; a third calls it, importing one of them.
+    fn two_makes(caller_file: &str, caller_src: &str) -> InMemoryGraphStore {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("src/model.rs", build_rust("fn make() {}"));
+        s.insert("src/other.rs", build_rust("fn make() {}"));
+        s.insert(caller_file, build_rust(caller_src));
+        s
+    }
+
+    #[test]
+    fn an_import_picks_the_module_it_names() {
+        let s = two_makes(
+            "src/app.rs",
+            "use crate::model::make;\nfn caller() { make(); }",
+        );
+        let r = resolve_references_to(&s, "make")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Imported);
+        assert_eq!(r.target.as_deref(), Some("src/model.rs"));
+    }
+
+    #[test]
+    fn without_the_import_the_same_call_stays_ambiguous() {
+        // The control: nothing else about this view changed.
+        let s = two_makes("src/app.rs", "fn caller() { make(); }");
+        let r = resolve_references_to(&s, "make")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Ambiguous);
+    }
+
+    #[test]
+    fn an_import_that_does_not_narrow_falls_through() {
+        // Two `model.rs` under different crates: the import names a module both
+        // could be, so the honest answer is still ambiguous rather than a coin
+        // flip. The rule only ever narrows (#248).
+        let mut s = InMemoryGraphStore::new();
+        s.insert("a/src/model.rs", build_rust("fn make() {}"));
+        s.insert("b/src/model.rs", build_rust("fn make() {}"));
+        s.insert(
+            "c/src/app.rs",
+            build_rust("use crate::model::make;\nfn caller() { make(); }"),
+        );
+        let r = resolve_references_to(&s, "make")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Ambiguous);
+        assert_eq!(r.target, None);
+    }
+
+    #[test]
+    fn an_import_matches_a_module_directory_through_mod_rs() {
+        // `model/mod.rs` *is* the module `model`; the filename is not a segment.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("src/model/mod.rs", build_rust("fn make() {}"));
+        s.insert("src/other.rs", build_rust("fn make() {}"));
+        s.insert(
+            "src/app.rs",
+            build_rust("use crate::model::make;\nfn caller() { make(); }"),
+        );
+        let r = resolve_references_to(&s, "make")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.target.as_deref(), Some("src/model/mod.rs"));
+    }
+
+    #[test]
+    fn a_unique_global_still_resolves_without_consulting_imports() {
+        // Imports are only consulted where the ladder would otherwise give up,
+        // so nothing that resolves today changes.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("src/model.rs", build_rust("fn only() {}"));
+        s.insert("src/app.rs", build_rust("fn caller() { only(); }"));
+        let r = resolve_references_to(&s, "only")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::UniqueGlobal);
+    }
+
+    #[test]
+    fn resolved_impact_follows_an_imported_edge() {
+        let s = two_makes(
+            "src/app.rs",
+            "use crate::model::make;\nfn caller() { make(); }",
+        );
+        let report = resolved_impact(&s, "make", None);
+        assert!(names_of(&report).contains(&"caller"), "{report:?}");
+    }
+
+    #[test]
+    fn an_import_of_a_crate_root_matches_the_crate_directory() {
+        // Measured on gonzalo itself: `use gonzalo_cli::list` in
+        // `crates/gonzalo-cli/src/main.rs` names the *crate*, whose root is
+        // `crates/gonzalo-cli/src/lib.rs`. Neither `lib` nor `src` is a module,
+        // and Rust writes the crate name with `_` where the directory has `-`.
+        let mut s = InMemoryGraphStore::new();
+        s.insert("crates/gonzalo-cli/src/lib.rs", build_rust("fn list() {}"));
+        s.insert(
+            "crates/gonzalo-graph/src/store.rs",
+            build_rust("fn list() {}"),
+        );
+        s.insert(
+            "crates/gonzalo-cli/src/main.rs",
+            build_rust("use gonzalo_cli::list;\nfn caller() { list(); }"),
+        );
+        let r = resolve_references_to(&s, "list")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.resolution, Resolution::Imported);
+        assert_eq!(r.target.as_deref(), Some("crates/gonzalo-cli/src/lib.rs"));
+    }
+
+    #[test]
+    fn a_hyphenated_directory_matches_an_underscored_module() {
+        let mut s = InMemoryGraphStore::new();
+        s.insert("my-pkg/src/model.rs", build_rust("fn make() {}"));
+        s.insert("other/src/model.rs", build_rust("fn make() {}"));
+        s.insert(
+            "app.rs",
+            build_rust("use my_pkg::model::make;\nfn caller() { make(); }"),
+        );
+        let r = resolve_references_to(&s, "make")
+            .into_iter()
+            .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+            .expect("call recorded");
+        assert_eq!(r.target.as_deref(), Some("my-pkg/src/model.rs"));
     }
 }
