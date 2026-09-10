@@ -11,6 +11,27 @@ the patch version for fixes.
 
 ### Changed
 
+- **Method calls are attributed when the body says what the receiver is.** A
+  call through a receiver of unknown type is deliberately not attributed,
+  because guessing was measurably wrong (#223) — but a large share of receivers
+  have a type written down a few lines up. Three purely syntactic shapes are now
+  read: a binding initialized from a constructor-style call, a binding
+  initialized from a struct literal, and a parameter with a written type,
+  including behind a reference. `self` takes the enclosing `impl`.
+
+  On gonzalo's own source 1043 of 6732 method references now carry a type, 437
+  of which name a type the view defines; `impact` on `insert` went from 60
+  symbols reached to 219, and its unattributed method edges fell from 368 to
+  274. `insert` is the seed that #248 could not move at all, because it is
+  reached almost entirely through `store.insert(..)`.
+
+  This is syntax, not inference, and the limits are deliberate: a receiver from
+  a plain call, a generic parameter, or a trait object still declines and is
+  still counted, because choosing an impl is the guess #223 removed. Bindings
+  are scoped to the function body they appear in. Rust only for now; every other
+  language records no receiver type and behaves exactly as before.
+  `EXTRACTION_VERSION` is 5, so each view re-walks once on upgrade. (#251)
+
 - **`callers` and `callees` now report how ambiguous the queried name is.** Both
   are raw name matches, so a name defined in several places returns the merged
   answer for all of them — and a bare list said nothing about that, which is the
