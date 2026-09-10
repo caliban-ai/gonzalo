@@ -16,8 +16,8 @@
 /// named as values (#250); 5 = syntactic receiver types on method calls (#251);
 /// 6 = per-file imports (#252); 7 = Java/Kotlin imports (#260); 8 = JS/TS
 /// functions bound through a higher-order call, and object properties (#257);
-/// 9 = relative-import depth (#261).
-pub const EXTRACTION_VERSION: u32 = 9;
+/// 9 = relative-import depth (#261); 10 = `.h` headers parsed as C++ (#266).
+pub const EXTRACTION_VERSION: u32 = 10;
 
 pub mod assembly;
 pub mod builder;

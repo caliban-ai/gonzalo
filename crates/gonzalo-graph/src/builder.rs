@@ -46,8 +46,15 @@ impl Language {
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
             "cs" => Some(Self::CSharp),
-            "c" | "h" => Some(Self::C),
-            "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some(Self::Cpp),
+            "c" => Some(Self::C),
+            // `.h` is the conventional header extension for C++ as much as for
+            // C, and the C grammar mis-parses C++ rather than failing: `enum
+            // class Color` recorded `Color` as a function and invented a symbol
+            // named `class`. C++ is a near superset and the two agree on plain
+            // C — pinned by
+            // [`a_pure_c_header_extracts_the_same_symbols_under_either_grammar`]
+            // — so a header goes through the wider grammar (#266).
+            "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some(Self::Cpp),
             "rb" => Some(Self::Ruby),
             "php" => Some(Self::Php),
             "sh" | "bash" => Some(Self::Bash),
@@ -1758,7 +1765,8 @@ def main():
         assert_eq!(Language::from_extension("java"), Some(Language::Java));
         assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
         assert_eq!(Language::from_extension("c"), Some(Language::C));
-        assert_eq!(Language::from_extension("h"), Some(Language::C));
+        // A header goes through the wider grammar; see #266.
+        assert_eq!(Language::from_extension("h"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("cc"), Some(Language::Cpp));
         assert_eq!(Language::from_extension("cxx"), Some(Language::Cpp));
@@ -3221,5 +3229,103 @@ object Config
         let g = build(Language::Python, "from pkg import D\n");
         let json = serde_json::to_string(&g).expect("serialize");
         assert!(!json.contains("depth"), "{json}");
+    }
+
+    // ---- .h headers are C++ too (#266) -------------------------------------
+
+    /// `(name, kind)` for every symbol in `src` under `language`.
+    fn symbols_of(language: Language, src: &str) -> Vec<(String, SymbolKind)> {
+        let mut out: Vec<(String, SymbolKind)> = build(language, src)
+            .symbols
+            .iter()
+            .map(|s| (s.name.clone(), s.kind))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+        out
+    }
+
+    #[test]
+    fn a_h_file_is_parsed_as_cpp() {
+        assert_eq!(Language::from_extension("h"), Some(Language::Cpp));
+    }
+
+    #[test]
+    fn a_scoped_enum_in_a_header_records_its_own_name() {
+        // The bug, pinned: under the C grammar `enum class Color` recorded
+        // `Color` as a *function* and invented a symbol named `class`. On a
+        // real C++ project that produced 372 symbols called `class` across 133
+        // files (#266).
+        let header = Language::from_extension("h").expect("h is a source extension");
+        let symbols = symbols_of(header, "enum class Color { Red, Green };");
+        assert_eq!(symbols, vec![("Color".to_string(), SymbolKind::Enum)]);
+    }
+
+    #[test]
+    fn a_header_records_no_keyword_shaped_symbols() {
+        let header = Language::from_extension("h").expect("h is a source extension");
+        let symbols = symbols_of(
+            header,
+            "enum class A {};\nenum struct B { x };\nenum class C : unsigned char { y };",
+        );
+        let names: Vec<&str> = symbols.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| matches!(*n, "class" | "struct" | "namespace" | "template")),
+            "{names:?}"
+        );
+        assert_eq!(names, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn cpp_declarations_in_a_header_record_their_real_names() {
+        let header = Language::from_extension("h").expect("h is a source extension");
+        let symbols = symbols_of(
+            header,
+            "namespace engine { class Widget { public: void go(); }; }",
+        );
+        let names: Vec<&str> = symbols.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"engine"), "{names:?}");
+        assert!(names.contains(&"Widget"), "{names:?}");
+    }
+
+    #[test]
+    fn a_pure_c_header_extracts_the_same_symbols_under_either_grammar() {
+        // The criterion that decides whether this fix is safe: C++ is a near
+        // superset, but "near" has to be evidence rather than assertion. If
+        // these ever diverge, the fix is to try C++ first and re-parse as C on
+        // a tree with errors.
+        let c_source = "\
+#include <stdio.h>
+typedef struct Point { int x; int y; } Point;
+enum Color { RED, GREEN };
+struct Opaque;
+static int helper(int n) { return n + 1; }
+int main(void) { return helper(1); }
+typedef int (*Callback)(void *ctx);
+";
+        assert_eq!(
+            symbols_of(Language::C, c_source),
+            symbols_of(Language::Cpp, c_source),
+            "the two grammars must agree on plain C"
+        );
+    }
+
+    #[test]
+    fn a_pure_c_header_records_the_same_references_under_either_grammar() {
+        let c_source = "\
+static int helper(int n) { return n + 1; }
+int main(void) { return helper(1) + abs(-2); }
+";
+        let names = |language| {
+            let mut out: Vec<String> = build(language, c_source)
+                .references
+                .iter()
+                .map(|r| format!("{}:{:?}", r.name, r.kind))
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(names(Language::C), names(Language::Cpp));
     }
 }

@@ -11,6 +11,36 @@ the patch version for fixes.
 
 ### Fixed
 
+- **`.h` headers are parsed as C++, not C.** `.h` is the conventional header
+  extension for C++ as much as for C, and the C grammar mis-parses C++ rather
+  than failing: `enum class Color { Red };` recorded `Color` as a *function* and
+  invented a symbol literally named `class`.
+
+  Found by indexing a real C++ project (2017 files):
+
+  | | before | after |
+  |---|---|---|
+  | symbols extracted | 82331 | 88385 |
+  | symbols from `.h` files | 22951 | 29005 |
+  | symbols named `class` | 372 | 0 |
+  | keyword-shaped names in total | 470 | 26 |
+
+  Those 372 were spread across 133 files and outranked every genuine symbol in
+  the ambiguity ranking. The 6054 new symbols are the real classes, namespaces
+  and scoped enums those headers declare — which for a C++ project is where its
+  types and interfaces actually live.
+
+  Safe because the two grammars agree on plain C, which is now pinned by a test
+  comparing symbol *and* reference extraction under both rather than asserted.
+  The residual 26 keyword-shaped names come from `inline namespace` inside a
+  `#define` body, a preprocessor limitation gonzalo already documents.
+
+  One caveat worth stating: a 13843-line generated header in that project parses
+  under the C grammar and aborts tree-sitter-cpp. Crash isolation handled it
+  exactly as designed — the worker died, the pool respawned, one file of 2017
+  was skipped and indexing continued. `.h` files also now report as `cpp` rather
+  than `c` in `overview`'s language breakdown. `EXTRACTION_VERSION` is 10. (#266)
+
 - **Indexing a tree gonzalo cannot parse now says so.** A file whose extension
   names no known language was dropped uncounted — not in `files`, not in
   `skipped`, not in `ignored` — so a repository gonzalo could not read reported
