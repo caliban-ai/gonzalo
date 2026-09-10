@@ -194,6 +194,11 @@ pub struct CodeGraph {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Import {
     /// The name as this file will write it — the alias when there is one.
+    ///
+    /// **Empty** when the import brings in a whole file rather than one name: a
+    /// C/C++ `#include` names a path, not a symbol (#267). Test that with
+    /// [`brings_whole_file`](Self::brings_whole_file) rather than comparing
+    /// against the empty string, so the intent is visible at the call site.
     pub name: String,
     /// The module path segments before the name, outermost first.
     pub path: Vec<String>,
@@ -210,6 +215,17 @@ pub struct Import {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub depth: usize,
     pub line: usize,
+}
+
+impl Import {
+    /// Whether this import brings in a whole file rather than one name.
+    ///
+    /// A `#include` names a path — every declaration in that file becomes
+    /// visible — so it has no single name to key on the way every other import
+    /// does. Resolution matches it by path instead (#267).
+    pub fn brings_whole_file(&self) -> bool {
+        self.name.is_empty()
+    }
 }
 
 /// Whether a count is zero, for `skip_serializing_if`.
