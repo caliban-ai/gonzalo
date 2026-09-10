@@ -4,7 +4,7 @@
 //! Scala, and Elixir are supported, and a new grammar is a matter of adding its
 //! node-kind mappings.
 
-use crate::model::{CodeGraph, RefKind, Reference, Symbol, SymbolKind};
+use crate::model::{CodeGraph, Import, RefKind, Reference, Symbol, SymbolKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
@@ -395,6 +395,63 @@ impl Language {
         callee
             .child_by_field_name(scope_field)
             .and_then(|n| trailing_path_segment(n, bytes))
+    }
+
+    /// Names `node` brings into this file's scope, if it is an import node.
+    ///
+    /// Recorded as a lexical signal rather than a resolved path: an import says
+    /// which *module* a name came from, which is enough to prefer one candidate
+    /// definition over another without knowing where a crate root is — and so
+    /// without extraction reading any file but this one (ADR 0012, #252).
+    ///
+    /// Rust, Python, JavaScript and TypeScript. Every other language records
+    /// nothing and resolves exactly as it did.
+    fn imports_at(self, node: Node<'_>, bytes: &[u8]) -> Vec<Import> {
+        let line = node.start_position().row + 1;
+        let mut out = Vec::new();
+        match self {
+            Self::Rust if node.kind() == "use_declaration" => {
+                if let Some(argument) = node.child_by_field_name("argument") {
+                    collect_rust_uses(argument, bytes, &[], &mut out);
+                }
+            }
+            // `from pkg.model import Symbol [as Other]`. A plain
+            // `import pkg.model` binds `pkg`, which names no symbol, so it is
+            // left alone.
+            Self::Python if node.kind() == "import_from_statement" => {
+                let path = node
+                    .child_by_field_name("module_name")
+                    .map(|m| python_module_segments(m, bytes))
+                    .unwrap_or_default();
+                let mut cursor = node.walk();
+                for child in node.children_by_field_name("name", &mut cursor) {
+                    let name = match child.kind() {
+                        "aliased_import" => child.child_by_field_name("alias"),
+                        _ => Some(child),
+                    }
+                    .and_then(|n| node_text(n, bytes));
+                    if let Some(name) = name {
+                        out.push(Import {
+                            name: name.to_string(),
+                            path: path.clone(),
+                            line,
+                        });
+                    }
+                }
+            }
+            Self::JavaScript | Self::TypeScript | Self::Tsx
+                if node.kind() == "import_statement" =>
+            {
+                let path = node
+                    .child_by_field_name("source")
+                    .and_then(|s| node_text(s, bytes))
+                    .map(js_module_segments)
+                    .unwrap_or_default();
+                collect_js_import_names(node, bytes, &path, line, &mut out);
+            }
+            _ => {}
+        }
+        out
     }
 
     /// Bare names appearing in a call's argument list, as `(name, line)` —
@@ -846,6 +903,177 @@ fn name_field(node: Node<'_>, bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Local names a JS/TS import clause binds, under module path `path`.
+fn collect_js_import_names(
+    node: Node<'_>,
+    bytes: &[u8],
+    path: &[String],
+    line: usize,
+    out: &mut Vec<Import>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            // `import { A, B as C } from '...'` — the specifier's alias wins.
+            "import_specifier" => {
+                let name = child
+                    .child_by_field_name("alias")
+                    .or_else(|| child.child_by_field_name("name"))
+                    .and_then(|n| node_text(n, bytes));
+                if let Some(name) = name {
+                    out.push(Import {
+                        name: name.to_string(),
+                        path: path.to_vec(),
+                        line,
+                    });
+                }
+            }
+            // `import Default from '...'`.
+            "identifier" => {
+                if let Some(name) = node_text(child, bytes) {
+                    out.push(Import {
+                        name: name.to_string(),
+                        path: path.to_vec(),
+                        line,
+                    });
+                }
+            }
+            // `import_clause`, `named_imports` — containers; look inside.
+            "import_clause" | "named_imports" => {
+                collect_js_import_names(child, bytes, path, line, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The module segments a Rust path node names, with relative markers dropped:
+/// `crate::model` is `["model"]`, `a::b` is `["a", "b"]`.
+fn rust_path_segments(node: Node<'_>, bytes: &[u8]) -> Vec<String> {
+    match node.kind() {
+        "scoped_identifier" => {
+            let mut segments = node
+                .child_by_field_name("path")
+                .map(|p| rust_path_segments(p, bytes))
+                .unwrap_or_default();
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| node_text(n, bytes))
+            {
+                segments.push(name.to_string());
+            }
+            segments
+        }
+        // Relative markers position the path; they name no module (#252).
+        "crate" | "self" | "super" => Vec::new(),
+        _ => node_text(node, bytes)
+            .filter(|t| !t.contains(':'))
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+/// Names a Rust `use` tree brings into scope, under `prefix`.
+///
+/// A glob (`use a::*`) contributes nothing: it introduces names this file never
+/// spells out, so there is no name to key on.
+fn collect_rust_uses(node: Node<'_>, bytes: &[u8], prefix: &[String], out: &mut Vec<Import>) {
+    let line = node.start_position().row + 1;
+    match node.kind() {
+        "scoped_identifier" => {
+            let mut segments = rust_path_segments(node, bytes);
+            if let Some(name) = segments.pop() {
+                let mut path = prefix.to_vec();
+                path.append(&mut segments);
+                out.push(Import { name, path, line });
+            }
+        }
+        "use_as_clause" => {
+            let Some(alias) = node
+                .child_by_field_name("alias")
+                .and_then(|n| node_text(n, bytes))
+            else {
+                return;
+            };
+            let mut segments = node
+                .child_by_field_name("path")
+                .map(|p| rust_path_segments(p, bytes))
+                .unwrap_or_default();
+            segments.pop(); // the original name; the alias replaces it
+            let mut path = prefix.to_vec();
+            path.append(&mut segments);
+            out.push(Import {
+                name: alias.to_string(),
+                path,
+                line,
+            });
+        }
+        "scoped_use_list" => {
+            let mut path = prefix.to_vec();
+            if let Some(inner) = node.child_by_field_name("path") {
+                path.extend(rust_path_segments(inner, bytes));
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_rust_uses(list, bytes, &path, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_rust_uses(child, bytes, prefix, out);
+            }
+        }
+        "use_wildcard" => {}
+        // A bare `use foo;`.
+        "identifier" => {
+            if let Some(name) = node_text(node, bytes) {
+                out.push(Import {
+                    name: name.to_string(),
+                    path: prefix.to_vec(),
+                    line,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The module segments a Python dotted name or relative import names.
+fn python_module_segments(node: Node<'_>, bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                if let Some(text) = node_text(child, bytes) {
+                    out.push(text.to_string());
+                }
+            }
+            // `from .model import X` nests the dotted name under the relative
+            // import; the leading dots are a marker, not a module.
+            "dotted_name" => out.extend(python_module_segments(child, bytes)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The module segments a JS/TS import source string names: `'./model'` is
+/// `["model"]`, `'pkg/sub/model.js'` is `["pkg", "sub", "model"]`.
+///
+/// A bare `@` is a tsconfig path alias rooted at the project (`@/lib/utils`),
+/// so like `.` and `..` it positions the path rather than naming a directory.
+/// A *scoped package* leads with `@scope`, which is a real name and survives.
+fn js_module_segments(raw: &str) -> Vec<String> {
+    raw.trim_matches(|c| c == '\'' || c == '"' || c == '`')
+        .split('/')
+        .filter(|part| !matches!(*part, "" | "." | ".." | "@" | "~"))
+        .map(|part| part.rsplit_once('.').map_or(part, |(stem, _)| stem))
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The base type a Rust type node names, or `None` when it needs inference:
 /// `Widget` for `Widget`, `&Widget`, `&mut Widget` and `a::b::Widget`, `Vec` for
 /// `Vec<T>`. `impl Trait`, `dyn Trait` and tuples yield nothing (#251).
@@ -1078,6 +1306,11 @@ fn walk(
                 RefKind::Free => language.callee_qualifier(node, bytes),
             },
         });
+    }
+
+    // Names this file brings into scope (#252).
+    for import in language.imports_at(node, bytes) {
+        graph.imports.push(import);
     }
 
     // Names handed to a call as values rather than called — `and_then(helper)`
@@ -2465,5 +2698,122 @@ object Config
             .find(|r| r.name == "get")
             .expect("call recorded");
         assert_eq!(r.qualifier, None);
+    }
+
+    // ---- imports (#252) ---------------------------------------------------
+
+    /// `(name, path)` for every import in `src`.
+    fn imports_of(language: Language, src: &str) -> Vec<(String, Vec<String>)> {
+        build(language, src)
+            .imports
+            .iter()
+            .map(|i| (i.name.clone(), i.path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn rust_records_a_simple_use_declaration() {
+        let imports = imports_of(Language::Rust, "use crate::model::Symbol;");
+        assert_eq!(
+            imports,
+            vec![("Symbol".to_string(), vec!["model".to_string()])],
+            "`crate` is a relative marker, not a path component"
+        );
+    }
+
+    #[test]
+    fn rust_records_each_name_in_a_use_list() {
+        let imports = imports_of(Language::Rust, "use a::b::{C, D};");
+        assert_eq!(
+            imports,
+            vec![
+                ("C".to_string(), vec!["a".to_string(), "b".to_string()]),
+                ("D".to_string(), vec!["a".to_string(), "b".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_records_an_aliased_import_under_its_local_name() {
+        // `as` renames it for this file, and the local name is what a reference
+        // in this file will be written as.
+        let imports = imports_of(Language::Rust, "use a::Thing as Other;");
+        assert_eq!(imports, vec![("Other".to_string(), vec!["a".to_string()])]);
+    }
+
+    #[test]
+    fn rust_records_nothing_for_a_glob_import() {
+        // `use a::*` brings in names the file never spells out, so there is no
+        // name to key on.
+        assert!(imports_of(Language::Rust, "use a::b::*;").is_empty());
+    }
+
+    #[test]
+    fn python_records_a_from_import() {
+        let imports = imports_of(Language::Python, "from pkg.model import Symbol\n");
+        assert_eq!(
+            imports,
+            vec![(
+                "Symbol".to_string(),
+                vec!["pkg".to_string(), "model".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn typescript_records_a_named_import() {
+        let imports = imports_of(Language::TypeScript, "import { Symbol } from './model';\n");
+        assert_eq!(
+            imports,
+            vec![("Symbol".to_string(), vec!["model".to_string()])],
+            "a leading `.` is a relative marker, not a path component"
+        );
+    }
+
+    #[test]
+    fn a_slice_with_no_imports_serializes_unchanged() {
+        let g = build_rust("fn helper() {}");
+        let json = serde_json::to_string(&g).expect("serialize");
+        assert!(!json.contains("imports"), "{json}");
+    }
+
+    #[test]
+    fn typescript_drops_a_bare_path_alias_segment() {
+        // Found by scanning a real Next.js app: `@/` is a tsconfig path alias
+        // rooted at the project, so it names no directory. Left in, it added a
+        // segment that could never match and the import matched nothing at all.
+        let imports = imports_of(
+            Language::TypeScript,
+            "import { resetDefaults } from '@/lib/redux/slices/colors';\n",
+        );
+        assert_eq!(
+            imports,
+            vec![(
+                "resetDefaults".to_string(),
+                vec![
+                    "lib".to_string(),
+                    "redux".to_string(),
+                    "slices".to_string(),
+                    "colors".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn typescript_keeps_a_scoped_package_name() {
+        // `@scope/pkg` is a package name, not an alias — only a *bare* `@` is
+        // the alias marker, so the scope survives.
+        let imports = imports_of(
+            Language::TypeScript,
+            "import { render } from '@testing-library/react';\n",
+        );
+        assert_eq!(
+            imports,
+            vec![(
+                "render".to_string(),
+                vec!["@testing-library".to_string(), "react".to_string()]
+            )]
+        );
     }
 }

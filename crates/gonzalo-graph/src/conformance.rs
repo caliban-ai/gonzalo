@@ -17,6 +17,7 @@ pub fn run_graph_store_conformance<S: GraphStore>(make: impl Fn() -> S) {
     enumerates_all_symbols_and_references(&mut seeded(&make));
     qualifier_and_owner_survive_a_round_trip(&mut seeded(&make));
     a_value_reference_is_stored_but_kept_out_of_the_call_graph(&mut seeded(&make));
+    imports_survive_a_round_trip_and_disambiguate(&mut seeded(&make));
     empty_store_answers_are_empty(&mut make());
 }
 
@@ -182,5 +183,38 @@ fn a_value_reference_is_stored_but_kept_out_of_the_call_graph<S: GraphStore>(s: 
     assert!(
         !dead.items.iter().any(|l| l.item.name == "handler"),
         "handler is referenced: {dead:?}"
+    );
+}
+
+/// A backend that drops imports leaves import-aware resolution quietly doing
+/// nothing while every other query still looks right — the exact shape of
+/// failure this suite exists to catch (#252).
+fn imports_survive_a_round_trip_and_disambiguate<S: GraphStore>(s: &mut S) {
+    s.insert("src/model.rs", build_rust("fn make() {}"));
+    s.insert("src/other.rs", build_rust("fn make() {}"));
+    s.insert(
+        "src/app.rs",
+        build_rust("use crate::model::make;\nfn caller() { make(); }"),
+    );
+
+    let imports = s.imports_in_file("src/app.rs");
+    assert_eq!(imports.len(), 1, "import persisted: {imports:?}");
+    assert_eq!(imports[0].name, "make");
+    assert_eq!(imports[0].path, vec!["model".to_string()]);
+    assert!(
+        s.imports_in_file("src/model.rs").is_empty(),
+        "a file with no imports has none"
+    );
+
+    // And the resolver can then tell the two `make`s apart.
+    let resolved = crate::resolve::resolve_references_to(s, "make");
+    let call = resolved
+        .iter()
+        .find(|r| r.reference.item.from.as_deref() == Some("caller"))
+        .expect("call recorded");
+    assert_eq!(
+        call.target.as_deref(),
+        Some("src/model.rs"),
+        "import must narrow the candidates: {call:?}"
     );
 }

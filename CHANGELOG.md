@@ -11,6 +11,48 @@ the patch version for fixes.
 
 ### Changed
 
+- **Imports narrow an otherwise ambiguous reference.** Resolution was file-scoped
+  and consulted nothing outside the calling file, so a name defined in several
+  places with none of them local was simply dropped — even when the file's own
+  imports named exactly one of them.
+
+  Each file's imports are now recorded and consulted at the point the ladder
+  would otherwise give up. `use crate::model::make` prefers the `make` under
+  `model.rs`. This is deliberately **lexical, not a resolved module path**:
+  resolving an import to a file needs the crate root, which means reading the
+  manifest and modelling the workspace, and extraction would then depend on
+  files other than the one being parsed (ADR 0012). An import says which
+  *module* a name came from, and a module's name almost always appears in its
+  own file's path, which is enough. Three layout conventions are folded in: an
+  entry file (`mod.rs`, `lib.rs`, `main.rs`, `__init__.py`, `index.ts`) names its
+  container rather than itself, a `src` directory is build layout rather than a
+  module, and `-` and `_` compare alike so a crate written `gonzalo_cli` matches
+  `gonzalo-cli` on disk.
+
+  It only ever narrows, following #248: when the import fits several candidates
+  the reference stays ambiguous, which is the honest answer, and nothing that
+  resolves today stops resolving.
+
+  Measured by indexing three real repositories — gonzalo itself, caliban, and a
+  Next.js app:
+
+  | repo | imports recorded | ambiguous refs whose file imports the name | now resolved |
+  |---|---|---|---|
+  | gonzalo | 1408 | 27 | 11 |
+  | caliban | 5803 | 68 | 45 |
+  | web-viz-next | 782 | 21 | 21 |
+
+  A bare `@` in a JS/TS import is a tsconfig path alias rooted at the project
+  (`@/lib/utils`), not a directory, and left in place it added a segment that
+  could never match — the Next.js app resolved 0 of 21 until it was dropped, and
+  21 of 21 after. A scoped package (`@testing-library/react`) leads with
+  `@scope`, which is a real name and survives.
+
+  Rust, Python, JavaScript and TypeScript. A glob import contributes nothing,
+  since it introduces names the file never spells out. `EXTRACTION_VERSION` is 6,
+  so each view re-walks once on upgrade, and the store gains an `imports` table.
+  (#252)
+
 - **Method calls are attributed when the body says what the receiver is.** A
   call through a receiver of unknown type is deliberately not attributed,
   because guessing was measurably wrong (#223) — but a large share of receivers

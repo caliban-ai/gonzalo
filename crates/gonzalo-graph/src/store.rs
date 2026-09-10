@@ -6,8 +6,8 @@
 
 use crate::builder::Language;
 use crate::model::{
-    CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, RefKind, Reference, Symbol,
-    SymbolFilter, SymbolKind, ViewOverview,
+    CodeGraph, FileSummary, Import, Located, Page, RankedSymbol, Ranking, RefKind, Reference,
+    Symbol, SymbolFilter, SymbolKind, ViewOverview,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -34,6 +34,12 @@ pub trait GraphStore: Send + Sync {
     fn definitions(&self, name: &str) -> Vec<Located<Symbol>>;
     /// References whose target name is `name`, each with its path.
     fn references_to(&self, name: &str) -> Vec<Located<Reference>>;
+    /// Names the slice at `path` brings into scope.
+    ///
+    /// Required rather than defaulted to empty on purpose: a backend that
+    /// silently returned nothing would leave import-aware resolution quietly
+    /// doing nothing while every other query looked right (#252).
+    fn imports_in_file(&self, path: &str) -> Vec<Import>;
     /// Distinct enclosing-function names that reference `name`.
     fn callers_of(&self, name: &str) -> Vec<String>;
     /// Distinct names referenced from within `name` (the inverse of
@@ -304,6 +310,13 @@ impl GraphStore for InMemoryGraphStore {
         self.slices
             .get(path)
             .map(|g| g.symbols.clone())
+            .unwrap_or_default()
+    }
+
+    fn imports_in_file(&self, path: &str) -> Vec<Import> {
+        self.slices
+            .get(path)
+            .map(|g| g.imports.clone())
             .unwrap_or_default()
     }
 

@@ -174,6 +174,30 @@ pub struct Located<T> {
 pub struct CodeGraph {
     pub symbols: Vec<Symbol>,
     pub references: Vec<Reference>,
+    /// Names this file brings into scope. Omitted from the serialized slice
+    /// when empty, so a file with no imports keeps the byte-identical slice —
+    /// and therefore the same content hash — it had before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<Import>,
+}
+
+/// A name brought into a file's scope, and the module path it came from.
+///
+/// Recorded as a **lexical scoping signal, not a resolved path** (#252).
+/// `use crate::model::Symbol` says that in this file `Symbol` came from a module
+/// called `model`, which is enough to prefer a definition under `model.rs` over
+/// a same-named one elsewhere — without needing to know where a crate root is,
+/// and so without extraction depending on any file but this one (ADR 0012).
+///
+/// Relative markers (`crate`, `self`, `super`, `.`, `..`) are stripped: they
+/// position the path rather than naming a module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Import {
+    /// The name as this file will write it — the alias when there is one.
+    pub name: String,
+    /// The module path segments before the name, outermost first.
+    pub path: Vec<String>,
+    pub line: usize,
 }
 
 impl CodeGraph {

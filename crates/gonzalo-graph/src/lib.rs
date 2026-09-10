@@ -13,8 +13,9 @@
 ///
 /// History: 1 = calls in macro arguments (#216); 2 = call-shape on references
 /// (#223); 3 = call-site qualifiers and definition owners (#248); 4 = functions
-/// named as values (#250); 5 = syntactic receiver types on method calls (#251).
-pub const EXTRACTION_VERSION: u32 = 5;
+/// named as values (#250); 5 = syntactic receiver types on method calls (#251);
+/// 6 = per-file imports (#252).
+pub const EXTRACTION_VERSION: u32 = 6;
 
 pub mod assembly;
 pub mod builder;
@@ -27,8 +28,8 @@ pub use assembly::assemble;
 pub use builder::{Language, build, build_rust};
 pub use diff::{GraphDiff, diff};
 pub use model::{
-    CodeGraph, FileSummary, Located, Page, RankedSymbol, Ranking, RefKind, Reference, Symbol,
-    SymbolFilter, SymbolKind, ViewOverview,
+    CodeGraph, FileSummary, Import, Located, Page, RankedSymbol, Ranking, RefKind, Reference,
+    Symbol, SymbolFilter, SymbolKind, ViewOverview,
 };
 pub use resolve::{
     ImpactNode, ImpactReport, Resolution, ResolvedReference, resolve_references_to,

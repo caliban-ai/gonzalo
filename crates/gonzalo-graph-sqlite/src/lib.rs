@@ -13,7 +13,7 @@
 //! `Connection` is `Send` but not `Sync`, and `GraphStore` requires `Sync`);
 //! read concurrency via a connection pool is a follow-on.
 
-use gonzalo_graph::{CodeGraph, GraphStore, Located, RefKind, Reference, Symbol};
+use gonzalo_graph::{CodeGraph, GraphStore, Import, Located, RefKind, Reference, Symbol};
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -35,11 +35,18 @@ CREATE TABLE IF NOT EXISTS refs (
     kind      TEXT    NOT NULL DEFAULT 'free',
     qualifier TEXT
 );
+CREATE TABLE IF NOT EXISTS imports (
+    path   TEXT    NOT NULL,
+    name   TEXT    NOT NULL,
+    module TEXT    NOT NULL,
+    line   INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
 CREATE INDEX IF NOT EXISTS idx_refs_name    ON refs(name);
 CREATE INDEX IF NOT EXISTS idx_refs_from    ON refs(from_fn);
 CREATE INDEX IF NOT EXISTS idx_refs_path    ON refs(path);
+CREATE INDEX IF NOT EXISTS idx_imports_path ON imports(path);
 ";
 
 /// A [`GraphStore`] backed by a SQLite database.
@@ -110,6 +117,9 @@ impl SqliteGraphStore {
         guard
             .execute("DELETE FROM refs WHERE path = ?1", params![path])
             .expect("delete refs for path");
+        guard
+            .execute("DELETE FROM imports WHERE path = ?1", params![path])
+            .expect("delete imports for path");
     }
 }
 
@@ -138,6 +148,19 @@ fn fs_safe(s: &str) -> String {
 }
 
 /// A [`SymbolKind`](gonzalo_graph::SymbolKind) as stored TEXT (its serde form).
+/// Module segments as one column value. `/` cannot appear in an identifier, so
+/// the join is unambiguous and splits back exactly.
+fn join_module(segments: &[String]) -> String {
+    segments.join("/")
+}
+
+fn split_module(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.split('/').map(str::to_string).collect()
+}
+
 fn kind_to_text(sym: &Symbol) -> String {
     serde_json::to_string(&sym.kind).expect("SymbolKind serializes")
 }
@@ -164,6 +187,8 @@ impl GraphStore for SqliteGraphStore {
             .expect("clear symbols for path");
         tx.execute("DELETE FROM refs WHERE path = ?1", params![path])
             .expect("clear refs for path");
+        tx.execute("DELETE FROM imports WHERE path = ?1", params![path])
+            .expect("clear imports for path");
         for s in &graph.symbols {
             tx.execute(
                 "INSERT INTO symbols (path, name, kind, start_line, end_line, owner)
@@ -194,7 +219,32 @@ impl GraphStore for SqliteGraphStore {
             )
             .expect("insert reference");
         }
+        for i in &graph.imports {
+            tx.execute(
+                "INSERT INTO imports (path, name, module, line) VALUES (?1, ?2, ?3, ?4)",
+                params![path, i.name, join_module(&i.path), i.line as i64],
+            )
+            .expect("insert import");
+        }
         tx.commit().expect("commit transaction");
+    }
+
+    fn imports_in_file(&self, path: &str) -> Vec<Import> {
+        let guard = self.conn.lock().expect("connection poisoned");
+        let mut stmt = guard
+            .prepare("SELECT name, module, line FROM imports WHERE path = ?1 ORDER BY line")
+            .expect("prepare imports_in_file");
+        let rows = stmt
+            .query_map(params![path], |row| {
+                Ok(Import {
+                    name: row.get(0)?,
+                    path: split_module(&row.get::<_, String>(1)?),
+                    line: row.get::<_, i64>(2)? as usize,
+                })
+            })
+            .expect("query imports_in_file");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect imports_in_file")
     }
 
     fn symbols_in_file(&self, path: &str) -> Vec<Symbol> {
@@ -404,5 +454,16 @@ mod tests {
             store.references_to("get")[0].item.qualifier.as_deref(),
             Some("Beta")
         );
+
+        // The imports table did not exist at all in that database; opening it
+        // creates it, so import-aware resolution works on an upgraded view
+        // rather than silently finding nothing (#252).
+        store.insert(
+            "app.rs",
+            gonzalo_graph::build_rust("use crate::model::make;\nfn caller() { make(); }"),
+        );
+        let imports = store.imports_in_file("app.rs");
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        assert_eq!(imports[0].path, vec!["model".to_string()]);
     }
 }
