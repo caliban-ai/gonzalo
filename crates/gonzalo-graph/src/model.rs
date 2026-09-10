@@ -97,6 +97,68 @@ pub struct Reference {
     /// Omitted from the serialized slice when absent, like [`kind`](Self::kind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qualifier: Option<String>,
+    /// What [`from`](Self::from) names — a function, or a module-level binding.
+    ///
+    /// Before #268 `from` was always a function, and a call at module level
+    /// simply had none. A great deal of modern TypeScript lives in module-level
+    /// builder objects (a Zod schema, a tRPC router), so those calls reached
+    /// neither `callers` nor `impact`.
+    ///
+    /// Attributing them to the binding widens what `from` means, so the scope
+    /// travels *with* it rather than the meaning changing silently: "who calls
+    /// this" and "which module-level declaration mentions this" are different
+    /// questions and a consumer must be able to tell them apart. Defaults to
+    /// [`Function`](FromScope::Function) and is omitted from the serialized
+    /// slice then, so a file with no module-level attribution keeps a
+    /// byte-identical slice.
+    #[serde(default, skip_serializing_if = "FromScope::is_function")]
+    pub from_scope: FromScope,
+}
+
+/// What a [`Reference`]'s `from` names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FromScope {
+    /// A function: a declaration, a method, or a function bound to a name. The
+    /// only kind before #268, and the default — so a slice written before it
+    /// deserializes to exactly what it meant.
+    #[default]
+    Function,
+    /// A module-level binding that is not a function — `const schema =
+    /// z.object({..})`, a tRPC handler keyed in a router object. The call sits
+    /// in that binding's initializer at module level (#268).
+    ///
+    /// Deliberately over-inclusive in the same way [`RefKind::Value`] is: a
+    /// module-level `const rows = items.map(..)` attributes its lambda's calls
+    /// to `rows`. At module level the alternative was no attribution at all,
+    /// and this field is what lets a consumer filter rather than guess.
+    Module,
+}
+
+impl FromScope {
+    /// Whether this is the default, [`Function`](FromScope::Function) scope.
+    pub fn is_function(&self) -> bool {
+        matches!(self, Self::Function)
+    }
+
+    /// Lowercase name, matching the `snake_case` serde representation. The
+    /// stored value in the persistent graph.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Module => "module",
+        }
+    }
+
+    /// Parse from [`as_str`](FromScope::as_str). Anything unrecognized —
+    /// including a row written before the column existed — reads as
+    /// `Function`, the pre-existing behaviour.
+    pub fn from_str_or_function(raw: &str) -> Self {
+        match raw {
+            "module" => Self::Module,
+            _ => Self::Function,
+        }
+    }
 }
 
 /// The syntactic shape of a call site.

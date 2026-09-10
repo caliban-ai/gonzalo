@@ -292,6 +292,17 @@ path unambiguously a path, currently Rust, C++, and PHP. Go's `pkg.Func()` and J
 unqualified rather than record a variable name as a type. A definition's `owner` shows
 up in `search` and `node` results when it has one.
 
+**A call can be attributed to a module-level declaration, not just a function.** A
+great deal of modern TypeScript lives in module-level builder objects — a Zod schema, a
+tRPC router — and calls inside them used to reach neither `callers` nor `impact`
+([#268](https://github.com/caliban-ai/gonzalo/issues/268)). They are now attributed to
+the nearest named binding, and reported separately: `callers` still means *functions*
+that call this, while `module_callers` carries the module-level ones. The nearest name
+wins, so `z.string()` under a `PORT:` key reports `PORT` rather than the whole schema.
+Deliberately over-inclusive in the same way value references are — a module-level
+`const rows = items.map(..)` attributes its lambda's calls to `rows` — which is why the
+two are separate fields rather than one list.
+
 **In JavaScript and TypeScript, an anonymous callback has no caller.** A call inside
 `it('...', () => { ... })` records no enclosing function, because that arrow has no name.
 Test files therefore contribute little to `callers` and `impact`, though they still count

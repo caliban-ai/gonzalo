@@ -6,8 +6,8 @@
 
 use crate::builder::Language;
 use crate::model::{
-    CodeGraph, FileSummary, Import, Located, Page, RankedSymbol, Ranking, RefKind, Reference,
-    Symbol, SymbolFilter, SymbolKind, ViewOverview,
+    CodeGraph, FileSummary, FromScope, Import, Located, Page, RankedSymbol, Ranking, RefKind,
+    Reference, Symbol, SymbolFilter, SymbolKind, ViewOverview,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -45,6 +45,32 @@ pub trait GraphStore: Send + Sync {
     /// Distinct names referenced from within `name` (the inverse of
     /// [`callers_of`](Self::callers_of)), sorted.
     fn callees(&self, name: &str) -> Vec<String>;
+
+    /// Distinct enclosing names that reference `name`, each with what that name
+    /// *is* — a function, or a module-level binding (#268).
+    ///
+    /// [`callers_of`](Self::callers_of) folds the two together. Separating them
+    /// is what lets a consumer ask the narrower question: "which functions call
+    /// this" and "which module-level declarations mention this" are different,
+    /// and attributing module-level calls would otherwise have widened `from`
+    /// silently.
+    ///
+    /// Defaulted over [`references_to`](Self::references_to) rather than left to
+    /// each backend, so no impl can quietly return nothing.
+    fn callers_scoped(&self, name: &str) -> Vec<(String, FromScope)> {
+        let mut out: Vec<(String, FromScope)> = self
+            .references_to(name)
+            .into_iter()
+            .filter(|located| located.item.kind != RefKind::Value)
+            .filter_map(|located| {
+                let scope = located.item.from_scope;
+                located.item.from.map(|from| (from, scope))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
     /// Every symbol in the view, each with its path (used for whole-graph
     /// operations like diffing).
     fn all_symbols(&self) -> Vec<Located<Symbol>>;

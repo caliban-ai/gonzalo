@@ -3,7 +3,7 @@
 //! in-memory reference. Backend crates call [`run_graph_store_conformance`]
 //! from their tests with a factory that returns a fresh, empty store.
 
-use crate::{GraphStore, Language, RefKind, build, build_rust};
+use crate::{FromScope, GraphStore, Language, RefKind, build, build_rust};
 use std::collections::BTreeSet;
 
 /// Run the full suite against stores produced by `make` (a fresh, empty
@@ -18,6 +18,7 @@ pub fn run_graph_store_conformance<S: GraphStore>(make: impl Fn() -> S) {
     qualifier_and_owner_survive_a_round_trip(&mut seeded(&make));
     a_value_reference_is_stored_but_kept_out_of_the_call_graph(&mut seeded(&make));
     imports_survive_a_round_trip_and_disambiguate(&mut seeded(&make));
+    module_scope_survives_a_round_trip(&mut seeded(&make));
     empty_store_answers_are_empty(&mut make());
 }
 
@@ -230,5 +231,38 @@ fn imports_survive_a_round_trip_and_disambiguate<S: GraphStore>(s: &mut S) {
         call.target.as_deref(),
         Some("src/model.rs"),
         "import must narrow the candidates: {call:?}"
+    );
+}
+
+/// A backend that drops [`Reference::from_scope`] silently widens what `from`
+/// means: a module-level binding starts reading as a function, which is exactly
+/// the distinction #268 added the field to preserve.
+fn module_scope_survives_a_round_trip<S: GraphStore>(s: &mut S) {
+    s.insert(
+        "schema.ts",
+        build(
+            Language::TypeScript,
+            "const allEnv = z.object({});\nconst run = () => { go(); };",
+        ),
+    );
+
+    let module = s
+        .references_to("object")
+        .into_iter()
+        .next()
+        .expect("module-level call stored");
+    assert_eq!(module.item.from.as_deref(), Some("allEnv"));
+    assert_eq!(module.item.from_scope, FromScope::Module);
+
+    let function = s
+        .references_to("go")
+        .into_iter()
+        .next()
+        .expect("call in a function stored");
+    assert_eq!(function.item.from.as_deref(), Some("run"));
+    assert_eq!(
+        function.item.from_scope,
+        FromScope::Function,
+        "an enclosing function still reports itself as one"
     );
 }
