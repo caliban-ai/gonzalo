@@ -17,8 +17,8 @@
 /// 6 = per-file imports (#252); 7 = Java/Kotlin imports (#260); 8 = JS/TS
 /// functions bound through a higher-order call, and object properties (#257);
 /// 9 = relative-import depth (#261); 10 = `.h` headers parsed as C++ (#266);
-/// 11 = C/C++ includes (#267).
-pub const EXTRACTION_VERSION: u32 = 11;
+/// 11 = C/C++ includes (#267); 12 = CommonJS `require` (#269).
+pub const EXTRACTION_VERSION: u32 = 12;
 
 pub mod assembly;
 pub mod builder;
