@@ -14,8 +14,8 @@
 /// History: 1 = calls in macro arguments (#216); 2 = call-shape on references
 /// (#223); 3 = call-site qualifiers and definition owners (#248); 4 = functions
 /// named as values (#250); 5 = syntactic receiver types on method calls (#251);
-/// 6 = per-file imports (#252).
-pub const EXTRACTION_VERSION: u32 = 6;
+/// 6 = per-file imports (#252); 7 = Java/Kotlin imports (#260).
+pub const EXTRACTION_VERSION: u32 = 7;
 
 pub mod assembly;
 pub mod builder;

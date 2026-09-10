@@ -11,6 +11,28 @@ the patch version for fixes.
 
 ### Changed
 
+- **Java and Kotlin imports are now recorded.** #252 shipped import-aware
+  resolution for Rust, Python, JavaScript and TypeScript and left out the two
+  most import-dense languages gonzalo supports — every type from another package
+  must be imported by name, so the signal is denser there than anywhere else.
+  Found by indexing three Vanderbilt course repositories, which between them
+  contained thousands of import lines and recorded zero.
+
+  | repo | files | imports before | after |
+  |---|---|---|---|
+  | cs-395-spring-2024 | 401 | 0 | 2657 |
+  | cs-5253-fall-2023 | 728 | 0 | 6620 |
+  | cs-5254-summer-2023 | 752 | 0 | 5642 |
+
+  A Java static import records the member it brings into scope rather than the
+  class holding it, and a Kotlin `as` alias records under its local name. A
+  wildcard records nothing, as with Rust's glob. Kotlin needed one wrinkle: its
+  grammar drops the `*`, so `import a.b.*` and `import a.b` parse identically and
+  the source text is the only way to tell them apart.
+
+  Extraction only — resolution already consumed imports generically.
+  `EXTRACTION_VERSION` is 7, so each view re-walks once on upgrade. (#260)
+
 - **Imports narrow an otherwise ambiguous reference.** Resolution was file-scoped
   and consulted nothing outside the calling file, so a name defined in several
   places with none of them local was simply dropped — even when the file's own
