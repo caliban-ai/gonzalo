@@ -1085,10 +1085,12 @@ pub fn build(language: Language, src: &str) -> CodeGraph {
         language,
         tree.root_node(),
         src.as_bytes(),
-        None,
-        None,
-        &BTreeMap::new(),
-        FromScope::Function,
+        Inherited {
+            enclosing: None,
+            scope: FromScope::Function,
+            owner: None,
+            receivers: &BTreeMap::new(),
+        },
         &mut graph,
     );
     graph
@@ -1548,24 +1550,40 @@ fn rust_receiver_name(call: Node<'_>, bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What a node inherits from the subtree above it: the name a call in it is
+/// attributed to, what that name is, the type owning it, and the receiver types
+/// its body declared.
+///
+/// A struct rather than four more parameters — [`walk`] threads all of it
+/// unchanged through most nodes, and the set has grown once per ticket
+/// (#248, #251, #268).
+#[derive(Clone, Copy)]
+struct Inherited<'a> {
+    /// The name a call here is attributed to, if any.
+    enclosing: Option<&'a str>,
+    /// What that name is — a function, or a module-level binding.
+    scope: FromScope,
+    /// The type or module enclosing definitions here.
+    owner: Option<&'a str>,
+    /// Receiver types visible in the enclosing function body.
+    receivers: &'a BTreeMap<String, String>,
+}
+
 fn walk(
     language: Language,
     node: Node<'_>,
     bytes: &[u8],
-    current_fn: Option<&str>,
-    current_type: Option<&str>,
-    current_receivers: &BTreeMap<String, String>,
-    current_scope: FromScope,
+    inherited: Inherited<'_>,
     graph: &mut CodeGraph,
 ) {
-    let mut enclosing = current_fn.map(str::to_string);
-    let mut scope = current_scope;
-    let mut owner = current_type.map(str::to_string);
+    let mut enclosing = inherited.enclosing.map(str::to_string);
+    let mut scope = inherited.scope;
+    let mut owner = inherited.owner.map(str::to_string);
     // Assigned only when this node opens a function body, and only then does
     // `receivers` point at it — so the table is scoped to the body it came from
     // and cannot leak into a sibling function (#251).
     let scoped_receivers;
-    let mut receivers = current_receivers;
+    let mut receivers = inherited.receivers;
 
     if let Some(kind) = language.item_kind(node, bytes)
         && let Some(name) = language.item_name(node, kind, bytes)
@@ -1670,10 +1688,12 @@ fn walk(
             language,
             child,
             bytes,
-            enclosing.as_deref(),
-            owner.as_deref(),
-            receivers,
-            scope,
+            Inherited {
+                enclosing: enclosing.as_deref(),
+                scope,
+                owner: owner.as_deref(),
+                receivers,
+            },
             graph,
         );
     }
