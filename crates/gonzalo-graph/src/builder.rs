@@ -132,9 +132,9 @@ impl Language {
                 "class_definition" => Some(SymbolKind::Class),
                 _ => None,
             },
-            Self::JavaScript => js_item_kind(node),
+            Self::JavaScript => js_item_kind(node, bytes),
             // TypeScript/TSX are a superset of JavaScript's declarations.
-            Self::TypeScript | Self::Tsx => js_item_kind(node).or(match node_kind {
+            Self::TypeScript | Self::Tsx => js_item_kind(node, bytes).or(match node_kind {
                 "interface_declaration" => Some(SymbolKind::Interface),
                 "type_alias_declaration" => Some(SymbolKind::TypeAlias),
                 "enum_declaration" => Some(SymbolKind::Enum),
@@ -261,6 +261,15 @@ impl Language {
             // Elixir defs carry no `name` field; the defined name is the head of
             // the first argument — a nested `call` (`def add(a, b)`), a bare
             // `identifier` (`def run`), or an `alias` (`defmodule Math`).
+            // An object property bound to a function carries its name in `key`;
+            // every other JS/TS function uses `name` (#257).
+            (Self::JavaScript | Self::TypeScript | Self::Tsx, SymbolKind::Function) => {
+                name_field(node, bytes).or_else(|| {
+                    node.child_by_field_name("key")
+                        .and_then(|n| node_text(n, bytes))
+                        .map(str::to_string)
+                })
+            }
             (Self::Elixir, _) => elixir_defined_name(node, bytes),
             _ => name_field(node, bytes),
         }
@@ -857,22 +866,66 @@ fn elixir_is_def_head(node: Node<'_>, bytes: &[u8]) -> bool {
 }
 
 /// JavaScript declaration node kinds shared by JS and TS/TSX.
-fn js_item_kind(node: Node<'_>) -> Option<SymbolKind> {
+fn js_item_kind(node: Node<'_>, bytes: &[u8]) -> Option<SymbolKind> {
     match node.kind() {
         "function_declaration" | "generator_function_declaration" | "method_definition" => {
             Some(SymbolKind::Function)
         }
         "class_declaration" | "abstract_class_declaration" => Some(SymbolKind::Class),
-        // `const foo = () => {}` / `const foo = function () {}` and class-field
-        // `foo = () => {}`: a binding whose value is an arrow/function expression
-        // is a named function. The name lives on the binding's `name` field.
-        "variable_declarator" | "public_field_definition" => {
-            match node.child_by_field_name("value").map(|v| v.kind()) {
-                Some("arrow_function" | "function_expression") => Some(SymbolKind::Function),
-                _ => None,
-            }
-        }
+        // `const foo = () => {}`, class-field `foo = () => {}`, object property
+        // `{ foo: () => {} }`, and a function wrapped in a higher-order call —
+        // `const C = React.memo(() => {})`. A binding whose value is, or wraps,
+        // a function literal is a named function (#257).
+        "variable_declarator" | "public_field_definition" | "pair" => node
+            .child_by_field_name("value")
+            .filter(|value| js_binds_a_function(*value, bytes, 3))
+            .map(|_| SymbolKind::Function),
         _ => None,
+    }
+}
+
+/// Whether a JS/TS initializer is, or wraps, a function literal.
+///
+/// Direct for `() => {}` and `function () {}`. Through a higher-order call for
+/// `memo(() => {})` and `memo(forwardRef(() => {}))`, the idiom that dominates
+/// React code and that used to leave whole component files with no symbols at
+/// all (#257).
+///
+/// The wrapper must be called on a **bare identifier** (`memo`, `forwardRef`,
+/// `styled`) or on a **capitalized namespace** (`React.memo`). That is what
+/// keeps `items.map(x => f(x))` out: an iterator method returns an array, not a
+/// function, and treating `const total = items.map(..)` as a function would
+/// attribute everything inside the lambda to `total` instead of to the function
+/// actually containing it — trading a missing answer for a wrong one.
+fn js_binds_a_function(node: Node<'_>, bytes: &[u8], depth: usize) -> bool {
+    match node.kind() {
+        "arrow_function" | "function_expression" | "generator_function" => true,
+        "call_expression" if depth > 0 && js_is_wrapper_call(node, bytes) => {
+            node.child_by_field_name("arguments").is_some_and(|args| {
+                let mut cursor = args.walk();
+                args.named_children(&mut cursor)
+                    .any(|arg| js_binds_a_function(arg, bytes, depth - 1))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a JS/TS call looks like a wrapper rather than a method on a value.
+fn js_is_wrapper_call(call: Node<'_>, bytes: &[u8]) -> bool {
+    let Some(callee) = call.child_by_field_name("function") else {
+        return false;
+    };
+    match callee.kind() {
+        "identifier" => true,
+        // `React.memo` — a capitalized object is a namespace by convention,
+        // where `items.map` is a value.
+        "member_expression" => callee
+            .child_by_field_name("object")
+            .filter(|object| object.kind() == "identifier")
+            .and_then(|object| node_text(object, bytes))
+            .is_some_and(|name| name.starts_with(char::is_uppercase)),
+        _ => false,
     }
 }
 
@@ -2964,5 +3017,144 @@ object Config
     #[test]
     fn kotlin_records_nothing_for_a_wildcard_import() {
         assert!(imports_of(Language::Kotlin, "import a.b.*\n").is_empty());
+    }
+
+    // ---- functions bound to a name in JS/TS (#257) -------------------------
+
+    /// Symbols of kind `Function` in `src`, with their owner.
+    fn ts_functions(src: &str) -> Vec<(String, Option<String>)> {
+        build(Language::TypeScript, src)
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .map(|s| (s.name.clone(), s.owner.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn ts_still_records_a_plainly_bound_function() {
+        // Regression guard: these already worked before #257 and must keep
+        // working.
+        assert_eq!(
+            ts_functions("const handler = () => {};"),
+            vec![("handler".to_string(), None)]
+        );
+        assert_eq!(
+            ts_functions("const handler = function () {};"),
+            vec![("handler".to_string(), None)]
+        );
+        assert_eq!(
+            ts_functions("export const Component = async () => {};"),
+            vec![("Component".to_string(), None)]
+        );
+        assert_eq!(
+            ts_functions("class Widget { render = () => {}; }"),
+            vec![("render".to_string(), Some("Widget".to_string()))]
+        );
+    }
+
+    #[test]
+    fn ts_records_a_function_wrapped_in_a_higher_order_call() {
+        // The real defect: `export const C = React.memo(() => {})` is the
+        // dominant React idiom, and gonzalo extracted *zero* symbols from files
+        // written that way (#257).
+        let fns = ts_functions("export const Controls = React.memo(() => {});");
+        assert_eq!(fns, vec![("Controls".to_string(), None)]);
+    }
+
+    #[test]
+    fn ts_records_a_function_through_two_wrappers() {
+        let fns = ts_functions("const Input = memo(forwardRef(() => {}));");
+        assert_eq!(fns, vec![("Input".to_string(), None)]);
+    }
+
+    #[test]
+    fn a_binding_to_a_call_with_no_function_in_it_records_nothing() {
+        assert!(ts_functions("const total = compute(1, 2);").is_empty());
+        assert!(ts_functions("const client = createClient({ url });").is_empty());
+    }
+
+    #[test]
+    fn a_call_inside_a_wrapped_component_records_it_as_the_caller() {
+        let g = build(
+            Language::TypeScript,
+            "export const Controls = React.memo(() => { useAppDispatch(); });",
+        );
+        let call = g
+            .references
+            .iter()
+            .find(|r| r.name == "useAppDispatch")
+            .expect("call recorded");
+        assert_eq!(call.from.as_deref(), Some("Controls"));
+    }
+
+    #[test]
+    fn ts_records_an_object_property_arrow_function() {
+        // The name lives in `key` here, not `name`.
+        let fns = ts_functions("const api = { fetchAll: () => {} };");
+        assert_eq!(fns, vec![("fetchAll".to_string(), None)]);
+    }
+
+    #[test]
+    fn a_binding_that_is_not_a_function_is_not_recorded_as_one() {
+        assert!(ts_functions("const count = 1;").is_empty());
+        assert!(ts_functions("const items = [1, 2];").is_empty());
+        assert!(ts_functions("const other = helper;").is_empty());
+    }
+
+    #[test]
+    fn a_call_inside_a_bound_function_records_it_as_the_caller() {
+        // The whole point: 72% of references in a real Next.js app had no
+        // enclosing function, so they reached neither `callers` nor `impact`.
+        let g = build(
+            Language::TypeScript,
+            "const boolToString = (b: boolean) => format(b);",
+        );
+        let call = g
+            .references
+            .iter()
+            .find(|r| r.name == "format")
+            .expect("call recorded");
+        assert_eq!(call.from.as_deref(), Some("boolToString"));
+    }
+
+    #[test]
+    fn a_nested_bound_function_takes_over_as_the_caller() {
+        let g = build(
+            Language::TypeScript,
+            "const outer = () => { const inner = () => { deep(); }; shallow(); };",
+        );
+        let from = |name: &str| {
+            g.references
+                .iter()
+                .find(|r| r.name == name)
+                .and_then(|r| r.from.clone())
+        };
+        assert_eq!(from("deep").as_deref(), Some("inner"));
+        assert_eq!(from("shallow").as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn an_iterator_method_does_not_make_its_binding_a_function() {
+        // The guard that keeps this from trading a missing answer for a wrong
+        // one: `items.map(..)` returns an array. Treating `total` as a function
+        // would attribute everything inside the lambda to `total` rather than
+        // to the function actually containing it.
+        assert!(ts_functions("const total = items.map((x) => f(x));").is_empty());
+        assert!(ts_functions("const kept = list.filter((x) => keep(x));").is_empty());
+    }
+
+    #[test]
+    fn a_lambda_in_an_iterator_call_keeps_the_real_enclosing_function() {
+        let g = build(
+            Language::TypeScript,
+            "const render = () => { const rows = items.map((x) => cell(x)); };",
+        );
+        let call = g
+            .references
+            .iter()
+            .find(|r| r.name == "cell")
+            .expect("call recorded");
+        assert_eq!(call.from.as_deref(), Some("render"));
     }
 }

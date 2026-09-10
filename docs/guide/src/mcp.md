@@ -283,6 +283,13 @@ path unambiguously a path, currently Rust, C++, and PHP. Go's `pkg.Func()` and J
 unqualified rather than record a variable name as a type. A definition's `owner` shows
 up in `search` and `node` results when it has one.
 
+**In JavaScript and TypeScript, an anonymous callback has no caller.** A call inside
+`it('...', () => { ... })` records no enclosing function, because that arrow has no name.
+Test files therefore contribute little to `callers` and `impact`, though they still count
+for `unreferenced`. Functions *bound* to a name do resolve, including through a
+higher-order wrapper such as `React.memo`
+([#257](https://github.com/caliban-ai/gonzalo/issues/257)).
+
 **`callers` on a type is always empty.** Only call expressions are edges, so types,
 traits, and structs have no inbound edges. Empty there means "not applicable", not
 "unused".
