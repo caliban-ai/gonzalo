@@ -9,6 +9,38 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A JavaScript or TypeScript function wrapped in a higher-order call is now a
+  named function.** `export const Controls = React.memo(() => { ... })` is the
+  dominant React idiom, and gonzalo extracted **zero symbols** from files written
+  that way: the binding's value is a call rather than an arrow, so the component
+  had no name in the graph and every call in its body had no caller. Object
+  properties bound to a function (`{ fetchAll: () => {} }`) were missed too,
+  because the name lives in `key` rather than `name`.
+
+  Measured by re-indexing a real Next.js app:
+
+  | | before | after |
+  |---|---|---|
+  | symbols extracted | 482 | 638 |
+  | production references with a caller | 1799 | 2247 |
+  | production references orphaned | 589 | 141 |
+
+  Test files are deliberately unchanged (4581 to 4564). Their calls sit inside
+  anonymous Jest callbacks — `it('...', () => { ... })` — which genuinely have no
+  name, and inventing one would be worse than reporting none. The residual 141
+  are top-level statements like `export default React.memo(ColorPicker)`, which
+  correctly have no enclosing function.
+
+  The wrapper must be called on a bare identifier (`memo`, `forwardRef`,
+  `styled`) or a capitalized namespace (`React.memo`). That is what keeps
+  `items.map(x => f(x))` out: an iterator method returns an array, and treating
+  its binding as a function would attribute everything inside the lambda to that
+  binding instead of to the function actually containing it — trading a missing
+  answer for a wrong one. Both exclusions are pinned by tests.
+  `EXTRACTION_VERSION` is 8. (#257)
+
 ### Changed
 
 - **Java and Kotlin imports are now recorded.** #252 shipped import-aware
