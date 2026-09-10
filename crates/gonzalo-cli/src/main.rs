@@ -324,6 +324,21 @@ async fn main() -> Result<()> {
                 "ignored:  {} files, {} dirs not descended",
                 summary.ignored.files, summary.ignored.dirs
             );
+            if summary.unindexed.files > 0 {
+                println!(
+                    "unindexed: {} files, no grammar{}",
+                    summary.unindexed.files,
+                    named_extensions(&summary.unindexed.extensions())
+                );
+            }
+            // The case a user is most likely to misread: a view that indexed
+            // nothing looks exactly like an empty repository unless we say
+            // otherwise (#259).
+            if summary.files == 0 && summary.unindexed.files > 0 {
+                println!(
+                    "note:     nothing was indexed — gonzalo parses none of the files in this tree"
+                );
+            }
             if let Some(swept) = swept {
                 println!("gc.freed:    {}", swept.freed);
                 println!("gc.retained: {}", swept.retained);
@@ -405,4 +420,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// ` (.ipynb, .org)` for a report, or empty when nothing has an extension to
+/// name. Bounded, so a tree full of odd files does not print a wall of text.
+fn named_extensions(extensions: &[(String, usize)]) -> String {
+    const MOST: usize = 5;
+    if extensions.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = extensions
+        .iter()
+        .take(MOST)
+        .map(|(extension, _)| format!(".{extension}"))
+        .collect();
+    let more = extensions.len().saturating_sub(MOST);
+    let tail = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    format!(" for {}{}", named.join(", "), tail)
 }

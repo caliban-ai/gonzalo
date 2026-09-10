@@ -119,22 +119,42 @@ pub struct IgnoredCounts {
     pub dirs: usize,
 }
 
+/// What a full walk found: the parseable files, plus what was excluded on
+/// purpose and what gonzalo has no grammar for.
+pub struct SourceFiles {
+    /// Parseable files with their language, sorted by path.
+    pub files: Vec<(PathBuf, Language)>,
+    pub ignored: IgnoredCounts,
+    pub unindexed: UnindexedCounts,
+}
+
 /// Supported source files under `dir` with their [`Language`], sorted by path,
-/// alongside a count of what was skipped.
+/// alongside a count of what was deliberately excluded and of what gonzalo has
+/// no grammar for.
 ///
 /// Applies `filter` plus, when `dir` is a git repository, `.gitignore`.
-pub fn source_files(
-    dir: &Path,
-    filter: &IndexFilter,
-) -> Result<(Vec<(PathBuf, Language)>, IgnoredCounts)> {
+pub fn source_files(dir: &Path, filter: &IndexFilter) -> Result<SourceFiles> {
     // Opened once for the whole walk; `is_path_ignored` is a pure query so the
     // repository is never mutated. A non-git tree simply gets no gitignore rules.
     let repo = git2::Repository::open(dir).ok();
     let mut out = Vec::new();
     let mut ignored = IgnoredCounts::default();
-    source_files_inner(dir, dir, repo.as_ref(), filter, &mut out, &mut ignored)?;
+    let mut unindexed = UnindexedCounts::default();
+    source_files_inner(
+        dir,
+        dir,
+        repo.as_ref(),
+        filter,
+        &mut out,
+        &mut ignored,
+        &mut unindexed,
+    )?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok((out, ignored))
+    Ok(SourceFiles {
+        files: out,
+        ignored,
+        unindexed,
+    })
 }
 
 /// Of `paths`, those the current rules would no longer admit under the tree at
@@ -165,6 +185,43 @@ fn git_ignores(repo: Option<&git2::Repository>, rel: &str) -> bool {
     repo.is_some_and(|r| r.is_path_ignored(Path::new(rel)).unwrap_or(false))
 }
 
+/// Files seen during a walk but not parsed, because their extension names no
+/// language gonzalo knows.
+///
+/// Deliberately distinct from [`IgnoredCounts`] (excluded on purpose) and from
+/// the summary's `skipped` (a parse failure). Without it, indexing a tree
+/// gonzalo cannot read reported every count at zero and said nothing — so an
+/// empty view was indistinguishable from an empty repository (#259).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnindexedCounts {
+    /// How many such files were seen.
+    pub files: usize,
+    by_extension: std::collections::BTreeMap<String, usize>,
+}
+
+impl UnindexedCounts {
+    /// Record a file gonzalo has no grammar for. `extension` is `None` for an
+    /// extensionless file, which is counted but names nothing.
+    pub fn record(&mut self, extension: Option<&str>) {
+        self.files += 1;
+        if let Some(extension) = extension {
+            *self.by_extension.entry(extension.to_string()).or_default() += 1;
+        }
+    }
+
+    /// The extensions responsible, most common first and alphabetical within a
+    /// tie, so a report can name them rather than print a bare number.
+    pub fn extensions(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = self
+            .by_extension
+            .iter()
+            .map(|(extension, count)| (extension.clone(), *count))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+}
+
 fn source_files_inner(
     root: &Path,
     dir: &Path,
@@ -172,6 +229,7 @@ fn source_files_inner(
     filter: &IndexFilter,
     out: &mut Vec<(PathBuf, Language)>,
     ignored: &mut IgnoredCounts,
+    unindexed: &mut UnindexedCounts,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -188,14 +246,20 @@ fn source_files_inner(
                 ignored.dirs += 1;
                 continue;
             }
-            source_files_inner(root, &path, repo, filter, out, ignored)?;
+            source_files_inner(root, &path, repo, filter, out, ignored, unindexed)?;
         } else if ft.is_file() {
             let Some(language) = path
                 .extension()
                 .and_then(|e| e.to_str())
                 .and_then(Language::from_extension)
             else {
-                continue; // not a source file at all — not "ignored", just irrelevant
+                // No grammar for it. Counted only when it would otherwise have
+                // been indexed, so a README inside a vendored tree stays as
+                // invisible as it already is (#259).
+                if filter.is_indexable(&rel) && !git_ignores(repo, &rel) {
+                    unindexed.record(path.extension().and_then(|e| e.to_str()));
+                }
+                continue;
             };
             if !filter.is_indexable(&rel) || git_ignores(repo, &rel) {
                 ignored.files += 1;
@@ -330,7 +394,7 @@ mod tests {
         write(dir.path(), "docs/mermaid.min.js", "var a=1;");
         write(dir.path(), "node_modules/x/index.js", "var b=2;");
 
-        let (files, ignored) = source_files(dir.path(), &filter()).unwrap();
+        let SourceFiles { files, ignored, .. } = source_files(dir.path(), &filter()).unwrap();
         assert_eq!(rels(&files, dir.path()), vec!["src/lib.rs"]);
         assert_eq!(ignored.files, 1, "the .min.js");
         assert_eq!(ignored.dirs, 1, "node_modules pruned without descending");
@@ -346,7 +410,7 @@ mod tests {
         write(dir.path(), "docs/guide/book/highlight.js", "var a=1;");
         drop(repo);
 
-        let (files, ignored) = source_files(dir.path(), &filter()).unwrap();
+        let SourceFiles { files, ignored, .. } = source_files(dir.path(), &filter()).unwrap();
         assert_eq!(rels(&files, dir.path()), vec!["src/lib.rs"]);
         // Two pruned directories: the gitignored `docs/guide/book/`, and `.git`
         // itself via the hidden-directory rule.
@@ -360,7 +424,7 @@ mod tests {
         write(dir.path(), "vendor/other/core.js", "var b=2;");
 
         let f = IndexFilter::new(&["vendor/mylib".to_string()]);
-        let (files, _) = source_files(dir.path(), &f).unwrap();
+        let SourceFiles { files, .. } = source_files(dir.path(), &f).unwrap();
         // `vendor/` is entered only because the include lives under it; its
         // other children stay excluded.
         assert_eq!(rels(&files, dir.path()), vec!["vendor/mylib/core.js"]);
@@ -379,7 +443,7 @@ mod tests {
                 write(dir.path(), "book/gen.js", "var a=1;");
                 write(dir.path(), "book/other.js", "var b=2;");
             }
-            let (files, _) = source_files(dir.path(), &filter()).unwrap();
+            let SourceFiles { files, .. } = source_files(dir.path(), &filter()).unwrap();
             rels(&files, dir.path())
         };
         assert_eq!(build(true), build(false));
@@ -390,7 +454,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "a.rs", "fn a() {}");
         write(dir.path(), "target/b.rs", "fn b() {}");
-        let (files, _) = source_files(dir.path(), &filter()).unwrap();
+        let SourceFiles { files, .. } = source_files(dir.path(), &filter()).unwrap();
         assert_eq!(rels(&files, dir.path()), vec!["a.rs"]);
     }
 
@@ -403,7 +467,7 @@ mod tests {
         write(dir.path(), "generated/out.js", "var b=2;");
 
         let f = IndexFilter::new(&["vendor/mylib".to_string(), "generated".to_string()]);
-        let (files, _) = source_files(dir.path(), &f).unwrap();
+        let SourceFiles { files, .. } = source_files(dir.path(), &f).unwrap();
         // The vendored path is re-admitted; the gitignored one is not, because
         // reproducibility must not be defeatable by a flag.
         assert_eq!(rels(&files, dir.path()), vec!["vendor/mylib/core.js"]);
@@ -452,7 +516,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "README.md", "# hi");
         write(dir.path(), "a.rs", "fn a() {}");
-        let (files, ignored) = source_files(dir.path(), &filter()).unwrap();
+        let SourceFiles { files, ignored, .. } = source_files(dir.path(), &filter()).unwrap();
         assert_eq!(rels(&files, dir.path()), vec!["a.rs"]);
         assert_eq!(ignored.files, 0, "a non-source file is not a skip");
     }

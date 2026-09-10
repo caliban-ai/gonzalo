@@ -11,6 +11,32 @@ the patch version for fixes.
 
 ### Fixed
 
+- **Indexing a tree gonzalo cannot parse now says so.** A file whose extension
+  names no known language was dropped uncounted — not in `files`, not in
+  `skipped`, not in `ignored` — so a repository gonzalo could not read reported
+  every number at zero with no explanation. Querying that view afterwards
+  returned empty answers that looked like real ones, the same failure shape as
+  #210 and #228.
+
+  Found by indexing a Vanderbilt machine-learning course repository whose entire
+  content is one Jupyter notebook. Before, it printed four zeros and nothing
+  else. Now:
+
+  ```
+  files:    0
+  ignored:  0 files, 2 dirs not descended
+  unindexed: 4 files, no grammar for .csv, .ipynb, .md, .txt
+  note:     nothing was indexed — gonzalo parses none of the files in this tree
+  ```
+
+  The count is distinct from `skipped` (a parse worker crashed on it) and
+  `ignored` (excluded on purpose), and it names the extensions responsible so
+  the message is actionable. A file that was going to be excluded anyway stays
+  as invisible as it already was, so `ignored` is unchanged and a README inside
+  a vendored tree does not start appearing. The extra note fires only when a run
+  indexed nothing at all, which is the case most easily misread. No extraction
+  change, so no re-walk. (#259)
+
 - **A JavaScript or TypeScript function wrapped in a higher-order call is now a
   named function.** `export const Controls = React.memo(() => { ... })` is the
   dominant React idiom, and gonzalo extracted **zero symbols** from files written
