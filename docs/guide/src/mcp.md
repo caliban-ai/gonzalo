@@ -231,6 +231,14 @@ a name are one node. `callees` includes enum variants, constructors, and std met
 ambiguity report: any name scoring above 1 is defined in several places, and every
 traversal through it merges unrelated subgraphs.
 
+**`callers` and `callees` now say how ambiguous the name is.** Each answers with a
+`definition_count` beside the list, plus `defined_in` while there are few enough paths
+to be useful ([#249](https://github.com/caliban-ai/gonzalo/issues/249)). A count above 1
+means the list merges several same-named symbols and is not the question you asked; a
+count of 0 means the name is defined nowhere in the view, which is what makes an empty
+list readable. The list itself moved under a `callers`/`callees` key, so these two tools
+return an object rather than a bare array.
+
 **`impact` follows only resolvable edges.** It used to walk the name-matched graph and
 return roughly half the repository for one seed; it now keys on `(name, defining path)`
 and refuses to traverse an ambiguous reference, reporting the count in

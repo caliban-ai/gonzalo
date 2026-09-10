@@ -9,6 +9,23 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Changed
+
+- **`callers` and `callees` now report how ambiguous the queried name is.** Both
+  are raw name matches, so a name defined in several places returns the merged
+  answer for all of them — and a bare list said nothing about that, which is the
+  point where a heuristic result is most easily read as a precise one. Each now
+  answers with a `definition_count` alongside the list, plus `defined_in` while
+  there are few enough paths to be a lead rather than noise. A count of 0 means
+  the name is defined nowhere in the view, which is what makes an empty list
+  readable rather than ambiguous between "nothing calls this" and "you asked the
+  wrong question".
+
+  This changes the shape of those two tool results: the list moved under a
+  `callers`/`callees` key, so they return an object rather than a bare array.
+  `impact` already reported the edges it declined; this brings the same honesty
+  to the tools that do no resolution at all. (#249)
+
 ### Fixed
 
 - **`unreferenced` no longer reports live callbacks as dead code.** A function
