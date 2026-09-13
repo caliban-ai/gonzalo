@@ -43,5 +43,8 @@ pub use ancestry::AncestryStore;
 pub mod sync;
 pub use sync::{SyncConflict, SyncReport, sync, sync_with_ancestry};
 
+#[cfg(any(test, feature = "conformance"))]
+pub mod memstore;
+
 #[cfg(feature = "conformance")]
 pub mod conformance;
