@@ -254,10 +254,11 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             key: &RecordKey,
             expected: Option<Revision>,
+            _author: Option<Identity>,
         ) -> Result<DeleteResult> {
             let mut g = self.0.lock().unwrap();
             match g.get(key) {
@@ -272,6 +273,18 @@ mod tests {
                     current: cur.clone(),
                 }))),
             }
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            <Self as Store>::put(self, record, expected).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.get(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.list(prefix).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.delete(key, Some(expected)).await
         }
     }
 
@@ -331,10 +344,11 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             key: &RecordKey,
             expected: Option<Revision>,
+            _author: Option<Identity>,
         ) -> Result<DeleteResult> {
             let mut g = self.inner.lock().unwrap();
             match g.get(key) {
@@ -349,6 +363,18 @@ mod tests {
                     current: cur.clone(),
                 }))),
             }
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            <Self as Store>::put(self, record, expected).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.get(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.list(prefix).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.delete(key, Some(expected)).await
         }
     }
 
@@ -391,10 +417,11 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             key: &RecordKey,
             expected: Option<Revision>,
+            _author: Option<Identity>,
         ) -> Result<DeleteResult> {
             let mut g = self.0.lock().unwrap();
             match g.get(key) {
@@ -409,6 +436,18 @@ mod tests {
                     current: cur.clone(),
                 }))),
             }
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            <Self as Store>::put(self, record, expected).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.get(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.list(prefix).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.delete(key, Some(expected)).await
         }
     }
 

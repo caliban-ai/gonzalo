@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
-    Result, Revision, Store, store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, Record,
+    RecordKey, Result, Revision, Store, store::Conflict,
 };
 use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
 use gonzalo_proto::v1::{
@@ -249,7 +249,12 @@ impl Store for ServerStore {
         }
     }
 
-    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+    async fn delete_as(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+        _author: Option<Identity>,
+    ) -> Result<DeleteResult> {
         match &self.backend {
             Backend::Http {
                 base,
@@ -293,6 +298,25 @@ impl Store for ServerStore {
                 }
             }
         }
+    }
+
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        <Self as Store>::put(self, record, expected).await
+    }
+
+    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
+    // so raw reads equal consumer reads and purge is the existing conditional
+    // physical delete. Replaced by the store's tombstone slice.
+    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+        Store::get(self, key).await
+    }
+
+    async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        Store::list(self, prefix).await
+    }
+
+    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        Store::delete(self, key, Some(expected)).await
     }
 }
 

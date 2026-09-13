@@ -571,7 +571,12 @@ impl gonzalo_core::Store for GitStore {
         .await
     }
 
-    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+    async fn delete_as(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+        _author: Option<Identity>,
+    ) -> Result<DeleteResult> {
         let root = self.root.clone();
         let key = key.clone();
         run_blocking(move || {
@@ -606,6 +611,25 @@ impl gonzalo_core::Store for GitStore {
             }
         })
         .await
+    }
+
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        <Self as gonzalo_core::Store>::put(self, record, expected).await
+    }
+
+    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
+    // so raw reads equal consumer reads and purge is the existing conditional
+    // physical delete. Replaced by the store's tombstone slice.
+    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+        gonzalo_core::Store::get(self, key).await
+    }
+
+    async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        gonzalo_core::Store::list(self, prefix).await
+    }
+
+    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        gonzalo_core::Store::delete(self, key, Some(expected)).await
     }
 }
 

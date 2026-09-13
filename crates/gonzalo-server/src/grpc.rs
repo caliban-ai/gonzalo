@@ -587,10 +587,42 @@ mod tests {
                 "s3://secret-bucket".into(),
             ))
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             _key: &RecordKey,
             _expected: Option<Revision>,
+            _author: Option<Identity>,
+        ) -> gonzalo_core::Result<DeleteResult> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+        async fn put_raw(
+            &self,
+            _record: Record,
+            _expected: Option<Revision>,
+        ) -> gonzalo_core::Result<PutResult> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+        async fn get_raw(&self, _key: &RecordKey) -> gonzalo_core::Result<Option<Record>> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+        async fn list_raw(
+            &self,
+            _prefix: &gonzalo_core::KeyPrefix,
+        ) -> gonzalo_core::Result<Vec<RecordKey>> {
+            Err(gonzalo_core::CoreError::Backend(
+                "s3://secret-bucket".into(),
+            ))
+        }
+        async fn purge(
+            &self,
+            _key: &RecordKey,
+            _expected: Revision,
         ) -> gonzalo_core::Result<DeleteResult> {
             Err(gonzalo_core::CoreError::Backend(
                 "s3://secret-bucket".into(),

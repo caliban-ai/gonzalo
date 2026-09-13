@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, PutResult, Record, RecordKey,
-    Result, Revision, decode_segment, object_key, store::Conflict,
+    BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, Record,
+    RecordKey, Result, Revision, decode_segment, object_key, store::Conflict,
 };
 
 /// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
@@ -231,7 +231,12 @@ impl gonzalo_core::Store for S3Store {
         Ok(out)
     }
 
-    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+    async fn delete_as(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+        _author: Option<Identity>,
+    ) -> Result<DeleteResult> {
         // Unconditional delete (`expected = None`): S3 delete of an absent key
         // already succeeds, so this is an idempotent `Deleted`.
         let Some(want) = expected.clone() else {
@@ -290,6 +295,25 @@ impl gonzalo_core::Store for S3Store {
                 Err(CoreError::Backend(svc.to_string()))
             }
         }
+    }
+
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        <Self as gonzalo_core::Store>::put(self, record, expected).await
+    }
+
+    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
+    // so raw reads equal consumer reads and purge is the existing conditional
+    // physical delete. Replaced by the store's tombstone slice.
+    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+        gonzalo_core::Store::get(self, key).await
+    }
+
+    async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        gonzalo_core::Store::list(self, prefix).await
+    }
+
+    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        gonzalo_core::Store::delete(self, key, Some(expected)).await
     }
 }
 

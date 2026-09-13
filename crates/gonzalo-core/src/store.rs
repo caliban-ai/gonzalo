@@ -1,6 +1,6 @@
 //! The generic storage substrate trait and write-outcome types.
 
-use crate::{ContentHash, Record, RecordKey, Result, Revision};
+use crate::{ContentHash, Identity, Record, RecordKey, Result, Revision};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -52,15 +52,47 @@ pub trait Store: Send + Sync {
     async fn list(&self, prefix: &crate::KeyPrefix) -> Result<Vec<RecordKey>>;
 
     /// Conditionally delete the record at `key`. `expected` is the revision the
-    /// caller believes is current: `None` deletes unconditionally (idempotent
-    /// no-op if already absent); `Some(rev)` deletes only if the current revision
-    /// matches, returning `DeleteResult::Conflict` if a concurrent write moved it
-    /// first. Deleting an already-absent key is a no-op `Deleted`.
-    ///
-    /// Delete is LOCAL to this store: it is not a tombstone and is NOT propagated
-    /// by `sync` — a later sync against a peer that still holds the record copies
-    /// it back. See ADR 0018.
-    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult>;
+    /// caller believes is current: `None` deletes unconditionally; `Some(rev)`
+    /// deletes only if the current revision matches, else
+    /// `DeleteResult::Conflict`. Deleting an absent key is a no-op `Deleted`.
+    /// `Some(author)` records who deleted (stores that write tombstones stamp
+    /// it on the tombstone's `meta.author`). See ADR 0018 and ADR 0021.
+    async fn delete_as(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+        author: Option<Identity>,
+    ) -> Result<DeleteResult>;
+
+    /// [`delete_as`](Store::delete_as) without an author. Provided; stores
+    /// implement `delete_as`.
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        self.delete_as(key, expected, None).await
+    }
+
+    /// Like [`get`](Store::get), but also returns tombstones. For replication
+    /// (sync, pull, collection) only: consumers must use `get`. A store must
+    /// never implement this by calling `get`, which would hide the deletions
+    /// replication exists to carry. See ADR 0021.
+    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>>;
+
+    /// Like [`list`](Store::list), but also includes tombstoned keys. For
+    /// replication only. See ADR 0021.
+    async fn list_raw(&self, prefix: &crate::KeyPrefix) -> Result<Vec<RecordKey>>;
+
+    /// Replication write: store `record` exactly as given, never re-stamping.
+    /// A create (`expected == None`) that finds anything stored, tombstones
+    /// included, is a `Conflict` carrying it. Sync and pull use this; consumers
+    /// must use `put`. A store must never implement this by calling `put`,
+    /// whose recreation rule would resurrect records mid-sync. See ADR 0021.
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult>;
+
+    /// Physically remove the record at `key` only if its current revision is
+    /// `expected`; otherwise `DeleteResult::Conflict`. Absent is an idempotent
+    /// `Deleted`. The only physical removal in the system: used by tombstone
+    /// collection, which must pass the tombstone's revision so a record
+    /// recreated in the meantime survives. See ADR 0021.
+    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult>;
 }
 
 /// A content-addressed blob store for out-of-line record bodies

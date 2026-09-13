@@ -309,10 +309,41 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn delete(
+        async fn delete_as(
             &self,
             _key: &gonzalo_core::RecordKey,
             _expected: Option<Revision>,
+            _author: Option<Identity>,
+        ) -> gonzalo_core::Result<gonzalo_core::DeleteResult> {
+            Ok(gonzalo_core::DeleteResult::Deleted)
+        }
+
+        async fn put_raw(
+            &self,
+            record: Record,
+            expected: Option<Revision>,
+        ) -> gonzalo_core::Result<PutResult> {
+            <Self as gonzalo_core::Store>::put(self, record, expected).await
+        }
+
+        async fn get_raw(
+            &self,
+            _key: &gonzalo_core::RecordKey,
+        ) -> gonzalo_core::Result<Option<Record>> {
+            Ok(None)
+        }
+
+        async fn list_raw(
+            &self,
+            _prefix: &gonzalo_core::KeyPrefix,
+        ) -> gonzalo_core::Result<Vec<gonzalo_core::RecordKey>> {
+            Ok(vec![])
+        }
+
+        async fn purge(
+            &self,
+            _key: &gonzalo_core::RecordKey,
+            _expected: Revision,
         ) -> gonzalo_core::Result<gonzalo_core::DeleteResult> {
             Ok(gonzalo_core::DeleteResult::Deleted)
         }
