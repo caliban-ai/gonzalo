@@ -259,6 +259,44 @@ async fn delete_commits_a_tombstone_file_at_the_record_path() {
 }
 
 #[tokio::test]
+async fn delete_with_stale_expected_conflicts_without_committing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GitStore::open(dir.path()).unwrap();
+    let key = RecordKey::new("ns", "col", "guarded");
+    let rev = committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+    let (before, _) = head_commit_of(dir.path());
+
+    match store
+        .delete_as(
+            &key,
+            Some(Revision::initial(b"a-revision-that-was-never-current")),
+            Some(Identity::new("deleter")),
+        )
+        .await
+        .unwrap()
+    {
+        DeleteResult::Conflict(c) => {
+            assert_eq!(c.key, key);
+            assert_eq!(c.current.revision, rev);
+            assert!(!c.current.is_tombstone());
+        }
+        DeleteResult::Deleted => panic!("stale delete must conflict"),
+    }
+    assert_eq!(head_commit_of(dir.path()).0, before);
+
+    let raw = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(raw.revision, rev);
+    assert!(!raw.is_tombstone());
+    let consumer = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(consumer.revision, rev);
+}
+
+#[tokio::test]
 async fn noop_deletes_make_no_commit() {
     let dir = tempfile::tempdir().unwrap();
     let store = GitStore::open(dir.path()).unwrap();
