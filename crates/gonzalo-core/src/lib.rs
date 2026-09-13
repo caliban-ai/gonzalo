@@ -12,6 +12,12 @@ pub use revision::{ContentHash, Revision};
 pub mod record;
 pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
+pub mod tombstone;
+pub use tombstone::{
+    DEFAULT_ANCESTOR_CAP, TOMBSTONE_DOMAIN, fold_ancestors, now_ms, tombstone_hash, tombstone_of,
+    validate_ancestor_cap,
+};
+
 pub mod manifest;
 pub use manifest::{Manifest, Reconciliation, desired_set};
 
