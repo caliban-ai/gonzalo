@@ -316,10 +316,14 @@ async fn delete_stale_expected_writes_no_tombstone<S: Store>(store: &S) {
     let key = tomb_key("stale");
     let rev = committed(store, sample(key.clone(), b"keep"), None).await;
     let wrong = Revision::initial(b"a-revision-that-was-never-current");
-    assert!(matches!(
-        store.delete(&key, Some(wrong)).await.unwrap(),
-        DeleteResult::Conflict(_)
-    ));
+    match store.delete(&key, Some(wrong)).await.unwrap() {
+        DeleteResult::Conflict(c) => {
+            assert_eq!(c.key, key);
+            assert_eq!(c.current.revision, rev);
+            assert!(!c.current.is_tombstone());
+        }
+        DeleteResult::Deleted => panic!("a stale conditional delete must conflict"),
+    }
     let raw = store.get_raw(&key).await.unwrap().unwrap();
     assert!(!raw.is_tombstone());
     assert_eq!(raw.revision, rev);
