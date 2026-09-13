@@ -3,7 +3,9 @@
 //! section, ask a planner here what to do, and carry out the returned plan, so
 //! every substrate reaches identical decisions by construction.
 
-use crate::{Body, ContentHash, CoreError, Identity, Record, RecordKind, Result, Revision};
+use crate::{
+    Body, ContentHash, CoreError, Identity, Record, RecordKind, Result, Revision, store::Conflict,
+};
 
 /// Ancestor list length used when a store is not configured otherwise.
 /// About 90 bytes per serialized entry: ~2.9 KB at the cap.
@@ -93,6 +95,172 @@ pub fn tombstone_of(
         links: Vec::new(),
         ancestors,
         deleted_at: Some(now_ms),
+    }
+}
+
+/// What a store must do for a `put`. Decided with the store's current record
+/// in hand, inside its OCC critical section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+// The plan is a short-lived return value, never stored in a collection, so the
+// size difference between `Write(Record)` and the other variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
+pub enum PutPlan {
+    /// Persist exactly this record, then return
+    /// `PutResult::Committed(record.revision)`. On recreation the revision was
+    /// re-stamped; ancestors are always already folded.
+    Write(Record),
+    /// Persist nothing; return `PutResult::Conflict`.
+    Conflict(Box<Conflict>),
+    /// Persist nothing; return `Err(CoreError::NotFound(key))`.
+    NotFound,
+}
+
+/// Decide a consumer `put` (spec §3.2). A tombstone counts as absent: a create
+/// (`expected == None`) recreates the key past the tombstone, and any
+/// `Some(_)` is `NotFound`. Replication writes use [`plan_put_raw`].
+pub fn plan_put(
+    current: Option<&Record>,
+    mut record: Record,
+    expected: Option<Revision>,
+    cap: usize,
+) -> PutPlan {
+    match current {
+        None => {
+            if expected.is_some() {
+                return PutPlan::NotFound;
+            }
+            record.ancestors = fold_ancestors(&record.revision, &record.ancestors, None, cap);
+            PutPlan::Write(record)
+        }
+        Some(t) if t.is_tombstone() => match expected {
+            None => {
+                // Recreation: continue the chain past the tombstone so the new
+                // record is never ordered before the delete it follows.
+                let hash = if record.is_tombstone() {
+                    tombstone_hash()
+                } else {
+                    ContentHash::of(record.body.bytes())
+                };
+                record.revision = Revision {
+                    counter: t.revision.counter + 1,
+                    hash,
+                };
+                record.parent = Some(t.revision.clone());
+                if !record.is_tombstone() {
+                    record.deleted_at = None;
+                }
+                record.ancestors =
+                    fold_ancestors(&record.revision, &record.ancestors, Some(t), cap);
+                PutPlan::Write(record)
+            }
+            // Consumers never learn a tombstone's revision, so any `Some` here
+            // is stale; replication writes over tombstones use `plan_put_raw`.
+            Some(_) => PutPlan::NotFound,
+        },
+        Some(c) => {
+            if expected.as_ref() == Some(&c.revision) {
+                record.ancestors =
+                    fold_ancestors(&record.revision, &record.ancestors, Some(c), cap);
+                PutPlan::Write(record)
+            } else {
+                PutPlan::Conflict(Box::new(Conflict {
+                    key: record.key.clone(),
+                    expected,
+                    current: c.clone(),
+                }))
+            }
+        }
+    }
+}
+
+/// Decide a replication write (`Store::put_raw`, spec §3.2). Never re-stamps:
+/// a tombstone is an ordinary record here. A create that finds anything stored
+/// (live or tombstone) is a `Conflict` carrying it, so sync re-reads instead of
+/// turning a copy into a recreation that would resurrect a deleted record.
+pub fn plan_put_raw(
+    current: Option<&Record>,
+    mut record: Record,
+    expected: Option<Revision>,
+    cap: usize,
+) -> PutPlan {
+    match (current, expected) {
+        (None, None) => {
+            record.ancestors = fold_ancestors(&record.revision, &record.ancestors, None, cap);
+            PutPlan::Write(record)
+        }
+        (None, Some(_)) => PutPlan::NotFound,
+        (Some(c), Some(e)) if e == c.revision => {
+            record.ancestors = fold_ancestors(&record.revision, &record.ancestors, Some(c), cap);
+            PutPlan::Write(record)
+        }
+        (Some(c), expected) => PutPlan::Conflict(Box::new(Conflict {
+            key: record.key.clone(),
+            expected,
+            current: c.clone(),
+        })),
+    }
+}
+
+/// What a store must do for a `delete`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+// The plan is a short-lived return value, never stored in a collection, so the
+// size difference between `Write(Record)` and the other variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
+pub enum DeletePlan {
+    /// Persist this tombstone, then return `DeleteResult::Deleted`.
+    Write(Record),
+    /// Persist nothing; return `DeleteResult::Deleted`.
+    Noop,
+    /// Persist nothing; return `DeleteResult::Conflict`.
+    Conflict(Box<Conflict>),
+}
+
+/// Decide a conditional `delete` (spec §3.2). Deleting an absent key writes
+/// nothing: there is no revision to order a tombstone against a peer's copy.
+/// Deleting a tombstone writes nothing: the chain does not advance.
+pub fn plan_delete(
+    current: Option<&Record>,
+    expected: Option<Revision>,
+    now_ms: i64,
+    cap: usize,
+    author: Option<&Identity>,
+) -> DeletePlan {
+    match current {
+        None => DeletePlan::Noop,
+        Some(c) if c.is_tombstone() => DeletePlan::Noop,
+        Some(c) if expected.is_none() || expected.as_ref() == Some(&c.revision) => {
+            DeletePlan::Write(tombstone_of(c, now_ms, cap, author))
+        }
+        Some(c) => DeletePlan::Conflict(Box::new(Conflict {
+            key: c.key.clone(),
+            expected,
+            current: c.clone(),
+        })),
+    }
+}
+
+/// What a store must do for a `purge`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PurgePlan {
+    /// Physically remove the stored record; return `DeleteResult::Deleted`.
+    Remove,
+    /// Nothing is stored; return `DeleteResult::Deleted`.
+    Noop,
+    /// Remove nothing; return `DeleteResult::Conflict`.
+    Conflict(Box<Conflict>),
+}
+
+/// Decide a `purge`: remove only the exact revision named, so a key recreated
+/// after its tombstone was listed survives collection.
+pub fn plan_purge(current: Option<&Record>, expected: &Revision) -> PurgePlan {
+    match current {
+        None => PurgePlan::Noop,
+        Some(c) if &c.revision == expected => PurgePlan::Remove,
+        Some(c) => PurgePlan::Conflict(Box::new(Conflict {
+            key: c.key.clone(),
+            expected: Some(expected.clone()),
+            current: c.clone(),
+        })),
     }
 }
 
@@ -232,5 +400,219 @@ mod tests {
             tombstone_of(&cur, 1, 32, None).revision,
             cur.revision.next(b"")
         );
+    }
+
+    fn tomb(counter: u64) -> Record {
+        let prior = live(counter - 1, b"was", vec![]);
+        tombstone_of(&prior, 42, 32, None)
+    }
+
+    // ---- plan_put ----
+
+    #[test]
+    fn put_create_on_absent_writes() {
+        let rec = live(0, b"new", vec![]);
+        assert_eq!(plan_put(None, rec.clone(), None, 32), PutPlan::Write(rec));
+    }
+
+    #[test]
+    fn put_expected_on_absent_is_not_found() {
+        let rec = live(0, b"new", vec![]);
+        assert_eq!(
+            plan_put(None, rec, Some(rev(0, b"x")), 32),
+            PutPlan::NotFound
+        );
+    }
+
+    #[test]
+    fn put_update_with_matching_expected_folds_ancestors() {
+        let cur = live(0, b"v0", vec![]);
+        let mut next = live(1, b"v1", vec![]);
+        next.parent = Some(cur.revision.clone());
+        let PutPlan::Write(stored) =
+            plan_put(Some(&cur), next.clone(), Some(cur.revision.clone()), 32)
+        else {
+            panic!("expected Write");
+        };
+        assert_eq!(stored.revision, next.revision);
+        assert_eq!(stored.ancestors, vec![cur.revision.clone()]);
+    }
+
+    #[test]
+    fn put_over_live_with_wrong_or_no_expected_conflicts() {
+        let cur = live(0, b"v0", vec![]);
+        for expected in [None, Some(rev(9, b"nope"))] {
+            match plan_put(Some(&cur), live(1, b"v1", vec![]), expected.clone(), 32) {
+                PutPlan::Conflict(c) => {
+                    assert_eq!(c.current, cur);
+                    assert_eq!(c.expected, expected);
+                }
+                other => panic!("expected Conflict, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn put_none_over_tombstone_recreates_continuing_the_chain() {
+        let t = tomb(3);
+        let fresh = live(0, b"again", vec![]);
+        let PutPlan::Write(stored) = plan_put(Some(&t), fresh, None, 32) else {
+            panic!("expected Write");
+        };
+        assert_eq!(stored.revision, rev(t.revision.counter + 1, b"again"));
+        assert_eq!(stored.parent, Some(t.revision.clone()));
+        assert_eq!(stored.deleted_at, None);
+        assert_eq!(stored.ancestors.first(), Some(&t.revision));
+        assert_eq!(stored.kind, RecordKind::Topic);
+    }
+
+    #[test]
+    fn put_none_tombstone_over_tombstone_keeps_the_tombstone_hash() {
+        let t = tomb(3);
+        let mut incoming = t.clone();
+        incoming.revision = rev(0, b"");
+        let PutPlan::Write(stored) = plan_put(Some(&t), incoming, None, 32) else {
+            panic!("expected Write");
+        };
+        assert_eq!(stored.revision.hash, tombstone_hash());
+    }
+
+    #[test]
+    fn consumer_put_with_any_expected_over_tombstone_is_not_found() {
+        let t = tomb(3);
+        // Even the tombstone's own revision: replication uses plan_put_raw.
+        for expected in [rev(1, b"stale"), t.revision.clone()] {
+            assert_eq!(
+                plan_put(Some(&t), live(0, b"x", vec![]), Some(expected), 32),
+                PutPlan::NotFound
+            );
+        }
+    }
+
+    // ---- plan_put_raw ----
+
+    #[test]
+    fn put_raw_create_on_absent_writes_verbatim_including_tombstones() {
+        let t = tomb(3);
+        assert_eq!(plan_put_raw(None, t.clone(), None, 32), PutPlan::Write(t));
+    }
+
+    #[test]
+    fn put_raw_expected_on_absent_is_not_found() {
+        assert_eq!(
+            plan_put_raw(None, live(0, b"x", vec![]), Some(rev(0, b"x")), 32),
+            PutPlan::NotFound
+        );
+    }
+
+    #[test]
+    fn put_raw_create_over_tombstone_conflicts_carrying_it() {
+        let t = tomb(3);
+        match plan_put_raw(Some(&t), live(0, b"copy", vec![]), None, 32) {
+            PutPlan::Conflict(c) => {
+                assert!(c.current.is_tombstone());
+                assert_eq!(c.current, t);
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_raw_overwrite_of_tombstone_never_restamps() {
+        let t = tomb(3);
+        let mut incoming = live(9, b"peer", vec![t.revision.clone()]);
+        incoming.parent = Some(t.revision.clone());
+        let PutPlan::Write(stored) =
+            plan_put_raw(Some(&t), incoming.clone(), Some(t.revision.clone()), 32)
+        else {
+            panic!("expected Write");
+        };
+        assert_eq!(
+            stored.revision, incoming.revision,
+            "revision stored unchanged"
+        );
+        assert_eq!(stored.ancestors.first(), Some(&t.revision));
+    }
+
+    #[test]
+    fn put_raw_over_live_with_wrong_expected_conflicts() {
+        let cur = live(0, b"v0", vec![]);
+        assert!(matches!(
+            plan_put_raw(Some(&cur), live(1, b"v1", vec![]), Some(rev(7, b"no")), 32),
+            PutPlan::Conflict(_)
+        ));
+    }
+
+    // ---- plan_delete ----
+
+    #[test]
+    fn delete_absent_is_noop() {
+        assert_eq!(plan_delete(None, None, 1, 32, None), DeletePlan::Noop);
+        assert_eq!(
+            plan_delete(None, Some(rev(0, b"x")), 1, 32, None),
+            DeletePlan::Noop
+        );
+    }
+
+    #[test]
+    fn delete_tombstone_is_noop() {
+        let t = tomb(2);
+        assert_eq!(plan_delete(Some(&t), None, 1, 32, None), DeletePlan::Noop);
+        assert_eq!(
+            plan_delete(Some(&t), Some(rev(7, b"x")), 1, 32, None),
+            DeletePlan::Noop
+        );
+    }
+
+    #[test]
+    fn delete_live_writes_its_tombstone() {
+        let cur = live(4, b"v", vec![]);
+        let expected_tomb = tombstone_of(&cur, 77, 32, None);
+        assert_eq!(
+            plan_delete(Some(&cur), None, 77, 32, None),
+            DeletePlan::Write(expected_tomb.clone())
+        );
+        assert_eq!(
+            plan_delete(Some(&cur), Some(cur.revision.clone()), 77, 32, None),
+            DeletePlan::Write(expected_tomb)
+        );
+    }
+
+    #[test]
+    fn delete_live_with_stale_expected_conflicts() {
+        let cur = live(4, b"v", vec![]);
+        match plan_delete(Some(&cur), Some(rev(1, b"old")), 77, 32, None) {
+            DeletePlan::Conflict(c) => assert_eq!(c.current, cur),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    // ---- plan_purge ----
+
+    #[test]
+    fn purge_absent_is_noop() {
+        assert_eq!(plan_purge(None, &rev(0, b"x")), PurgePlan::Noop);
+    }
+
+    #[test]
+    fn purge_matching_revision_removes() {
+        let t = tomb(2);
+        assert_eq!(plan_purge(Some(&t), &t.revision), PurgePlan::Remove);
+    }
+
+    #[test]
+    fn purge_after_recreation_conflicts() {
+        let t = tomb(2);
+        let PutPlan::Write(recreated) = plan_put(Some(&t), live(0, b"back", vec![]), None, 32)
+        else {
+            panic!("expected Write");
+        };
+        match plan_purge(Some(&recreated), &t.revision) {
+            PurgePlan::Conflict(c) => {
+                assert_eq!(c.current, recreated);
+                assert_eq!(c.expected, Some(t.revision.clone()));
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 }
