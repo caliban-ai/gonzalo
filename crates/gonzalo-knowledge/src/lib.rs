@@ -270,7 +270,11 @@ pub fn chunk(record: &Record) -> Result<Option<Vec<String>>> {
         // These are the ONLY definitionally-opaque kinds — a parse failure on a
         // knowledge-bearing kind above propagates as an error rather than being
         // silently indistinguishable from "not indexable" (#139).
-        RecordKind::Checkpoint | RecordKind::GraphManifest => return Ok(None),
+        // A tombstone has no content; consumer reads never surface one, so
+        // this arm is belt-and-braces (ADR 0021).
+        RecordKind::Checkpoint | RecordKind::GraphManifest | RecordKind::Tombstone => {
+            return Ok(None);
+        }
     };
     Ok(Some(chunks))
 }
@@ -372,6 +376,8 @@ mod tests {
             },
             links: Vec::new(),
             key: key.clone(),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 

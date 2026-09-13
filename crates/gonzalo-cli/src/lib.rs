@@ -126,6 +126,8 @@ pub async fn migrate(
                 labels: BTreeMap::new(),
             },
             links: vec![],
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
 
         match store.put(record, None).await? {
@@ -621,6 +623,8 @@ pub async fn index_with_worker(
             labels: BTreeMap::new(),
         },
         links: Vec::new(),
+        ancestors: Vec::new(),
+        deleted_at: None,
     };
     match store.put(record, expected).await? {
         PutResult::Committed(_) => {}

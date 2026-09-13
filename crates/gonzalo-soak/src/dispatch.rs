@@ -167,6 +167,8 @@ mod tests {
             },
             links: Vec::new(),
             key: RecordKey::new("ns", "col", "k"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 

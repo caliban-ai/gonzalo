@@ -233,6 +233,8 @@ fn build_record(key: &RecordKey, body_bytes: &[u8], parent: Option<Revision>) ->
         },
         links: Vec::new(),
         key: key.clone(),
+        ancestors: Vec::new(),
+        deleted_at: None,
     }
 }
 

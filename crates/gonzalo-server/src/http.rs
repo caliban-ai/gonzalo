@@ -576,6 +576,8 @@ mod tests {
             },
             links: Vec::new(),
             key: RecordKey::new(namespace, "col", "x"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
         serde_json::to_vec(&PutBody {
             record,

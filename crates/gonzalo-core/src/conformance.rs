@@ -24,6 +24,8 @@ fn sample(key: RecordKey, payload: &[u8]) -> Record {
         },
         links: Vec::new(),
         key,
+        ancestors: Vec::new(),
+        deleted_at: None,
     }
 }
 

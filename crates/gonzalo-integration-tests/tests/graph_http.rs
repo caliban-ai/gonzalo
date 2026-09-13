@@ -40,6 +40,8 @@ async fn seed(fs: &FsStore) {
         },
         links: Vec::new(),
         key: Manifest::key("r", "main"),
+        ancestors: Vec::new(),
+        deleted_at: None,
     };
     assert!(matches!(
         fs.put(record, None).await.unwrap(),

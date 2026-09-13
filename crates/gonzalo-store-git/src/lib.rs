@@ -461,6 +461,8 @@ fn merged_record(key: &RecordKey, local: &Record, remote: &Record, body: Body) -
             labels,
         },
         links,
+        ancestors: Vec::new(),
+        deleted_at: None,
     }
 }
 

@@ -90,6 +90,8 @@ mod tests {
             },
             links: Vec::new(),
             key: key.clone(),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
 
         assert!(matches!(

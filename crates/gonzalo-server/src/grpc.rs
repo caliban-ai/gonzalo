@@ -463,6 +463,8 @@ mod tests {
             },
             links: Vec::new(),
             key: Manifest::key("r", "main"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
         let outcome = fs.put(record, None).await.unwrap();
         assert!(matches!(outcome, PutResult::Committed(_)));
@@ -541,6 +543,8 @@ mod tests {
             },
             links: Vec::new(),
             key: RecordKey::new(namespace, "col", "x"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
         PutRequest {
             record_json: serde_json::to_vec(&record).unwrap(),

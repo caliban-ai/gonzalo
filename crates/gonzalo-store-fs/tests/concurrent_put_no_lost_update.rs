@@ -27,6 +27,8 @@ fn rec(key: RecordKey, payload: &str) -> Record {
         },
         links: Vec::new(),
         key,
+        ancestors: Vec::new(),
+        deleted_at: None,
     }
 }
 

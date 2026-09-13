@@ -106,6 +106,8 @@ async fn upsert(
             labels: BTreeMap::new(),
         },
         links: vec![],
+        ancestors: Vec::new(),
+        deleted_at: None,
     };
     match store.put(record, expected).await? {
         PutResult::Committed(_) => Ok(if existing.is_some() {

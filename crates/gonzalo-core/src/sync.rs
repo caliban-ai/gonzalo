@@ -206,6 +206,8 @@ fn build_merged(key: &RecordKey, a: &Record, b: &Record, body: Body) -> Record {
             labels,
         },
         links,
+        ancestors: Vec::new(),
+        deleted_at: None,
     }
 }
 
@@ -426,6 +428,8 @@ mod tests {
                 labels: BTreeMap::new(),
             },
             links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 

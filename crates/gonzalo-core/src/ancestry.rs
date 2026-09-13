@@ -169,6 +169,8 @@ pub(crate) mod tests {
                 labels: BTreeMap::new(),
             },
             links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 

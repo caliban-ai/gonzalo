@@ -20,6 +20,8 @@ fn sample(key: RecordKey) -> Record {
         },
         links: Vec::new(),
         key,
+        ancestors: Vec::new(),
+        deleted_at: None,
     }
 }
 
