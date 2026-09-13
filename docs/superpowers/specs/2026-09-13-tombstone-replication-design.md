@@ -131,7 +131,7 @@ A tombstone written by `delete` over a live record `cur` has these fields:
 | `parent` | `Some(cur.revision)` |
 | `ancestors` | `[cur.revision] ++ cur.ancestors`, capped |
 | `deleted_at` | `Some(now_ms)` |
-| `meta` | `cur.meta`, with `author` restamped by the daemon when authenticated (as `put` is today, `grpc.rs:142`) |
+| `meta` | `cur.meta`, with `author` replaced by the deleter when one is given (`Store::delete_as`, §3.2). The daemon passes the authenticated principal, as it stamps `put` today (`grpc.rs:139-143`, `http.rs:161-165`). |
 | `links` | empty |
 
 **`TOMBSTONE_HASH` is a fixed domain-separated hash,
@@ -163,20 +163,33 @@ pub trait Store: Send + Sync {
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>>;
     /// See "put over a tombstone" below.
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult>;
-    /// Same signature, new meaning: writes a tombstone instead of removing.
-    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult>;
+    /// Writes a tombstone instead of removing. `Some(author)` records the
+    /// deleter as the tombstone's `meta.author`. Stores implement this.
+    async fn delete_as(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+        author: Option<Identity>,
+    ) -> Result<DeleteResult>;
+    /// Same signature as today, provided: `self.delete_as(key, expected, None)`.
+    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+        self.delete_as(key, expected, None).await
+    }
 
     // ---- replication surface (tombstones visible) ----
     async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>>;
     async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>>;
+    /// Replication write: stores `record` exactly as given, never re-stamps.
+    /// See "replication writes" below.
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult>;
     /// Physically remove the record at `key` only if its current revision is
     /// `expected`. The only physical removal in the system.
     async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult>;
 }
 ```
 
-`get_raw`, `list_raw` and `purge` are **required methods with no default
-implementation.** A default of `get_raw = get` would compile, pass every test
+`delete_as`, `get_raw`, `list_raw`, `put_raw` and `purge` are **required
+methods with no default implementation**. Only `delete` is provided. A default of `get_raw = get` would compile, pass every test
 that doesn't involve deletion, and silently resurrect records in production.
 Requiring them is a breaking change to `gonzalo-core`, so this ships in 0.7.0.
 
@@ -200,14 +213,12 @@ don't leak through the consumer surface.
 
 #### `put` over a tombstone
 
-Consumers see a tombstoned key as absent, so `put` treats it as absent too,
-with one exception for replication:
+Consumers see a tombstoned key as absent, so `put` treats it as absent:
 
 | Current state | `expected` | Result |
 |---|---|---|
 | tombstone `t` | `None` | **Recreation.** The store writes the caller's record with its `revision` **re-stamped** to `Revision { counter: t.revision.counter + 1, hash: ContentHash::of(body) }`, `parent = Some(t.revision)`, and `t.revision` folded into `ancestors` → `Committed(new_revision)` |
-| tombstone `t` | `Some(t.revision)` | **Replication overwrite.** Written with the caller's revision unchanged → `Committed` |
-| tombstone `t` | `Some(other)` | same as absent + `Some`: `Err(CoreError::NotFound)` |
+| tombstone `t` | `Some(_)` (any, including `t.revision`) | same as absent + `Some`: `Err(CoreError::NotFound)` |
 
 Recreation is **the one case where `put` does not store the caller's revision
 unchanged.** A consumer building a "new" record after a delete will typically
@@ -216,9 +227,29 @@ record would look *older* than the tombstone and could lose to it in sync. The
 re-stamp keeps the chain moving forward. `PutResult::Committed` already returns
 the stored revision, so callers learn the real value without any API change.
 
-Consumers never see a tombstone's revision, so they can't pass
-`Some(t.revision)` by accident. That argument is only used by sync and pull
-after a raw read.
+#### Replication writes: `put_raw`
+
+Sync and pull write through `put_raw`, which stores exactly the record it is
+given (ancestors folded) and **never re-stamps**. A tombstone is an ordinary
+record to it:
+
+| Current state | `expected` | Result |
+|---|---|---|
+| absent | `None` | written → `Committed(record.revision)` |
+| absent | `Some(_)` | `Err(CoreError::NotFound)` |
+| any `c`, live or tombstone | `Some(c.revision)` | written unchanged → `Committed(record.revision)` |
+| any `c`, live or tombstone | `None` or `Some(other)` | nothing written → `Conflict { current: c }`, which may carry a tombstone |
+
+**Why a separate write.** An earlier draft had sync copy one-sided records with
+consumer `put(rec, None)` and overwrite tombstones with `put(rec, Some(t.revision))`.
+The copy has a race. Sync reads B raw and finds the key absent; before its
+`put` lands, B gains a tombstone for that key (a local delete, or another sync).
+Consumer `put(rec, None)` over a tombstone is a recreation, so B would re-stamp
+the copied record past the tombstone and **resurrect** it, and every later sync
+would spread the resurrected copy. With `put_raw` the same interleaving is a
+`Conflict`, sync re-reads, and the ordering rules in §3.4 decide.
+`Conflict` values from `put_raw` may carry a tombstone. That is acceptable
+because the raw surface is replication-only.
 
 #### Ancestor maintenance on every committed `put` or `delete`
 
@@ -253,7 +284,16 @@ that same critical section.
 |---|---|---|---|---|
 | **fs** | atomic tombstone write under the per-key flock (temp + fsync + rename, the `put_locked` path) | read and filter by kind | today's `get` / `list` | today's `delete_locked` with `expected` required |
 | **git** | commit the tombstone file | read and filter | today's reads | today's `commit_removal` |
-| **s3** | conditional `PutObject` with `If-Match` on the read ETag | `GetObject` per key and filter (see §8.4) | today's reads | today's conditional `DeleteObject` |
+| **s3** | conditional `PutObject` with `If-Match` on the read ETag (`If-None-Match: *` when nothing was read) | `GetObject` per key and filter (see §8.4) | today's reads | conditional `DeleteObject` with `If-Match` |
+
+**s3 lost races.** fs and git decide under a lock, but s3 decides from an
+unlocked read and then writes conditionally. A conditional write that fails
+(HTTP 412) means someone wrote in between. s3 then re-reads the object and its
+ETag, **re-runs the same planner**, and retries. After 8 consecutive lost races
+it returns `CoreError::Backend`. Re-planning rather than mapping a 412 straight
+to `Conflict` gives s3 exactly the lock-based stores' outcomes. For example,
+`delete(key, None)` never reports a conflict just because a concurrent edit
+landed first; it deletes the newer revision, as fs would.
 | **daemon client** (`ServerStore`) | existing endpoint | existing endpoints | new endpoints (§3.6) | new endpoint |
 | **`AncestryStore`** | passes through | passes through | passes through | passes through |
 
@@ -293,6 +333,18 @@ otherwise merge" to:
                                                revisions)
 (ra, None) / (None, rb)                      → copy, unchanged (tombstones included)
 ```
+
+Every write sync makes (copy, overwrite, tombstone winner, merged record) goes
+through **`put_raw`** (§3.2), never consumer `put`. If a write returns
+`Conflict` or `NotFound`, the store changed after the raw read. Sync marks the
+pass as raced and re-loops, exactly as it already does for concurrent writes.
+The resurrection window described in §3.2 therefore can't open.
+
+Sync doesn't know either store's ancestor cap. It folds ancestors without
+truncating, and each store's `plan_put_raw` truncates to its own cap on write.
+
+`SyncReport` gains `fast_forwarded_to_a` and `fast_forwarded_to_b`, so a
+fast-forward is reported separately from a merge.
 
 What this changes for records that have nothing to do with deletion:
 
@@ -350,10 +402,34 @@ paths and gain the hide-tombstones meaning through the backing store.
 | HTTP | gRPC | Store call | Auth (ADR 0015) |
 |---|---|---|---|
 | `GET /v1/raw/records/{ns}/{col}/{id}` | `GetRaw` | `get_raw` | `read` on `ns` |
-| `GET /v1/raw/keys?namespace=&collection=` | `ListRaw` | `list_raw` | `read` on `ns`; admin when unscoped |
+| `GET /v1/raw/keys?namespace=&collection=` | `ListRaw` | `list_raw` | `read` on `ns`; read on `*` when unscoped, like `/v1/keys` today |
+| `PUT /v1/raw/records/{ns}/{col}/{id}` (body as consumer put) | `PutRaw` | `put_raw` | `write` on `ns` |
 | `POST /v1/purge/{ns}/{col}/{id}` (body: expected revision JSON) | `Purge` | `purge` | **admin** |
 
-Existing `DELETE /v1/records/...` keeps requiring `write` on the namespace.
+- **Delete.** Existing `DELETE /v1/records/...` keeps requiring `write` on the
+  namespace and now calls `delete_as` with the authenticated principal's
+  identity (open mode passes `None`).
+- **Author on `put_raw`.** ADR 0015 promises authorship can't be forged, and
+  the daemon keeps that promise.
+  - When auth is enabled and the principal is **not** admin, `put_raw`
+    restamps `meta.author` to the principal, exactly as consumer `put` does.
+  - An admin principal (the replication credential for daemon-to-daemon or
+    operator sync) keeps the replicated record's author, and so does open
+    mode.
+  - This is about authorship only. `put_raw` never re-stamps the *revision*.
+- **Not-found puts over the wire.** A `put` or `put_raw` the store rejects
+  with `NotFound` (e.g. `Some(expected)` over a tombstone) returns HTTP `412` /
+  gRPC `FailedPrecondition`, and `ServerStore` maps it back to
+  `CoreError::NotFound`. Previously every store error surfaced as an opaque
+  `500` / `Internal`. It isn't `404`, because on the raw routes that means "old
+  daemon".
+- **Admin.** ADR 0015 has no admin role. An admin is a principal with `"*"` in
+  both its read and write lists (`auth.rs:43-46`), and the daemon gains a
+  `Principal::is_admin()` helper for purge. Open mode (`Auth::Disabled`) counts
+  as admin.
+- **Absent key on a raw get.** It returns `200 {"record": null}`, not 404, so a
+  404 on a raw route always means "this daemon doesn't have the route". The
+  client relies on that.
 
 **`ServerStore` against an old daemon.** HTTP 404 on the raw routes, or gRPC
 `Unimplemented`, maps to
@@ -432,7 +508,11 @@ constructor).
 - `pub const DEFAULT_ANCESTOR_CAP: usize = 32;` in `gonzalo-core`.
 - Each store gets a builder method, `.with_ancestor_cap(n: usize) -> Self`, so
   existing constructors keep compiling. `n == 0` is rejected at construction.
-- The CLI and `gonzalod` each get `--ancestor-cap <n>`.
+- The CLI gets `--ancestor-cap <n>` on `delete`, `reset`, `collect` and
+  `sync`, the commands that open a store for these operations.
+- `gonzalod` has no command-line flags; it is configured only through
+  `GONZALO_*` environment variables. It reads `GONZALO_ANCESTOR_CAP`, and a
+  value of 0 or an unparsable value is a startup error.
 - **Size:** about 90 bytes per serialized ancestor, so roughly 2.9 KB at the
   default cap, and only on records edited 32 or more times.
 - **Mixed caps across peers** are safe. Each store truncates to its own cap on
@@ -441,15 +521,27 @@ constructor).
 
 ### 3.10 CLI
 
-| Command | Behaviour | Exit code |
-|---|---|---|
-| `gonzalo delete --namespace N --collection C --id I [--expected REV]` | one tombstone | 0 deleted; 1 conflict |
-| `gonzalo reset --namespace N [--collection C]` | §3.7, prints `N deleted, M conflicts` | 0 if M == 0; 1 otherwise |
-| `gonzalo collect --older-than 30d [--namespace N [--collection C]]` | §3.8, prints purged / unstamped / conflicts, and the horizon it used | 0 unless an I/O error |
+The CLI opens only a local `FsStore` (`--root`, default `.`), so the daemon's
+admin scope doesn't apply to these commands. `--ancestor-cap <K>` (default 32)
+is accepted by all three and by `sync`.
 
-`reset` without `--namespace` is a clap validation error, not a runtime
-prompt. `collect` without `--namespace` runs across the whole store (admin on a
-daemon).
+**Exit codes:** 0 success, 1 error, 2 usage error (clap), **3 conflict**. A
+conflict gets its own code so scripts can tell "someone else changed it" apart
+from an I/O failure.
+
+| Command | Output | Exit |
+|---|---|---|
+| `gonzalo delete --namespace N --collection C --id I [--expected REVISION_JSON]` | `deleted: N/C/I`, or `conflict: N/C/I` plus `current:  <revision JSON>` | 0 deleted (including absent or already deleted); 3 conflict |
+| `gonzalo reset --namespace N [--collection C]` | stdout `X deleted, M conflicts`; stderr one `conflict: <key>` per conflict | 0 if M == 0; 3 if M > 0 (re-run to finish) |
+| `gonzalo collect --older-than DURATION [--namespace N [--collection C]]` | four lines: `horizon: <as typed> (<seconds>s)`, `purged: P`, `unstamped: U`, `conflicts: Q` | 0 even with conflicts (nothing to retry) |
+
+- **`--expected`** is a revision as JSON, exactly as `gonzalo get` prints one.
+- **`delete` authorship:** the tombstone is attributed to `gonzalo-cli`, the
+  identity the CLI already stamps on its writes.
+- **`--older-than`** is a positive integer plus one unit (`d`, `h`, `m`, `s`),
+  parsed without new dependencies. Zero is rejected.
+- **Usage errors (exit 2):** `reset` without `--namespace`, and
+  `--collection` without `--namespace` on `collect`.
 
 ## 4. Compatibility
 
@@ -477,7 +569,7 @@ intended outcome.
   ordering, version vectors, automatic collection).
 - **ADR 0018** stays `accepted`. Its OCC semantics still hold; only its
   local-only decision is superseded. Index row:
-  `accepted (local-only deletion superseded by [0021])`. 0021's Context names
+  `accepted (local-only deletion superseded by [0021](0021-replicated-deletion-with-tombstones.md))`. 0021's Context names
   the part of 0018 it supersedes, so the link goes both ways, as
   `adr-validate` requires.
 
@@ -537,10 +629,13 @@ The four existing delete cases are rewritten for the new meaning (for example,
 | `independent_deletes_are_identical` | Deleting the same revision on two fresh stores gives equal revisions |
 | `tombstone_never_collides_with_empty_body` | Tombstone revision ≠ an empty-body live edit at the same counter |
 | `recreate_continues_chain` | `put(initial_rec, None)` over a tombstone → `Committed(r)` with `r.counter == tomb.counter + 1`, `parent == tomb.revision`, tombstone in `ancestors` |
-| `put_some_over_tombstone_is_not_found` | `put(rec, Some(random))` over a tombstone → `NotFound` |
-| `replication_overwrite_of_tombstone` | `put(rec, Some(tomb.revision))` stores `rec.revision` unchanged |
+| `put_some_over_tombstone_is_not_found` | consumer `put(rec, Some(r))` over a tombstone → `NotFound`, both for a random `r` and for the tombstone's own revision |
+| `replication_overwrite_of_tombstone` | `put_raw(rec, Some(tomb.revision))` succeeds, and consumer `get` then returns `rec` |
 | `purge_removes_physically` | After `purge`: `get_raw` → `None`, `list_raw` excludes the key |
 | `purge_conflicts_after_recreation` | `purge(tomb.revision)` after a recreation → `Conflict`, live record intact |
+| `put_raw_create_over_tombstone_conflicts` | `put_raw(rec, None)` over a tombstone → `Conflict` whose `current` is the tombstone; nothing written |
+| `put_raw_never_restamps` | `put_raw(rec, Some(tomb.revision))` stores `rec.revision` unchanged, with the tombstone in `ancestors` |
+| `delete_as_stamps_author` | `delete_as(key, None, Some(deleter))` → the tombstone's `meta.author == deleter` |
 | `ancestors_capped_and_ordered` | After cap + 5 updates: `ancestors.len() == cap`, newest first, matching the fold rule |
 
 ### 6.2 Sync (`gonzalo-core/src/sync.rs` tests, `MemStore`)
@@ -572,8 +667,9 @@ The four existing delete cases are rewritten for the new meaning (for example,
 ### 6.4 Reset and collect (core tests)
 
 - reset refuses a prefix without a namespace
-- reset with a concurrent edit reports the key in `conflicts`, and a second run
-  deletes nothing more and conflicts on nothing new (idempotent)
+- reset with a concurrent edit reports the key in `conflicts`. A second run
+  tombstones exactly that key (§3.7), and a third run deletes nothing and
+  reports no conflicts (idempotent)
 - reset scoped to a collection leaves sibling collections alone
 - collect skips unstamped, too-young and future-dated tombstones, and never
   touches live records
@@ -582,7 +678,10 @@ The four existing delete cases are rewritten for the new meaning (for example,
 
 ### 6.5 Daemon (`gonzalo-server` http + grpc tests)
 
-- raw reads need `read`, purge needs admin, and unscoped `list_raw` needs admin
+- raw reads need `read`, `put_raw` needs `write`, purge needs admin, and
+  unscoped `list_raw` needs read on `*`
+- an authenticated delete stamps the principal as the tombstone's
+  `meta.author`, and `put_raw` keeps the replicated record's author
 - `delete` over the wire returns a tombstone on a later `get_raw`
 - `ServerStore` maps 404 / `Unimplemented` on raw routes to the upgrade error,
   and never calls consumer `get` as a fallback (asserted with a wiremock that
@@ -600,6 +699,12 @@ The four existing delete cases are rewritten for the new meaning (for example,
   concurrent writers.
 - New oracle invariant: after writers stop and replicas settle, **every key is
   either live on all replicas or a tombstone on all replicas**, never a mix.
+- **What this can catch.** Every soak replica fronts **one shared bucket** and
+  no sync runs between them, so the invariant can't detect storage-replication
+  divergence. It does catch daemon read-path bugs (caching, raw vs. consumer
+  filtering, a replica's `get` disagreeing with its own `get_raw`) and deletes
+  lost across replica kills. Replication correctness is covered by §6.2 and
+  §6.3.
 - The existing "conflicts were actually exercised" check extends to delete
   conflicts.
 
