@@ -943,6 +943,8 @@ mod tests {
             },
             links: Vec::new(),
             key: Manifest::key("r", "main"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
         assert!(matches!(
             fs.put(record, None).await.unwrap(),
@@ -1454,6 +1456,8 @@ mod tests {
                 },
                 links: Vec::new(),
                 key: Manifest::key("r", view),
+                ancestors: Vec::new(),
+                deleted_at: None,
             };
             assert!(matches!(
                 fs.put(record, None).await.unwrap(),

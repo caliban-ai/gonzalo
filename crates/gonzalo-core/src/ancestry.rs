@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    BlobStore, DeleteResult, KeyPrefix, PutResult, Record, RecordKey, Result, Revision, Store,
+    BlobStore, DeleteResult, Identity, KeyPrefix, PutResult, Record, RecordKey, Result, Revision,
+    Store,
 };
 
 /// Wraps a record [`Store`] and an ancestry [`BlobStore`]. On a committed `put`
@@ -55,11 +56,40 @@ impl<S: Store, B: BlobStore> Store for AncestryStore<S, B> {
         self.inner.list(prefix).await
     }
 
-    async fn delete(&self, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
-        // Delete is local and leaves ancestry blobs untouched: retained bodies
-        // stay available for a later divergence's 3-way merge (ADR 0016), and a
-        // sync from a peer may resurrect the record (ADR 0018).
-        self.inner.delete(key, expected).await
+    async fn delete_as(
+        &self,
+        key: &RecordKey,
+        expected: Option<Revision>,
+        author: Option<Identity>,
+    ) -> Result<DeleteResult> {
+        // Retained ancestry blobs stay: they may back a later divergence's
+        // 3-way merge (ADR 0016).
+        self.inner.delete_as(key, expected, author).await
+    }
+
+    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+        self.inner.get_raw(key).await
+    }
+
+    async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        self.inner.list_raw(prefix).await
+    }
+
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        // Replicated bodies are retained exactly like local puts, so a later
+        // divergence can still find this version as its merge base.
+        let body_bytes = record.body.bytes().to_vec();
+        let outcome = self.inner.put_raw(record, expected).await?;
+        if matches!(outcome, PutResult::Committed(_)) {
+            self.ancestry.put_blob(&body_bytes).await?;
+        }
+        Ok(outcome)
+    }
+
+    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        // Retained ancestry bodies stay: they are content-addressed and may
+        // back other records' merges (ADR 0016).
+        self.inner.purge(key, expected).await
     }
 }
 
@@ -110,10 +140,11 @@ pub(crate) mod tests {
                 .cloned()
                 .collect())
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             key: &RecordKey,
             expected: Option<Revision>,
+            _author: Option<Identity>,
         ) -> Result<DeleteResult> {
             let mut g = self.records.lock().unwrap();
             match g.get(key) {
@@ -128,6 +159,18 @@ pub(crate) mod tests {
                     current: cur.clone(),
                 }))),
             }
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            <Self as Store>::put(self, record, expected).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.get(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.list(prefix).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.delete(key, Some(expected)).await
         }
     }
 
@@ -169,6 +212,8 @@ pub(crate) mod tests {
                 labels: BTreeMap::new(),
             },
             links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 

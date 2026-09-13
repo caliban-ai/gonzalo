@@ -18,6 +18,10 @@ pub enum RecordKind {
     /// A per-view code-graph manifest: `(repo, view_id) -> { path -> content_hash }`.
     /// Regenerable from source; reconciled last-writer-wins. See ADR 0012.
     GraphManifest,
+    /// A deletion marker. Hidden from consumer reads (`get`/`list`); replicated
+    /// by sync and pull through raw reads; physically removed only by
+    /// `Store::purge`. See ADR 0021.
+    Tombstone,
 }
 
 /// How concurrent edits to a record of a given kind are reconciled.
@@ -46,6 +50,9 @@ impl RecordKind {
             RecordKind::MemoryTier | RecordKind::Ticket => MergeClass::Structured,
             RecordKind::Checkpoint => MergeClass::Opaque,
             RecordKind::GraphManifest => MergeClass::Derived,
+            // Sync and pull reconcile tombstones before any body merge runs;
+            // the most conservative class guards a path that forgets to.
+            RecordKind::Tombstone => MergeClass::Opaque,
         }
     }
 }
@@ -112,6 +119,22 @@ pub struct Record {
     pub body: Body,
     pub meta: Meta,
     pub links: Vec<RecordKey>,
+    /// Recent revisions this record descends from, newest first, bounded by the
+    /// store's ancestor cap. Advisory: a missing or truncated list makes sync
+    /// report a conflict instead of guessing. Empty on legacy records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<Revision>,
+    /// Tombstones only: when the delete happened, in ms since the Unix epoch.
+    /// Stamped by the store. `None` means collection never purges it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<i64>,
+}
+
+impl Record {
+    /// Whether this record is a deletion marker.
+    pub fn is_tombstone(&self) -> bool {
+        self.kind == RecordKind::Tombstone
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +178,71 @@ mod tests {
         // record-level face of content-addressed dedup).
         assert_eq!(Body::blob(b"same").bytes(), Body::blob(b"same").bytes());
         assert_ne!(Body::blob(b"same").bytes(), Body::blob(b"diff").bytes());
+    }
+
+    fn plain_record() -> Record {
+        let body = Body::Inline(b"hello".to_vec());
+        Record {
+            key: RecordKey::new("ns", "col", "id"),
+            kind: RecordKind::Topic,
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            meta: Meta {
+                author: Identity::new("t"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn tombstone_kind_is_opaque_and_detected() {
+        assert_eq!(RecordKind::Tombstone.merge_class(), MergeClass::Opaque);
+        let mut r = plain_record();
+        assert!(!r.is_tombstone());
+        r.kind = RecordKind::Tombstone;
+        assert!(r.is_tombstone());
+    }
+
+    #[test]
+    fn tombstone_kind_serializes_as_its_name() {
+        assert_eq!(
+            serde_json::to_string(&RecordKind::Tombstone).unwrap(),
+            "\"Tombstone\""
+        );
+    }
+
+    #[test]
+    fn empty_new_fields_are_omitted_from_json() {
+        let json = serde_json::to_value(plain_record()).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("ancestors"));
+        assert!(!obj.contains_key("deleted_at"));
+    }
+
+    #[test]
+    fn legacy_json_without_new_fields_deserializes() {
+        let mut json = serde_json::to_value(plain_record()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("ancestors");
+        obj.remove("deleted_at");
+        let back: Record = serde_json::from_value(json).unwrap();
+        assert_eq!(back, plain_record());
+    }
+
+    #[test]
+    fn populated_new_fields_roundtrip() {
+        let mut r = plain_record();
+        r.kind = RecordKind::Tombstone;
+        r.ancestors = vec![Revision::initial(b"a"), Revision::initial(b"b")];
+        r.deleted_at = Some(1_700_000_000_000);
+        let back: Record = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
     }
 }

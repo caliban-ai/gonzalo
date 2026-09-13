@@ -12,6 +12,13 @@ pub use revision::{ContentHash, Revision};
 pub mod record;
 pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
+pub mod tombstone;
+pub use tombstone::{
+    CONSUMER_TOMBSTONE_REJECTED, DEFAULT_ANCESTOR_CAP, DeletePlan, PurgePlan, PutPlan,
+    TOMBSTONE_DOMAIN, fold_ancestors, now_ms, plan_delete, plan_purge, plan_put, plan_put_raw,
+    tombstone_hash, tombstone_of, validate_ancestor_cap,
+};
+
 pub mod manifest;
 pub use manifest::{Manifest, Reconciliation, desired_set};
 
@@ -35,6 +42,9 @@ pub use ancestry::AncestryStore;
 
 pub mod sync;
 pub use sync::{SyncConflict, SyncReport, sync, sync_with_ancestry};
+
+#[cfg(any(test, feature = "conformance"))]
+pub mod memstore;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;

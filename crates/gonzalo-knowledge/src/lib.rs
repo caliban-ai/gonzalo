@@ -267,10 +267,16 @@ pub fn chunk(record: &Record) -> Result<Option<Vec<String>>> {
         }
         // Not knowledge-bearing: a checkpoint is opaque state; a graph manifest
         // is a path -> content-hash map, not natural-language text (ADR 0011/0012).
-        // These are the ONLY definitionally-opaque kinds — a parse failure on a
-        // knowledge-bearing kind above propagates as an error rather than being
-        // silently indistinguishable from "not indexable" (#139).
-        RecordKind::Checkpoint | RecordKind::GraphManifest => return Ok(None),
+        // Checkpoint and GraphManifest are the ONLY definitionally-opaque
+        // kinds — a parse failure on a knowledge-bearing kind above
+        // propagates as an error rather than being silently indistinguishable
+        // from "not indexable" (#139).
+        // Tombstone is listed here defensively, not definitionally: consumer
+        // reads never surface one, so indexing never actually sees this kind
+        // (ADR 0021).
+        RecordKind::Checkpoint | RecordKind::GraphManifest | RecordKind::Tombstone => {
+            return Ok(None);
+        }
     };
     Ok(Some(chunks))
 }
@@ -372,6 +378,8 @@ mod tests {
             },
             links: Vec::new(),
             key: key.clone(),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 

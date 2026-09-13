@@ -53,6 +53,8 @@ Slices 2 and 3 can run in parallel once slice 1 has merged. So can slices 5 and 
 record's merge class, so an append-only kind silently drops the remote delete.
 Slice 5 fixes this. It's another reason nothing is tagged before slice 5.
 - **After slice 4:** `run_store_conformance` calls the tombstone cases itself, so every future store gets them automatically.
+- **Before slice 4 merges:** `ServerStore::get_raw` / `list_raw` / `put_raw` are interim consumer delegations, same as the other stores' interim raw methods. Running slice 5's sync against a daemon before slice 4 merges would therefore still use consumer reads under the hood. Merge slice 4 before relying on daemon sync.
+- **For slice 7's ADR 0021:** independent deletes of the same revision converge on byte-identical tombstone revisions (§3.1), but each peer stamps its own `deleted_at` at its own local delete time, so peers may become eligible to purge — and actually purge — at different times. That's harmless under the explicit-horizon collection model (§3.8): collection never runs automatically, and a purge only removes the exact revision named, so a peer that purges later never resurrects or diverges from one that purged earlier.
 
 ---
 
@@ -128,6 +130,10 @@ pub enum PutPlan {
     Conflict(Box<Conflict>),
     /// Return Err(CoreError::NotFound(key)).
     NotFound,
+    /// The record may not be written through this path. Return
+    /// Err(CoreError::Backend(reason.to_string())). Only consumer `plan_put`
+    /// produces this, for a `RecordKind::Tombstone` record.
+    Rejected(&'static str),
 }
 pub fn plan_put(
     current: Option<&Record>,
@@ -172,6 +178,7 @@ Planner decision tables (these are the single source of truth; spec §3.2):
 
 | `plan_put` current | expected | Plan |
 |---|---|---|
+| any | any | record is `RecordKind::Tombstone` → `Rejected(CONSUMER_TOMBSTONE_REJECTED)` |
 | `None` | `None` | `Write(record with ancestors folded)` |
 | `None` | `Some(_)` | `NotFound` |
 | live `c` | `Some(c.revision)` | `Write(record with ancestors folded against c)` |
@@ -232,6 +239,7 @@ The consumer methods keep their signatures. From slice 2/3/4 onward per store: `
 **Why `put_raw` exists.** Sync's one-sided copy used to call consumer `put(rec, None)`. If a tombstone landed on the destination between sync's raw read and that put, `plan_put` treated the copy as a recreation, re-stamped it past the tombstone, and brought the deleted record back. Every replication write goes through `put_raw`, which never re-stamps.
 
 **Rules every store follows:**
+- A `PutPlan::Rejected(reason)` maps to `Err(CoreError::Backend(reason.to_string()))`.
 - A conformance factory returns a fresh, empty store on every call.
 - A stored object that fails to deserialize is still included by consumer `list`, as today, so `get` surfaces the parse error.
 - s3 only: a lost conditional write (HTTP 412) re-reads and re-plans, up to 8 attempts, then returns `CoreError::Backend`. That gives the same outcomes as the lock-based stores.

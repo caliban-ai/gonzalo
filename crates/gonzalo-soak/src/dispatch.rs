@@ -133,10 +133,11 @@ mod tests {
         async fn list(&self, _prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
             Ok(Vec::new())
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             _key: &RecordKey,
             _expected: Option<Revision>,
+            _author: Option<Identity>,
         ) -> Result<DeleteResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.alive.load(Ordering::SeqCst) {
@@ -144,6 +145,18 @@ mod tests {
             } else {
                 Err(CoreError::Backend("connection refused".into()))
             }
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            <Self as Store>::put(self, record, expected).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.get(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.list(prefix).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.delete(key, Some(expected)).await
         }
     }
 
@@ -167,6 +180,8 @@ mod tests {
             },
             links: Vec::new(),
             key: RecordKey::new("ns", "col", "k"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         }
     }
 
@@ -256,7 +271,28 @@ mod tests {
             async fn list(&self, _p: &KeyPrefix) -> Result<Vec<RecordKey>> {
                 Ok(Vec::new())
             }
-            async fn delete(&self, _k: &RecordKey, _e: Option<Revision>) -> Result<DeleteResult> {
+            async fn delete_as(
+                &self,
+                _k: &RecordKey,
+                _e: Option<Revision>,
+                _author: Option<Identity>,
+            ) -> Result<DeleteResult> {
+                Ok(DeleteResult::Deleted)
+            }
+            async fn put_raw(
+                &self,
+                record: Record,
+                expected: Option<Revision>,
+            ) -> Result<PutResult> {
+                <Self as Store>::put(self, record, expected).await
+            }
+            async fn get_raw(&self, _k: &RecordKey) -> Result<Option<Record>> {
+                Ok(None)
+            }
+            async fn list_raw(&self, _p: &KeyPrefix) -> Result<Vec<RecordKey>> {
+                Ok(Vec::new())
+            }
+            async fn purge(&self, _k: &RecordKey, _e: Revision) -> Result<DeleteResult> {
                 Ok(DeleteResult::Deleted)
             }
         }

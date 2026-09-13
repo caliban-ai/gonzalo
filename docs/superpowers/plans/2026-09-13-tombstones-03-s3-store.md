@@ -597,6 +597,9 @@ fn put_step(key: &RecordKey, plan: PutPlan) -> Result<Planned<PutResult>> {
         }
         PutPlan::Conflict(conflict) => Ok(Planned::Finish(PutResult::Conflict(conflict))),
         PutPlan::NotFound => Err(CoreError::NotFound(key.clone())),
+        // Only consumer `plan_put` produces this, for a `RecordKind::Tombstone`
+        // record: deletes go through `delete_as`, replication through `put_raw`.
+        PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
     }
 }
 
@@ -1447,7 +1450,7 @@ Expected: PASS, `test result: ok. 24 passed; 0 failed`, and no dead-code warning
 
 Run (RustFS env exported):
 `cargo test -p gonzalo-store-s3 --all-features --test integration -- --nocapture`
-Expected: PASS, `test result: ok. 7 passed; 0 failed`, with none of them skipping. That includes slice 1's `put_raw_create_over_tombstone_conflicts`, `put_raw_never_restamps` and `delete_as_stamps_author` cases inside both tombstone-conformance runs.
+Expected: PASS, `test result: ok. 7 passed; 0 failed`, with none of them skipping. That includes slice 1's `put_raw_create_over_tombstone_conflicts`, `put_raw_never_restamps`, `delete_as_stamps_author` and `consumer_put_of_a_tombstone_is_rejected` cases inside both tombstone-conformance runs.
 
 Then tear down:
 
@@ -1620,6 +1623,7 @@ gh pr merge --squash --delete-branch
 **Spec and contract coverage**
 - §3.2 `delete` table → `plan_delete` in `delete_as` (Task 3). Live proof: `run_tombstone_conformance` (Task 2), incl. `delete_as_stamps_author`.
 - §3.2 `put` over a tombstone (recreation only; `Some(_)` → `NotFound`) → `plan_put` + `precondition(etag)` (Tasks 1 and 3). Unit: `recreation_over_tombstone_uses_if_match`.
+- §3.2 consumer `put` of a `RecordKind::Tombstone` record is rejected → `plan_put`'s `Rejected` arm mapped by `put_step` (Task 3). Live: `consumer_put_of_a_tombstone_is_rejected` (now part of `run_tombstone_conformance`, Task 2).
 - Contract change 1, `put_raw` → `plan_put_raw` through `put_step` (Task 3). Live: `put_raw_create_over_tombstone_conflicts`, `put_raw_never_restamps`.
 - §3.2 ancestor maintenance inside the critical section → planners fold against the record read under the ETag that gates the write, and each retry re-folds against the fresh read (Task 3). Live: the cap-3 run.
 - §3.3 s3 row: delete = `If-Match` PutObject; get/list = GetObject per key and filter; raw = today's reads; purge = conditional DeleteObject (Task 3).

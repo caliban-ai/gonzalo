@@ -512,11 +512,28 @@ mod tests {
         async fn list(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
             Err(CoreError::Backend("store unreachable".into()))
         }
-        async fn delete(
+        async fn delete_as(
             &self,
             _key: &RecordKey,
             _expected: Option<Revision>,
+            _author: Option<Identity>,
         ) -> CoreResult<DeleteResult> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn put_raw(
+            &self,
+            _record: Record,
+            _expected: Option<Revision>,
+        ) -> CoreResult<PutResult> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn get_raw(&self, _key: &RecordKey) -> CoreResult<Option<Record>> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn list_raw(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
+            Err(CoreError::Backend("store unreachable".into()))
+        }
+        async fn purge(&self, _key: &RecordKey, _expected: Revision) -> CoreResult<DeleteResult> {
             Err(CoreError::Backend("store unreachable".into()))
         }
     }
@@ -576,6 +593,8 @@ mod tests {
             },
             links: Vec::new(),
             key: RecordKey::new(namespace, "col", "x"),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
         serde_json::to_vec(&PutBody {
             record,

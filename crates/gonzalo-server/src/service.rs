@@ -452,6 +452,8 @@ mod tests {
             },
             links: Vec::new(),
             key: Manifest::key(repo, view),
+            ancestors: Vec::new(),
+            deleted_at: None,
         };
         let outcome = fs.put(record, None).await.unwrap();
         assert!(matches!(outcome, PutResult::Committed(_)));

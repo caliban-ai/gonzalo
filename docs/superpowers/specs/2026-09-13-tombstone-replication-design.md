@@ -227,6 +227,12 @@ record would look *older* than the tombstone and could lose to it in sync. The
 re-stamp keeps the chain moving forward. `PutResult::Committed` already returns
 the stored revision, so callers learn the real value without any API change.
 
+Consumer `put` also rejects any `RecordKind::Tombstone` record outright, with
+an error, regardless of what is currently stored at the key (absent, live, or
+tombstoned): a tombstone is not something a consumer writes directly, whatever
+its intended destination. Deletes go through `Store::delete_as`, which builds
+the tombstone itself, and replication writes tombstones through `put_raw`.
+
 #### Replication writes: `put_raw`
 
 Sync and pull write through `put_raw`, which stores exactly the record it is
@@ -254,7 +260,8 @@ because the raw surface is replication-only.
 #### Ancestor maintenance on every committed `put` or `delete`
 
 All stores must apply the same rule, which lives in a shared core helper
-(`gonzalo_core::ancestry::fold_ancestors`) so no store re-implements it:
+(`gonzalo_core::tombstone::fold_ancestors`, re-exported at the crate root as
+`gonzalo_core::fold_ancestors`) so no store re-implements it:
 
 ```text
 stored.ancestors =
@@ -630,6 +637,7 @@ The four existing delete cases are rewritten for the new meaning (for example,
 | `tombstone_never_collides_with_empty_body` | Tombstone revision ≠ an empty-body live edit at the same counter |
 | `recreate_continues_chain` | `put(initial_rec, None)` over a tombstone → `Committed(r)` with `r.counter == tomb.counter + 1`, `parent == tomb.revision`, tombstone in `ancestors` |
 | `put_some_over_tombstone_is_not_found` | consumer `put(rec, Some(r))` over a tombstone → `NotFound`, both for a random `r` and for the tombstone's own revision |
+| `consumer_put_of_a_tombstone_is_rejected` | consumer put of a tombstone-kind record → error, on an absent key and over a live record; nothing written |
 | `replication_overwrite_of_tombstone` | `put_raw(rec, Some(tomb.revision))` succeeds, and consumer `get` then returns `rec` |
 | `purge_removes_physically` | After `purge`: `get_raw` → `None`, `list_raw` excludes the key |
 | `purge_conflicts_after_recreation` | `purge(tomb.revision)` after a recreation → `Conflict`, live record intact |
