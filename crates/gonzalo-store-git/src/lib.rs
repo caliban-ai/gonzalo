@@ -10,10 +10,10 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    Body, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeleteResult, Identity, KeyPrefix,
-    MergeOutcome, Meta, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision,
-    decode_segment, merge, plan_purge, plan_put, plan_put_raw, record_components, store::Conflict,
-    validate_ancestor_cap,
+    Body, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
+    KeyPrefix, MergeOutcome, Meta, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result,
+    Revision, decode_segment, merge, now_ms, plan_delete, plan_purge, plan_put, plan_put_raw,
+    record_components, validate_ancestor_cap,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::cell::RefCell;
@@ -144,6 +144,22 @@ impl GitStore {
             Err(e) => return Err(be(e)),
         }
         self.commit_removal(&rel, message)
+    }
+
+    /// Whether consumer `list` reports `key`. A tombstone is hidden. A file
+    /// that vanished since the directory walk (a concurrent `purge`) is
+    /// dropped. A file that doesn't parse as a `Record` stays listed, exactly
+    /// as before tombstones, so `get` keeps surfacing the `Serde` error.
+    fn is_listed(&self, key: &RecordKey) -> Result<bool> {
+        match std::fs::read(self.path_for(key)) {
+            Ok(bytes) => Ok(serde_json::from_slice::<Record>(&bytes)
+                .map(|rec| !rec.is_tombstone())
+                .unwrap_or(true)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            // Unreadable (e.g. a stray directory named `*.json`): keep it listed as
+            // before tombstones, so `get` surfaces the error instead of `list` failing.
+            Err(_) => Ok(true),
+        }
     }
 
     fn path_for(&self, key: &RecordKey) -> PathBuf {
@@ -607,9 +623,10 @@ where
 #[async_trait]
 impl gonzalo_core::Store for GitStore {
     async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
+        // Consumer read: a tombstoned key looks absent (spec §3.2).
         let store = self.handle();
         let key = key.clone();
-        run_blocking(move || store.read(&key)).await
+        run_blocking(move || Ok(store.read(&key)?.filter(|rec| !rec.is_tombstone()))).await
     }
 
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
@@ -626,11 +643,19 @@ impl gonzalo_core::Store for GitStore {
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        // Consumer listing excludes tombstoned keys, which means reading each
+        // record file under the prefix (spec §8.4: a local read per key).
         let store = self.handle();
         let prefix = prefix.clone();
         run_blocking(move || {
-            let mut out = Vec::new();
-            collect_keys(&store.root, &prefix, &mut out)?;
+            let mut keys = Vec::new();
+            collect_keys(&store.root, &prefix, &mut keys)?;
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                if store.is_listed(&key)? {
+                    out.push(key);
+                }
+            }
             Ok(out)
         })
         .await
@@ -641,32 +666,33 @@ impl gonzalo_core::Store for GitStore {
         &self,
         key: &RecordKey,
         expected: Option<Revision>,
-        _author: Option<Identity>,
+        author: Option<Identity>,
     ) -> Result<DeleteResult> {
-        // Still the physical conditional delete until Task 5 switches to
-        // tombstones (which is where the author gets stamped).
         let store = self.handle();
         let key = key.clone();
         run_blocking(move || {
-            // Serialize the read→check→remove→commit critical section over the
+            // Serialize the read→plan→write→commit critical section over the
             // shared index+HEAD, exactly as `put`; the lock releases when `_lock`
             // drops (all paths).
             let _lock = lock_repo(&store.root)?;
             let current = store.read(&key)?;
-            match (current, &expected) {
-                // Absent: nothing to remove — idempotent `Deleted`.
-                (None, _) => Ok(DeleteResult::Deleted),
-                // Unconditional, or the expected revision matches: remove + commit.
-                (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
-                    store.remove_and_commit(&key, &format!("delete {key}"))?;
+            // A delete commits a tombstone at the record's normal path, so git
+            // history shows it as an ordinary modification (spec §3.3, §5.5).
+            // A no-op (absent key, or already a tombstone) makes no commit.
+            // `Some(author)` replaces `meta.author` on the tombstone.
+            match plan_delete(
+                current.as_ref(),
+                expected,
+                now_ms(),
+                store.cap,
+                author.as_ref(),
+            ) {
+                DeletePlan::Write(tombstone) => {
+                    store.write_and_commit(&tombstone, &format!("delete {key}"))?;
                     Ok(DeleteResult::Deleted)
                 }
-                // Present but the expected revision differs: surface a Conflict.
-                (Some(cur), _) => Ok(DeleteResult::Conflict(Box::new(Conflict {
-                    key: key.clone(),
-                    expected,
-                    current: cur,
-                }))),
+                DeletePlan::Noop => Ok(DeleteResult::Deleted),
+                DeletePlan::Conflict(conflict) => Ok(DeleteResult::Conflict(conflict)),
             }
         })
         .await
