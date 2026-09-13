@@ -12,6 +12,9 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+/// A store-side planner for a record write: [`plan_put`] or [`plan_put_raw`].
+type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, usize) -> PutPlan;
+
 /// Reference in-memory store. See the module docs.
 pub struct MemStore {
     records: Mutex<BTreeMap<RecordKey, Record>>,
@@ -57,6 +60,28 @@ impl MemStore {
     fn now(&self) -> i64 {
         self.clock.unwrap_or_else(now_ms)
     }
+
+    /// Shared write path for `put` and `put_raw`: lock, ask `plan` for a
+    /// decision, and apply it. Synchronous, so the lock never crosses an
+    /// `.await`.
+    fn write(
+        &self,
+        record: Record,
+        expected: Option<Revision>,
+        plan: PutPlanner,
+    ) -> Result<PutResult> {
+        let mut g = self.records.lock().unwrap();
+        let key = record.key.clone();
+        match plan(g.get(&key), record, expected, self.cap) {
+            PutPlan::Write(stored) => {
+                let rev = stored.revision.clone();
+                g.insert(key, stored);
+                Ok(PutResult::Committed(rev))
+            }
+            PutPlan::Conflict(c) => Ok(PutResult::Conflict(c)),
+            PutPlan::NotFound => Err(crate::CoreError::NotFound(key)),
+        }
+    }
 }
 
 #[async_trait]
@@ -72,17 +97,7 @@ impl Store for MemStore {
     }
 
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
-        let mut g = self.records.lock().unwrap();
-        let key = record.key.clone();
-        match plan_put(g.get(&key), record, expected, self.cap) {
-            PutPlan::Write(stored) => {
-                let rev = stored.revision.clone();
-                g.insert(key, stored);
-                Ok(PutResult::Committed(rev))
-            }
-            PutPlan::Conflict(c) => Ok(PutResult::Conflict(c)),
-            PutPlan::NotFound => Err(crate::CoreError::NotFound(key)),
-        }
+        self.write(record, expected, plan_put)
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
@@ -130,17 +145,7 @@ impl Store for MemStore {
     }
 
     async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
-        let mut g = self.records.lock().unwrap();
-        let key = record.key.clone();
-        match plan_put_raw(g.get(&key), record, expected, self.cap) {
-            PutPlan::Write(stored) => {
-                let rev = stored.revision.clone();
-                g.insert(key, stored);
-                Ok(PutResult::Committed(rev))
-            }
-            PutPlan::Conflict(c) => Ok(PutResult::Conflict(c)),
-            PutPlan::NotFound => Err(crate::CoreError::NotFound(key)),
-        }
+        self.write(record, expected, plan_put_raw)
     }
 
     async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
