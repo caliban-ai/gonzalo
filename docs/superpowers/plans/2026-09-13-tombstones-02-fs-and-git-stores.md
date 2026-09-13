@@ -535,6 +535,9 @@ fn put_locked(
         // `expected` named a revision, but nothing live (and no tombstone at
         // that revision) is stored.
         PutPlan::NotFound => Err(CoreError::NotFound(key)),
+        // Only consumer `plan_put` produces this, for a `RecordKind::Tombstone`
+        // record: deletes go through `delete_as`, replication through `put_raw`.
+        PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
     }
 }
 
@@ -1395,6 +1398,10 @@ impl GitStore {
             }
             PutPlan::Conflict(conflict) => Ok(PutResult::Conflict(conflict)),
             PutPlan::NotFound => Err(CoreError::NotFound(key)),
+            // Only consumer `plan_put` produces this, for a
+            // `RecordKind::Tombstone` record: deletes go through `delete_as`,
+            // replication through `put_raw`.
+            PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
         }
     }
 
@@ -2158,6 +2165,7 @@ Expected: every check passes. Then merge the PR (the repository's usual squash m
 | §3.2 `get_raw` / `list_raw` / `purge` required | 1, 4 |
 | Reconciled contract: `put_raw` via `plan_put_raw`, never re-stamps, create over tombstone conflicts | 1, 4 (cap tests), 2, 5 (`put_raw_over_a_tombstone`), conformance in 3 and 6 |
 | Reconciled contract: consumer `put(Some(_))` over a tombstone is `NotFound` | 2, 5 (`consumer_put_over_a_tombstone`) |
+| Reconciled contract: consumer `put` of a `RecordKind::Tombstone` record is rejected | 1, 4 (`PutPlan::Rejected` arm), conformance `consumer_put_of_a_tombstone_is_rejected` (now part of `run_tombstone_conformance`, exercised by both tombstone-conformance runs in 3 and 6) |
 | Reconciled contract: stores implement `delete_as` (author passed to `plan_delete`), never `delete` | 1, 4 (interim), 2, 5 (author assertions + `rg` checks), conformance `delete_as_stamps_author` |
 | §3.3 fs: atomic tombstone write under flock; `purge` = today's conditional unlink | 1, 2 |
 | §3.3 git: commit the tombstone file; `purge` = `commit_removal` | 4, 5 |
