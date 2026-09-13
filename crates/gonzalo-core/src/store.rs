@@ -40,15 +40,31 @@ pub enum DeleteResult {
 /// A pluggable storage substrate over generic records.
 #[async_trait]
 pub trait Store: Send + Sync {
-    /// Fetch a record by key, or `None` if absent.
+    /// Fetch a record by key. Returns `None` for an absent key **and** for a
+    /// tombstoned one: a delete is invisible on this surface, and only
+    /// [`get_raw`](Store::get_raw) shows the tombstone. See ADR 0021.
     async fn get(&self, key: &RecordKey) -> Result<Option<Record>>;
 
     /// Conditionally write `record`. `expected` is the revision the caller
-    /// believes is current (`None` means "expect no existing record").
-    /// If the store's current revision differs, returns `PutResult::Conflict`.
+    /// believes is current (`None` means "expect no existing record"). If the
+    /// store's current revision differs, returns `PutResult::Conflict`.
+    ///
+    /// A tombstoned key counts as absent (ADR 0021, spec §8.5):
+    /// - `expected == None` **recreates** the key. The store re-stamps
+    ///   `record.revision` to continue the chain past the tombstone, so the
+    ///   caller must read the real revision back from
+    ///   `PutResult::Committed` rather than reuse the one it built.
+    /// - Any `Some(_)` — including the tombstone's own revision, which
+    ///   consumers never learn — is `Err(CoreError::NotFound)`.
+    ///
+    /// A `record` whose `kind` is `RecordKind::Tombstone` is always rejected
+    /// with an error, on every `current` state: deletes go through
+    /// [`delete_as`](Store::delete_as), and replication writes tombstones
+    /// through [`put_raw`](Store::put_raw).
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult>;
 
-    /// List keys matching `prefix`.
+    /// List keys matching `prefix`, excluding tombstoned keys. See
+    /// [`list_raw`](Store::list_raw) for a listing that includes them.
     async fn list(&self, prefix: &crate::KeyPrefix) -> Result<Vec<RecordKey>>;
 
     /// Conditionally delete the record at `key`. `expected` is the revision the

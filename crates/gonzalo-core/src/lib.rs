@@ -14,9 +14,9 @@ pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
 pub mod tombstone;
 pub use tombstone::{
-    DEFAULT_ANCESTOR_CAP, DeletePlan, PurgePlan, PutPlan, TOMBSTONE_DOMAIN, fold_ancestors, now_ms,
-    plan_delete, plan_purge, plan_put, plan_put_raw, tombstone_hash, tombstone_of,
-    validate_ancestor_cap,
+    CONSUMER_TOMBSTONE_REJECTED, DEFAULT_ANCESTOR_CAP, DeletePlan, PurgePlan, PutPlan,
+    TOMBSTONE_DOMAIN, fold_ancestors, now_ms, plan_delete, plan_purge, plan_put, plan_put_raw,
+    tombstone_hash, tombstone_of, validate_ancestor_cap,
 };
 
 pub mod manifest;

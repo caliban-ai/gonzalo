@@ -80,6 +80,7 @@ impl MemStore {
             }
             PutPlan::Conflict(c) => Ok(PutResult::Conflict(c)),
             PutPlan::NotFound => Err(crate::CoreError::NotFound(key)),
+            PutPlan::Rejected(reason) => Err(crate::CoreError::Backend(reason.to_string())),
         }
     }
 }

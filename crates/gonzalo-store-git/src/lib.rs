@@ -613,13 +613,14 @@ impl gonzalo_core::Store for GitStore {
         .await
     }
 
+    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
+    // so `put_raw` delegates to `put`, raw reads equal consumer reads, and
+    // purge is the existing conditional physical delete. That is only correct
+    // while no tombstones are stored; replaced by the store's tombstone slice.
     async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
         <Self as gonzalo_core::Store>::put(self, record, expected).await
     }
 
-    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
-    // so raw reads equal consumer reads and purge is the existing conditional
-    // physical delete. Replaced by the store's tombstone slice.
     async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
         gonzalo_core::Store::get(self, key).await
     }

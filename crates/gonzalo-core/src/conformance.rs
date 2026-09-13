@@ -240,14 +240,17 @@ where
     tombstone_never_collides_with_empty_body(&factory().await).await;
     recreate_continues_chain(&factory().await).await;
     put_some_over_tombstone_is_not_found(&factory().await).await;
+    consumer_put_of_a_tombstone_is_rejected(&factory().await).await;
     replication_overwrite_of_tombstone(&factory().await).await;
     put_raw_create_over_tombstone_conflicts(&factory().await).await;
     put_raw_never_restamps(&factory().await).await;
     delete_as_stamps_author(&factory().await).await;
+    delete_keeps_the_prior_author(&factory().await).await;
     purge_removes_physically(&factory().await).await;
     purge_absent_is_noop(&factory().await).await;
     purge_conflicts_after_recreation(&factory().await).await;
     ancestors_capped_and_ordered(&factory().await, cap).await;
+    put_raw_truncates_ancestors_and_excludes_own_revision(&factory().await, cap).await;
 }
 
 fn tomb_key(id: &str) -> RecordKey {
@@ -406,6 +409,37 @@ async fn put_some_over_tombstone_is_not_found<S: Store>(store: &S) {
     assert!(matches!(out, Err(CoreError::NotFound(_))), "got {out:?}");
 }
 
+/// Consumer `put` of a `RecordKind::Tombstone` record is rejected with an
+/// error on every `current` state that a consumer put can reach: absent, and
+/// a live key naming the correct `expected`. Nothing is written either way.
+async fn consumer_put_of_a_tombstone_is_rejected<S: Store>(store: &S) {
+    let absent = tomb_key("reject-absent");
+    let mut t = sample(absent.clone(), b"");
+    t.kind = RecordKind::Tombstone;
+    t.deleted_at = Some(1);
+    let out = store.put(t, None).await;
+    assert!(
+        out.is_err(),
+        "consumer put of a tombstone-kind record over an absent key must error, got {out:?}"
+    );
+    assert_eq!(store.get_raw(&absent).await.unwrap(), None);
+
+    let key = tomb_key("reject-live");
+    let rev = committed(store, sample(key.clone(), b"live"), None).await;
+    let mut over_live = sample(key.clone(), b"");
+    over_live.kind = RecordKind::Tombstone;
+    over_live.deleted_at = Some(1);
+    over_live.revision = rev.next(b"");
+    let out = store.put(over_live, Some(rev.clone())).await;
+    assert!(
+        out.is_err(),
+        "consumer put of a tombstone-kind record over a live record must error, got {out:?}"
+    );
+    let raw = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(raw.revision, rev);
+    assert!(!raw.is_tombstone());
+}
+
 /// Replication naming the tombstone's revision overwrites it unchanged.
 async fn replication_overwrite_of_tombstone<S: Store>(store: &S) {
     let key = tomb_key("replicated");
@@ -426,10 +460,10 @@ async fn replication_overwrite_of_tombstone<S: Store>(store: &S) {
         PutResult::Conflict(c) => panic!("unexpected conflict: {c:?}"),
     };
     assert_eq!(r, incoming.revision);
-    assert_eq!(
-        store.get(&key).await.unwrap().unwrap().revision,
-        incoming.revision
-    );
+    let got = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(got.revision, incoming.revision);
+    assert_eq!(got.body, incoming.body);
+    assert_eq!(got.ancestors.first(), Some(&t.revision));
 }
 
 /// A replication create over a tombstone conflicts carrying it; nothing is written.
@@ -496,6 +530,19 @@ async fn delete_as_stamps_author<S: Store>(store: &S) {
     assert_eq!(t.meta.author, deleter);
 }
 
+/// A plain `delete` (no author) keeps the live record's own author on the
+/// tombstone: `sample()` writes every live record as author `"tester"`.
+async fn delete_keeps_the_prior_author<S: Store>(store: &S) {
+    let key = tomb_key("prior-author");
+    committed(store, sample(key.clone(), b"mine"), None).await;
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let t = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(t.meta.author, Identity::new("tester"));
+}
+
 /// Purge physically removes the tombstone.
 async fn purge_removes_physically<S: Store>(store: &S) {
     let key = tomb_key("purged");
@@ -547,6 +594,53 @@ async fn ancestors_capped_and_ordered<S: Store>(store: &S, cap: usize) {
     assert_eq!(stored.revision, rev);
     let expected: Vec<Revision> = history.iter().rev().skip(1).take(cap).cloned().collect();
     assert_eq!(stored.ancestors, expected);
+}
+
+/// `put_raw` folds an oversized, self-including `incoming.ancestors` the same
+/// way every other write does: truncated to `cap`, newest first, and never
+/// containing the record's own stored revision.
+async fn put_raw_truncates_ancestors_and_excludes_own_revision<S: Store>(store: &S, cap: usize) {
+    let key = tomb_key("raw-cap");
+    let rev = committed(store, sample(key.clone(), b"0"), None).await;
+
+    let mut incoming = sample(key.clone(), b"peer");
+    incoming.revision = Revision {
+        counter: rev.counter + 1,
+        hash: ContentHash::of(b"peer"),
+    };
+    incoming.parent = Some(rev.clone());
+    incoming.ancestors = (0..cap + 3)
+        .map(|i| Revision {
+            counter: i as u64,
+            hash: ContentHash::of(format!("a{i}").as_bytes()),
+        })
+        .collect();
+    // Including the incoming record's own revision must not survive the fold.
+    incoming.ancestors.push(incoming.revision.clone());
+
+    let stored = match store
+        .put_raw(incoming.clone(), Some(rev.clone()))
+        .await
+        .unwrap()
+    {
+        PutResult::Committed(r) => r,
+        PutResult::Conflict(c) => panic!("unexpected conflict: {c:?}"),
+    };
+    assert_eq!(stored, incoming.revision);
+
+    let got = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(got.ancestors.len(), cap);
+    assert!(
+        !got.ancestors.contains(&stored),
+        "ancestors must not contain the record's own stored revision"
+    );
+    for pair in got.ancestors.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert!(
+            a.counter > b.counter || (a.counter == b.counter && a.hash >= b.hash),
+            "ancestors not newest-first: {a:?} before {b:?}"
+        );
+    }
 }
 
 /// Run the full blob-store suite against a store produced by `factory`

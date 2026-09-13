@@ -56,13 +56,13 @@ pub fn fold_ancestors(
     let from_current = current
         .into_iter()
         .flat_map(|c| std::iter::once(&c.revision).chain(c.ancestors.iter()));
-    let mut folded: Vec<Revision> = Vec::new();
-    for r in incoming.iter().chain(from_current) {
-        if r != stored && !folded.contains(r) {
-            folded.push(r.clone());
-        }
-    }
+    let mut folded: Vec<Revision> = incoming.iter().chain(from_current).cloned().collect();
+    // `incoming` is untrusted and this runs inside a store's critical section,
+    // so dedup by sorting first (equal revisions land adjacent) rather than
+    // `Vec::contains`, which is O(n²).
     folded.sort_by(|a, b| b.counter.cmp(&a.counter).then_with(|| b.hash.cmp(&a.hash)));
+    folded.dedup();
+    folded.retain(|r| r != stored);
     folded.truncate(cap);
     folded
 }
@@ -113,17 +113,33 @@ pub enum PutPlan {
     Conflict(Box<Conflict>),
     /// Persist nothing; return `Err(CoreError::NotFound(key))`.
     NotFound,
+    /// The record may not be written through this path; return
+    /// `Err(CoreError::Backend(reason.to_string()))`. Only consumer `plan_put`
+    /// produces this, for a `RecordKind::Tombstone` record: deletes go through
+    /// `Store::delete_as`, and replication writes tombstones through `put_raw`.
+    Rejected(&'static str),
 }
 
-/// Decide a consumer `put` (spec §3.2). A tombstone counts as absent: a create
-/// (`expected == None`) recreates the key past the tombstone, and any
-/// `Some(_)` is `NotFound`. Replication writes use [`plan_put_raw`].
+/// The reason a consumer `put` of a `RecordKind::Tombstone` record is
+/// rejected (see [`PutPlan::Rejected`]).
+pub const CONSUMER_TOMBSTONE_REJECTED: &str =
+    "consumer put cannot write a tombstone; use delete_as";
+
+/// Decide a consumer `put` (spec §3.2). A `RecordKind::Tombstone` record is
+/// always `Rejected`: deletes go through `Store::delete_as`, and replication
+/// writes tombstones through `put_raw`. Otherwise, a tombstone counts as
+/// absent: a create (`expected == None`) recreates the key past the
+/// tombstone, and any `Some(_)` is `NotFound`. Replication writes use
+/// [`plan_put_raw`].
 pub fn plan_put(
     current: Option<&Record>,
     mut record: Record,
     expected: Option<Revision>,
     cap: usize,
 ) -> PutPlan {
+    if record.is_tombstone() {
+        return PutPlan::Rejected(CONSUMER_TOMBSTONE_REJECTED);
+    }
     match current {
         None => {
             if expected.is_some() {
@@ -135,20 +151,15 @@ pub fn plan_put(
         Some(t) if t.is_tombstone() => match expected {
             None => {
                 // Recreation: continue the chain past the tombstone so the new
-                // record is never ordered before the delete it follows.
-                let hash = if record.is_tombstone() {
-                    tombstone_hash()
-                } else {
-                    ContentHash::of(record.body.bytes())
-                };
+                // record is never ordered before the delete it follows. The
+                // incoming record is never a tombstone here: that case is
+                // rejected above, before `current` is even consulted.
                 record.revision = Revision {
                     counter: t.revision.counter + 1,
-                    hash,
+                    hash: ContentHash::of(record.body.bytes()),
                 };
                 record.parent = Some(t.revision.clone());
-                if !record.is_tombstone() {
-                    record.deleted_at = None;
-                }
+                record.deleted_at = None;
                 record.ancestors =
                     fold_ancestors(&record.revision, &record.ancestors, Some(t), cap);
                 PutPlan::Write(record)
@@ -467,14 +478,33 @@ mod tests {
     }
 
     #[test]
-    fn put_none_tombstone_over_tombstone_keeps_the_tombstone_hash() {
+    fn consumer_put_of_a_tombstone_is_rejected() {
+        let tombstone_record = tomb(1);
+
+        // Absent key.
+        assert_eq!(
+            plan_put(None, tombstone_record.clone(), None, 32),
+            PutPlan::Rejected(CONSUMER_TOMBSTONE_REJECTED)
+        );
+
+        // Live key, matching expected.
+        let cur = live(0, b"v", vec![]);
+        assert_eq!(
+            plan_put(
+                Some(&cur),
+                tombstone_record.clone(),
+                Some(cur.revision.clone()),
+                32
+            ),
+            PutPlan::Rejected(CONSUMER_TOMBSTONE_REJECTED)
+        );
+
+        // Tombstoned key.
         let t = tomb(3);
-        let mut incoming = t.clone();
-        incoming.revision = rev(0, b"");
-        let PutPlan::Write(stored) = plan_put(Some(&t), incoming, None, 32) else {
-            panic!("expected Write");
-        };
-        assert_eq!(stored.revision.hash, tombstone_hash());
+        assert_eq!(
+            plan_put(Some(&t), tombstone_record, None, 32),
+            PutPlan::Rejected(CONSUMER_TOMBSTONE_REJECTED)
+        );
     }
 
     #[test]
