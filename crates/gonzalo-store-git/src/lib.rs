@@ -10,18 +10,24 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    Body, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, MergeOutcome, Meta, PutResult,
-    Record, RecordKey, Result, Revision, decode_segment, merge, record_components, store::Conflict,
+    Body, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeleteResult, Identity, KeyPrefix,
+    MergeOutcome, Meta, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision,
+    decode_segment, merge, plan_purge, plan_put, plan_put_raw, record_components, store::Conflict,
+    validate_ancestor_cap,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 mod diff;
 pub use diff::{ChangedPaths, changed_paths, head_commit, is_git_repo};
+
+/// A put planner: `gonzalo_core::plan_put` (consumer write) or
+/// `gonzalo_core::plan_put_raw` (replication write). Both run inside the same
+/// locked read→plan→write→commit path, `GitStore::put_locked`.
+type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, usize) -> PutPlan;
 
 /// A record that diverged on both sides of a pull and could not be auto-merged;
 /// the local version is kept and both sides are surfaced for resolution.
@@ -46,6 +52,9 @@ pub struct PullReport {
 
 pub struct GitStore {
     root: PathBuf,
+    /// Upper bound on `Record::ancestors` for every record this store commits
+    /// (spec §3.9). Defaults to `DEFAULT_ANCESTOR_CAP`.
+    cap: usize,
 }
 
 impl GitStore {
@@ -59,7 +68,82 @@ impl GitStore {
                 git2::Repository::init(&root).map_err(|e| CoreError::Backend(e.to_string()))?;
             }
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            cap: DEFAULT_ANCESTOR_CAP,
+        })
+    }
+
+    /// Bound the ancestor list this store keeps on every write (spec §3.9).
+    /// A cap of `0` is rejected.
+    pub fn with_ancestor_cap(mut self, cap: usize) -> Result<Self> {
+        self.cap = validate_ancestor_cap(cap)?;
+        Ok(self)
+    }
+
+    /// An owned copy of this handle, to move into a `spawn_blocking` closure.
+    fn handle(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            cap: self.cap,
+        }
+    }
+
+    /// Perform a conditional `put` or `put_raw`: take the repo lock, read the
+    /// current record, let `plan` (`plan_put` or `plan_put_raw`) decide, and
+    /// commit the planned record. Serializes the read→plan→write→commit
+    /// critical section over the shared index+HEAD; the lock releases when
+    /// `_lock` drops (all paths). Blocking; call from `run_blocking`.
+    fn put_locked(
+        &self,
+        record: Record,
+        expected: Option<Revision>,
+        plan: PutPlanner,
+    ) -> Result<PutResult> {
+        let _lock = lock_repo(&self.root)?;
+        let key = record.key.clone();
+        let current = self.read(&key)?;
+        // The decision (recreation re-stamping for `put`, verbatim for
+        // `put_raw`, ancestor folding for both) is the shared core planner's
+        // (spec §3.2).
+        match plan(current.as_ref(), record, expected, self.cap) {
+            PutPlan::Write(stored) => {
+                self.write_and_commit(&stored, &format!("put {key}"))?;
+                Ok(PutResult::Committed(stored.revision))
+            }
+            PutPlan::Conflict(conflict) => Ok(PutResult::Conflict(conflict)),
+            PutPlan::NotFound => Err(CoreError::NotFound(key)),
+            // Only consumer `plan_put` produces this, for a
+            // `RecordKind::Tombstone` record: deletes go through `delete_as`,
+            // replication through `put_raw`.
+            PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
+        }
+    }
+
+    /// Write `record` to its worktree file and commit it with `message`.
+    /// Call only while holding `lock_repo`.
+    fn write_and_commit(&self, record: &Record, message: &str) -> Result<()> {
+        let rel = rel_path(&record.key);
+        let abs = self.root.join(&rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(be)?;
+        }
+        let bytes =
+            serde_json::to_vec_pretty(record).map_err(|e| CoreError::Serde(e.to_string()))?;
+        std::fs::write(&abs, &bytes).map_err(be)?;
+        self.commit_file(&rel, message)
+    }
+
+    /// Remove `key`'s worktree file and commit the removal with `message`.
+    /// Call only while holding `lock_repo`.
+    fn remove_and_commit(&self, key: &RecordKey, message: &str) -> Result<()> {
+        let rel = rel_path(key);
+        match std::fs::remove_file(self.root.join(&rel)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(be(e)),
+        }
+        self.commit_removal(&rel, message)
     }
 
     fn path_for(&self, key: &RecordKey) -> PathBuf {
@@ -163,19 +247,27 @@ impl GitStore {
     }
 }
 
+/// The repo-relative path of `key`'s record file: `<ns>/<col>/<id>.json`.
+fn rel_path(key: &RecordKey) -> PathBuf {
+    let (ns, col, file) = record_components(key);
+    Path::new(&ns).join(&col).join(&file)
+}
+
 fn be<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Backend(e.to_string())
 }
 
-/// Acquire the repo-level exclusive lock guarding `put`'s OCC critical section.
+/// Acquire the repo-level exclusive lock guarding the OCC critical section of
+/// `put`, `delete` and `purge`.
 ///
-/// Unlike `FsStore`, whose per-record lock suffices, `GitStore::put` mutates the
-/// *shared* on-disk index and HEAD (via `commit_file`), so serialization must be
-/// repo-wide: two puts on different keys still race on the same index+HEAD. The
-/// lock is a `<root>/.gonzalo-git.lock` file held exclusively via `flock`; it is
-/// released when the returned handle drops, which covers every `put` exit path
-/// (the `Conflict`/`NotFound` early returns and any error). Blocking by design —
-/// call only from the `spawn_blocking` section.
+/// Unlike `FsStore`, whose per-record lock suffices, every `GitStore` write
+/// mutates the *shared* on-disk index and HEAD (via `commit_file` /
+/// `commit_removal`), so serialization must be repo-wide: two writes on
+/// different keys still race on the same index+HEAD. The lock is a
+/// `<root>/.gonzalo-git.lock` file held exclusively via `flock`; it is released
+/// when the returned handle drops, which covers every exit path (the
+/// `Conflict`/`NotFound`/no-op early returns and any error). Blocking by
+/// design — call only from the `spawn_blocking` section.
 fn lock_repo(root: &Path) -> Result<std::fs::File> {
     let lock_path = root.join(".gonzalo-git.lock");
     let lock = std::fs::OpenOptions::new()
@@ -515,91 +607,58 @@ where
 #[async_trait]
 impl gonzalo_core::Store for GitStore {
     async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
-        let this = Arc::new(self.root.clone());
+        let store = self.handle();
         let key = key.clone();
-        run_blocking(move || {
-            let store = GitStore {
-                root: (*this).clone(),
-            };
-            store.read(&key)
-        })
-        .await
+        run_blocking(move || store.read(&key)).await
     }
 
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
-        let root = self.root.clone();
-        run_blocking(move || {
-            let store = GitStore { root: root.clone() };
-            // Serialize the read→check→write→commit critical section over the
-            // shared index+HEAD; the lock releases when `_lock` drops (all paths).
-            let _lock = lock_repo(&root)?;
-            let current = store.read(&record.key)?;
-            let current_rev = current.as_ref().map(|r| r.revision.clone());
-            if current_rev != expected {
-                if let Some(cur) = current {
-                    return Ok(PutResult::Conflict(Box::new(Conflict {
-                        key: record.key.clone(),
-                        expected,
-                        current: cur,
-                    })));
-                }
-                return Err(CoreError::NotFound(record.key.clone()));
-            }
-            let (ns, col, file) = record_components(&record.key);
-            let rel = Path::new(&ns).join(&col).join(&file);
-            let abs = root.join(&rel);
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
-            }
-            let bytes =
-                serde_json::to_vec_pretty(&record).map_err(|e| CoreError::Serde(e.to_string()))?;
-            std::fs::write(&abs, &bytes).map_err(|e| CoreError::Backend(e.to_string()))?;
-            store.commit_file(&rel, &format!("put {}", record.key))?;
-            Ok(PutResult::Committed(record.revision))
-        })
-        .await
+        let store = self.handle();
+        run_blocking(move || store.put_locked(record, expected, plan_put)).await
+    }
+
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        // Replication write: same repo-wide critical section as `put`, decided
+        // by `plan_put_raw`, which never re-stamps. A create over a tombstone is
+        // a Conflict, never a recreation.
+        let store = self.handle();
+        run_blocking(move || store.put_locked(record, expected, plan_put_raw)).await
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
-        let root = self.root.clone();
+        let store = self.handle();
         let prefix = prefix.clone();
         run_blocking(move || {
             let mut out = Vec::new();
-            collect_keys(&root, &prefix, &mut out)?;
+            collect_keys(&store.root, &prefix, &mut out)?;
             Ok(out)
         })
         .await
     }
 
+    // No `delete` here: the trait provides it as `delete_as(key, expected, None)`.
     async fn delete_as(
         &self,
         key: &RecordKey,
         expected: Option<Revision>,
         _author: Option<Identity>,
     ) -> Result<DeleteResult> {
-        let root = self.root.clone();
+        // Still the physical conditional delete until Task 5 switches to
+        // tombstones (which is where the author gets stamped).
+        let store = self.handle();
         let key = key.clone();
         run_blocking(move || {
-            let store = GitStore { root: root.clone() };
             // Serialize the read→check→remove→commit critical section over the
             // shared index+HEAD, exactly as `put`; the lock releases when `_lock`
             // drops (all paths).
-            let _lock = lock_repo(&root)?;
+            let _lock = lock_repo(&store.root)?;
             let current = store.read(&key)?;
             match (current, &expected) {
                 // Absent: nothing to remove — idempotent `Deleted`.
                 (None, _) => Ok(DeleteResult::Deleted),
                 // Unconditional, or the expected revision matches: remove + commit.
                 (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
-                    let (ns, col, file) = record_components(&key);
-                    let rel = Path::new(&ns).join(&col).join(&file);
-                    let abs = root.join(&rel);
-                    match std::fs::remove_file(&abs) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(CoreError::Backend(e.to_string())),
-                    }
-                    store.commit_removal(&rel, &format!("delete {key}"))?;
+                    store.remove_and_commit(&key, &format!("delete {key}"))?;
                     Ok(DeleteResult::Deleted)
                 }
                 // Present but the expected revision differs: surface a Conflict.
@@ -613,24 +672,45 @@ impl gonzalo_core::Store for GitStore {
         .await
     }
 
-    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
-    // so `put_raw` delegates to `put`, raw reads equal consumer reads, and
-    // purge is the existing conditional physical delete. That is only correct
-    // while no tombstones are stored; replaced by the store's tombstone slice.
-    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
-        <Self as gonzalo_core::Store>::put(self, record, expected).await
-    }
-
     async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
-        gonzalo_core::Store::get(self, key).await
+        // Replication read: whatever the worktree holds, tombstones included.
+        let store = self.handle();
+        let key = key.clone();
+        run_blocking(move || store.read(&key)).await
     }
 
     async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
-        gonzalo_core::Store::list(self, prefix).await
+        // Replication listing: every `<id>.json` under the prefix, tombstones
+        // included, without reading any file.
+        let store = self.handle();
+        let prefix = prefix.clone();
+        run_blocking(move || {
+            let mut out = Vec::new();
+            collect_keys(&store.root, &prefix, &mut out)?;
+            Ok(out)
+        })
+        .await
     }
 
     async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
-        gonzalo_core::Store::delete(self, key, Some(expected)).await
+        let store = self.handle();
+        let key = key.clone();
+        run_blocking(move || {
+            // The only physical removal in the system, in the same repo-wide
+            // critical section as `put`: read, decide (`plan_purge`), then
+            // remove the file and commit the removal.
+            let _lock = lock_repo(&store.root)?;
+            let current = store.read(&key)?;
+            match plan_purge(current.as_ref(), &expected) {
+                PurgePlan::Remove => {
+                    store.remove_and_commit(&key, &format!("purge {key}"))?;
+                    Ok(DeleteResult::Deleted)
+                }
+                PurgePlan::Noop => Ok(DeleteResult::Deleted),
+                PurgePlan::Conflict(conflict) => Ok(DeleteResult::Conflict(conflict)),
+            }
+        })
+        .await
     }
 }
 
