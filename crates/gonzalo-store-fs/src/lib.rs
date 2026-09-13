@@ -7,9 +7,9 @@ pub use tilde::expand_tilde;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeleteResult, Identity, KeyPrefix,
-    PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, Store, plan_purge,
-    plan_put, plan_put_raw, store::Conflict, validate_ancestor_cap,
+    BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
+    KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, Store, now_ms,
+    plan_delete, plan_purge, plan_put, plan_put_raw, validate_ancestor_cap,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::io::{self, Write};
@@ -62,7 +62,11 @@ impl FsStore {
 #[async_trait]
 impl Store for FsStore {
     async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
-        self.read_record(key).await
+        // Consumer read: a tombstoned key looks absent (spec §3.2).
+        Ok(self
+            .read_record(key)
+            .await?
+            .filter(|rec| !rec.is_tombstone()))
     }
 
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
@@ -92,8 +96,16 @@ impl Store for FsStore {
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
-        let mut out = Vec::new();
-        collect_keys(&self.root, prefix, &mut out).await?;
+        // Consumer listing excludes tombstoned keys, which means reading each
+        // record file under the prefix (spec §8.4: a local read per key on fs).
+        let mut keys = Vec::new();
+        collect_keys(&self.root, prefix, &mut keys).await?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if listed_live(&self.root, &key).await? {
+                out.push(key);
+            }
+        }
         Ok(out)
     }
 
@@ -102,16 +114,16 @@ impl Store for FsStore {
         &self,
         key: &RecordKey,
         expected: Option<Revision>,
-        _author: Option<Identity>,
+        author: Option<Identity>,
     ) -> Result<DeleteResult> {
-        // Still the physical conditional delete until Task 2 switches to
-        // tombstones (which is where the author gets stamped). Mirror `put`'s
-        // critical section: hold the per-record flock so the read→check→remove
-        // is atomic against a concurrent writer. Blocking, so run it on a
-        // blocking thread rather than stalling the async runtime.
+        // Mirror `put`'s critical section: hold the per-record flock so the
+        // read→plan→tombstone-write is atomic against a concurrent writer.
+        // Blocking, so run it on a blocking thread rather than stalling the
+        // async runtime.
         let root = self.root.clone();
         let key = key.clone();
-        tokio::task::spawn_blocking(move || delete_locked(&root, &key, expected))
+        let cap = self.cap;
+        tokio::task::spawn_blocking(move || delete_locked(&root, &key, expected, cap, author))
             .await
             .map_err(|e| CoreError::Backend(format!("delete task panicked: {e}")))?
     }
@@ -392,64 +404,37 @@ fn purge_locked(root: &Path, key: &RecordKey, expected: &Revision) -> Result<Del
     }
 }
 
-/// Perform the conditional `delete` under the same per-record advisory lock
-/// `put_locked` uses, so the read→check→remove is atomic against a concurrent
-/// writer. Blocking by design; call from `spawn_blocking`.
+/// Perform the conditional `delete` under the per-record lock. Blocking by
+/// design; call from `spawn_blocking`.
 ///
-/// `expected == None` removes the record if present (idempotent no-op if
-/// absent). `expected == Some(rev)` removes only if the current revision matches;
-/// a mismatch is a `Conflict`, and an already-absent key is an idempotent
-/// `Deleted` (the revision is already gone — nothing to conflict on). We leave
-/// the sibling `.lock` file in place (it is reused by the next writer).
-fn delete_locked(root: &Path, key: &RecordKey, expected: Option<Revision>) -> Result<DeleteResult> {
+/// A delete no longer removes anything (spec §3.3). Over a live record it
+/// durably publishes the tombstone `gonzalo_core::plan_delete` builds, at the
+/// record's normal path, through the same temp+fsync+rename as `put`. Over an
+/// absent key or an existing tombstone it writes nothing and reports `Deleted`.
+/// A stale `expected` over a live record is a `Conflict`. `Some(author)`
+/// replaces `meta.author` on the tombstone. Physical removal is
+/// `purge_locked`'s job alone.
+fn delete_locked(
+    root: &Path,
+    key: &RecordKey,
+    expected: Option<Revision>,
+    cap: usize,
+    author: Option<Identity>,
+) -> Result<DeleteResult> {
     let path = layout::record_path(root, key);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
-    }
+    // Acquire the exclusive lock; it lives until `_lock` drops at function end.
+    let _lock = lock_record(&path)?;
 
-    // Acquire the exclusive lock; it lives until `lock` drops at function end.
-    let lock_path = path.with_extension("json.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| CoreError::Backend(e.to_string()))?;
-    flock(&lock, FlockOperation::LockExclusive).map_err(|e| CoreError::Backend(e.to_string()))?;
-
-    // Critical section: revision check and removal are now serialized per record.
-    let current = match std::fs::read(&path) {
-        Ok(bytes) => Some(
-            serde_json::from_slice::<Record>(&bytes)
-                .map_err(|e| CoreError::Serde(e.to_string()))?,
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(CoreError::Backend(e.to_string())),
-    };
-
-    match (current, &expected) {
-        // Absent: nothing to remove. Idempotent `Deleted` regardless of
-        // `expected` — the revision the caller named is already gone.
-        (None, _) => Ok(DeleteResult::Deleted),
-        // Unconditional, or the expected revision matches: remove the record.
-        (Some(cur), exp) if exp.is_none() || exp.as_ref() == Some(&cur.revision) => {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                // A concurrent remover won under the lock hand-off — still absent.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(CoreError::Backend(e.to_string())),
-            }
-            if let Some(parent) = path.parent() {
-                fsync_dir(parent).map_err(|e| CoreError::Backend(e.to_string()))?;
-            }
+    // Critical section: the read, the decision and the tombstone write are
+    // serialized per record.
+    let current = read_current(&path)?;
+    match plan_delete(current.as_ref(), expected, now_ms(), cap, author.as_ref()) {
+        DeletePlan::Write(tombstone) => {
+            write_durable(&path, &tombstone)?;
             Ok(DeleteResult::Deleted)
         }
-        // Present but the expected revision differs: surface a Conflict.
-        (Some(cur), _) => Ok(DeleteResult::Conflict(Box::new(Conflict {
-            key: key.clone(),
-            expected,
-            current: cur,
-        }))),
+        DeletePlan::Noop => Ok(DeleteResult::Deleted),
+        DeletePlan::Conflict(conflict) => Ok(DeleteResult::Conflict(conflict)),
     }
 }
 
@@ -465,6 +450,24 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Whether consumer `list` reports `key`. A tombstone is hidden. A file that
+/// vanished since the directory walk (a concurrent `purge`) is dropped. A file
+/// that doesn't parse as a `Record` stays listed, exactly as before tombstones,
+/// so `get` keeps surfacing the `Serde` error instead of the key silently
+/// disappearing.
+async fn listed_live(root: &Path, key: &RecordKey) -> Result<bool> {
+    match tokio::fs::read(layout::record_path(root, key)).await {
+        Ok(bytes) => Ok(serde_json::from_slice::<Record>(&bytes)
+            .map(|rec| !rec.is_tombstone())
+            .unwrap_or(true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        // Unreadable (e.g. a stray directory named `*.json`): keep it listed as
+        // before tombstones, so `get` surfaces the error instead of `list`
+        // failing.
+        Err(_) => Ok(true),
     }
 }
 

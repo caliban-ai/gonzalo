@@ -4,11 +4,12 @@
 //! `run_tombstone_conformance` in `tests/conformance.rs`.
 
 use gonzalo_core::{
-    Body, DeleteResult, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind,
-    Revision, Store,
+    Body, CoreError, DeleteResult, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey,
+    RecordKind, Revision, Store, tombstone_hash,
 };
 use gonzalo_store_fs::FsStore;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn rec(key: &RecordKey, payload: &[u8], revision: Revision) -> Record {
     Record {
@@ -168,4 +169,288 @@ async fn purge_of_absent_key_is_deleted() {
             .unwrap(),
         DeleteResult::Deleted
     );
+}
+
+#[tokio::test]
+async fn delete_writes_a_tombstone_at_the_record_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = RecordKey::new("ns", "col", "doomed");
+    let rev0 = committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        store
+            .delete_as(&key, Some(rev0.clone()), Some(Identity::new("deleter")))
+            .await
+            .unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let path = dir.path().join("ns").join("col").join("doomed.json");
+    let bytes = std::fs::read(&path).expect("the tombstone stays at the record path");
+    let on_disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(on_disk["kind"], "Tombstone");
+    assert!(on_disk["deleted_at"].is_i64());
+
+    let tomb: Record = serde_json::from_slice(&bytes).unwrap();
+    assert!(tomb.is_tombstone());
+    assert_eq!(
+        tomb.revision,
+        Revision {
+            counter: rev0.counter + 1,
+            hash: tombstone_hash(),
+        }
+    );
+    assert_eq!(tomb.parent, Some(rev0.clone()));
+    assert_eq!(tomb.ancestors, vec![rev0]);
+    // `delete_as` stamps the deleting principal onto the tombstone.
+    assert_eq!(tomb.meta.author, Identity::new("deleter"));
+    // The atomic temp+rename publish leaves no temp file behind.
+    assert!(!path.with_extension("json.tmp").exists());
+}
+
+#[tokio::test]
+async fn consumer_reads_hide_a_tombstone_and_raw_reads_show_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let dead = RecordKey::new("ns", "col", "dead");
+    let live = RecordKey::new("ns", "col", "live");
+    committed(
+        store
+            .put(rec(&dead, b"d", Revision::initial(b"d")), None)
+            .await
+            .unwrap(),
+    );
+    committed(
+        store
+            .put(rec(&live, b"l", Revision::initial(b"l")), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        store.delete(&dead, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    assert_eq!(store.get(&dead).await.unwrap(), None);
+    assert!(store.get_raw(&dead).await.unwrap().unwrap().is_tombstone());
+
+    let all = KeyPrefix::default();
+    assert_eq!(store.list(&all).await.unwrap(), vec![live.clone()]);
+    let raw = store.list_raw(&all).await.unwrap();
+    assert_eq!(raw.len(), 2);
+    assert!(raw.contains(&dead) && raw.contains(&live));
+}
+
+#[tokio::test]
+async fn purge_removes_a_tombstone_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = RecordKey::new("ns", "col", "collected");
+    committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+    let path = dir.path().join("ns").join("col").join("collected.json");
+    assert!(path.exists());
+
+    assert_eq!(
+        store.purge(&key, tomb.revision).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    assert!(!path.exists());
+    assert_eq!(store.get_raw(&key).await.unwrap(), None);
+}
+
+/// Consumer `list` must read each file to filter tombstones, but a `*.json`
+/// that doesn't parse as a `Record` stays listed exactly as it was before
+/// tombstones, and `get` keeps surfacing the parse error loudly.
+#[tokio::test]
+async fn list_keeps_an_unparseable_record_file_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let good = RecordKey::new("ns", "col", "good");
+    committed(
+        store
+            .put(rec(&good, b"g", Revision::initial(b"g")), None)
+            .await
+            .unwrap(),
+    );
+    std::fs::write(
+        dir.path().join("ns").join("col").join("garbage.json"),
+        b"not json",
+    )
+    .unwrap();
+    let garbage = RecordKey::new("ns", "col", "garbage");
+
+    let listed = store.list(&KeyPrefix::default()).await.unwrap();
+    assert!(listed.contains(&good));
+    assert!(listed.contains(&garbage));
+    assert!(matches!(
+        store.get(&garbage).await,
+        Err(CoreError::Serde(_))
+    ));
+}
+
+/// A `*.json` entry that isn't even a readable file (e.g. a stray directory)
+/// keeps today's listing behaviour: consumer `list` still surfaces the key,
+/// leaving `get` to report the read error instead of `list` failing outright.
+#[tokio::test]
+async fn list_keeps_an_unreadable_json_entry_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let good = RecordKey::new("ns", "col", "good");
+    committed(
+        store
+            .put(rec(&good, b"g", Revision::initial(b"g")), None)
+            .await
+            .unwrap(),
+    );
+    // A directory named `<id>.json` sitting next to the real record: it
+    // matches the `*.json` walk in `collect_keys` but can't be read as a file.
+    std::fs::create_dir(dir.path().join("ns").join("col").join("stray.json")).unwrap();
+    let stray = RecordKey::new("ns", "col", "stray");
+
+    let listed = store.list(&KeyPrefix::default()).await.unwrap();
+    assert!(listed.contains(&good));
+    assert!(listed.contains(&stray));
+}
+
+/// Deletes go through the per-record lock: N racing deletes of one revision
+/// all report `Deleted` with no errors. Exactly one tombstone is written; the
+/// rest see it and no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_deletes_of_one_revision_write_one_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsStore::new(dir.path()));
+    let key = RecordKey::new("ns", "col", "raced");
+    let base = committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let store = Arc::clone(&store);
+        let key = key.clone();
+        let expected = base.clone();
+        handles.push(tokio::spawn(async move {
+            store.delete(&key, Some(expected)).await
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap().unwrap(), DeleteResult::Deleted);
+    }
+
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+    assert!(tomb.is_tombstone());
+    assert_eq!(tomb.revision.counter, base.counter + 1);
+    assert_eq!(tomb.parent, Some(base));
+}
+
+/// Consumer `put` treats a tombstoned key as absent: a conditional write
+/// naming any revision (even the tombstone's own) is `NotFound`, and an
+/// unconditional write is a re-stamped recreation.
+#[tokio::test]
+async fn consumer_put_over_a_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = RecordKey::new("ns", "col", "reborn");
+    committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+
+    assert!(matches!(
+        store
+            .put(
+                rec(&key, b"y", Revision::initial(b"y")),
+                Some(tomb.revision.clone())
+            )
+            .await,
+        Err(CoreError::NotFound(_))
+    ));
+
+    let recreated = committed(
+        store
+            .put(rec(&key, b"y", Revision::initial(b"y")), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(recreated.counter, tomb.revision.counter + 1);
+    let stored = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(stored.parent, Some(tomb.revision));
+}
+
+/// Replication `put_raw` never re-stamps: a create over a tombstone conflicts
+/// with the tombstone as `current`, and a write conditional on the
+/// tombstone's revision stores the caller's revision verbatim.
+#[tokio::test]
+async fn put_raw_over_a_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = RecordKey::new("ns", "col", "replicated");
+    committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+
+    match store
+        .put_raw(rec(&key, b"y", Revision::initial(b"y")), None)
+        .await
+        .unwrap()
+    {
+        PutResult::Conflict(c) => assert!(c.current.is_tombstone()),
+        PutResult::Committed(rev) => panic!("create over a tombstone must conflict, got {rev:?}"),
+    }
+    // The conflicting create wrote nothing.
+    assert_eq!(store.get_raw(&key).await.unwrap().unwrap(), tomb);
+
+    let incoming = Revision {
+        counter: 7,
+        hash: gonzalo_core::ContentHash::of(b"peer"),
+    };
+    assert_eq!(
+        committed(
+            store
+                .put_raw(
+                    rec(&key, b"peer", incoming.clone()),
+                    Some(tomb.revision.clone())
+                )
+                .await
+                .unwrap()
+        ),
+        incoming
+    );
+    let stored = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(stored.revision, incoming);
+    assert!(stored.ancestors.contains(&tomb.revision));
 }
