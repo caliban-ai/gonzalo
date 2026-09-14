@@ -24,7 +24,7 @@ qualifier. Running it against candidates:
 
 | Backend | Atomic `If-Match` | License | Outcome |
 |---|---|---|---|
-| **RustFS** `1.0.0-rc.6` | ✅ deterministic (3/3 + full soak) | Apache-2.0 | **chosen** — Rust, MinIO-compatible, drop-in (was 1.0.0-beta.8; see Consequences) |
+| **RustFS** `1.0.0-rc.6` | ✅ atomic conditional DeleteObject probe 0/200 + s3 integration suite 8/8; the 3/3 qualifier and full soak ran on 1.0.0-beta.8 and are not yet re-run on rc.6 (CI's HA soak exercises rc.6 on this PR) | Apache-2.0 | **chosen** — Rust, MinIO-compatible, drop-in (was 1.0.0-beta.8; see Consequences) |
 | MinIO | ✅ | AGPL | rejected — project sustainability |
 | Garage | ❌ non-atomic | AGPL | disqualified — see below |
 | SeaweedFS | ⚠️ setup-blocked, upstream CAS bugs | Apache-2.0 | not pursued |
