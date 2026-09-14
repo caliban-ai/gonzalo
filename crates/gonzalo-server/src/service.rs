@@ -5,8 +5,8 @@
 //! content-addressed slices on the fly.
 
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DeleteResult, KeyPrefix, Manifest, PutResult, Record,
-    RecordKey, Result, Revision, Store,
+    BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, Manifest, PutResult,
+    Record, RecordKey, Result, Revision, Store,
 };
 use gonzalo_graph::{
     FromScope, GraphStore, ImpactReport, Located, Page, RankedSymbol, Ranking, Reference, Symbol,
@@ -118,12 +118,39 @@ impl Service {
         self.store.list(prefix).await
     }
 
-    pub async fn delete(
+    /// Delete `key` by writing a tombstone. `author`, when set, becomes the
+    /// tombstone's `meta.author`: transports pass the authenticated principal
+    /// and open mode passes `None` (ADR 0015).
+    pub async fn delete_as(
         &self,
         key: &RecordKey,
         expected: Option<Revision>,
+        author: Option<Identity>,
     ) -> Result<DeleteResult> {
-        self.store.delete(key, expected).await
+        self.store.delete_as(key, expected, author).await
+    }
+
+    // --- Replication surface (gonzalo#203): tombstones visible ---
+
+    /// Like [`get`](Self::get), but returns tombstones. Replication only.
+    pub async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+        self.store.get_raw(key).await
+    }
+
+    /// Like [`list`](Self::list), but includes tombstoned keys. Replication only.
+    pub async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        self.store.list_raw(prefix).await
+    }
+
+    /// Replication write: stores `record` verbatim (never re-stamped).
+    pub async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        self.store.put_raw(record, expected).await
+    }
+
+    /// Physically remove the record at `key` iff its current revision is
+    /// `expected`. The only physical removal in the system.
+    pub async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        self.store.purge(key, expected).await
     }
 
     /// Build a source for `conn` from the registry and ingest its tickets into
@@ -678,5 +705,76 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, TicketSyncError::BadRequest(_)), "got {err:?}");
         assert!(err.to_string().contains("unknown provider"));
+    }
+
+    fn live_record(key: RecordKey) -> Record {
+        let body = gonzalo_core::Body::Inline(b"{\"v\":1}".to_vec());
+        Record {
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            kind: RecordKind::Topic,
+            meta: Meta {
+                author: Identity::new("tester"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+            key,
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_methods_delegate_to_the_store() {
+        let fs = fresh_fs();
+        let svc = Service::new(fs.clone(), fs);
+        let key = RecordKey::new("ns", "col", "gone");
+        let prefix = KeyPrefix {
+            namespace: Some("ns".into()),
+            collection: None,
+        };
+
+        assert!(matches!(
+            svc.put(live_record(key.clone()), None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+        assert_eq!(
+            svc.delete_as(&key, None, Some(Identity::new("deleter")))
+                .await
+                .unwrap(),
+            DeleteResult::Deleted
+        );
+
+        // Consumer surface hides the tombstone; raw surface shows it, stamped.
+        assert_eq!(svc.get(&key).await.unwrap(), None);
+        assert!(!svc.list(&prefix).await.unwrap().contains(&key));
+        let tomb = svc.get_raw(&key).await.unwrap().expect("tombstone");
+        assert_eq!(tomb.kind, RecordKind::Tombstone);
+        assert_eq!(tomb.meta.author, Identity::new("deleter"));
+        assert!(svc.list_raw(&prefix).await.unwrap().contains(&key));
+
+        // Purge physically removes it.
+        assert_eq!(
+            svc.purge(&key, tomb.revision.clone()).await.unwrap(),
+            DeleteResult::Deleted
+        );
+        assert_eq!(svc.get_raw(&key).await.unwrap(), None);
+
+        // put_raw writes verbatim, author included.
+        let mut replica = live_record(key.clone());
+        replica.meta.author = Identity::new("origin");
+        let rev = replica.revision.clone();
+        assert_eq!(
+            svc.put_raw(replica, None).await.unwrap(),
+            PutResult::Committed(rev)
+        );
+        assert_eq!(
+            svc.get_raw(&key).await.unwrap().unwrap().meta.author,
+            Identity::new("origin")
+        );
     }
 }

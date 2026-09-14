@@ -11,8 +11,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use gonzalo_core::{ContentHash, DeleteResult, Identity, KeyPrefix, PutResult, RecordKey};
-use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
+use gonzalo_core::{
+    ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, RecordKey,
+};
+use gonzalo_proto::http::{
+    DeleteBody, DeleteOutcome, PurgeBody, PutBody, PutOutcome, RawRecordBody,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -43,6 +47,16 @@ pub fn router(service: Service, auth: Arc<Auth>) -> Router {
             get(get_record).put(put_record).delete(delete_record),
         )
         .route("/v1/keys", get(list_keys))
+        // Replication surface (gonzalo#203): tombstones visible, purge is admin.
+        .route(
+            "/v1/raw/records/{ns}/{col}/{id}",
+            get(get_raw_record).put(put_raw_record),
+        )
+        .route("/v1/raw/keys", get(list_raw_keys))
+        .route(
+            "/v1/purge/{ns}/{col}/{id}",
+            axum::routing::post(purge_record),
+        )
         .route("/v1/tickets/sync", axum::routing::post(ticket_sync))
         .route("/v1/graph/definitions", get(graph_definitions))
         .route("/v1/graph/references", get(graph_references_to))
@@ -81,6 +95,68 @@ fn forbidden(principal: &Principal, access: Access, namespace: &str) -> Response
         ),
     )
         .into_response()
+}
+
+/// `403` when an operation requires an admin (`read` and `write` on `"*"`).
+fn forbidden_admin(principal: &Principal, operation: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!(
+            "principal {:?} is not an admin; {operation} requires admin",
+            principal.name()
+        ),
+    )
+        .into_response()
+}
+
+/// `400` when the URL path and the body's record key disagree (#158), else
+/// `None`. Shared by `PUT /v1/records/...` and `PUT /v1/raw/records/...`.
+fn path_key_mismatch(path: &(String, String, String), key: &RecordKey) -> Option<Response> {
+    let (ns, col, id) = path;
+    (*ns != key.namespace || *col != key.collection || *id != key.id).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "URL path does not match record key",
+        )
+            .into_response()
+    })
+}
+
+/// `200` + `Committed`, `409` + `Conflict`, `412` when `expected` names a
+/// revision the store does not hold (`CoreError::NotFound`), or an opaque
+/// `500`. `412` rather than `404`: on the raw routes a `404` means "old daemon".
+/// Shared by both put routes.
+fn put_outcome_response(result: gonzalo_core::Result<PutResult>) -> Response {
+    match result {
+        Ok(PutResult::Committed(revision)) => {
+            (StatusCode::OK, Json(PutOutcome::Committed { revision })).into_response()
+        }
+        Ok(PutResult::Conflict(conflict)) => (
+            StatusCode::CONFLICT,
+            Json(PutOutcome::Conflict { conflict }),
+        )
+            .into_response(),
+        Err(CoreError::NotFound(key)) => (
+            StatusCode::PRECONDITION_FAILED,
+            format!("record not found: {key}"),
+        )
+            .into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `200` + `Deleted`, `409` + `Conflict`, or an opaque `500`. Shared by
+/// `DELETE /v1/records/...` and `POST /v1/purge/...`.
+fn delete_outcome_response(result: gonzalo_core::Result<DeleteResult>) -> Response {
+    match result {
+        Ok(DeleteResult::Deleted) => (StatusCode::OK, Json(DeleteOutcome::Deleted)).into_response(),
+        Ok(DeleteResult::Conflict(conflict)) => (
+            StatusCode::CONFLICT,
+            Json(DeleteOutcome::Conflict { conflict }),
+        )
+            .into_response(),
+        Err(e) => server_error(e),
+    }
 }
 
 /// Paths served without authentication (k8s probes).
@@ -139,20 +215,15 @@ async fn get_record(
 async fn put_record(
     State(svc): State<Arc<Service>>,
     Extension(principal): Extension<Principal>,
-    Path((ns, col, id)): Path<(String, String, String)>,
+    Path(path): Path<(String, String, String)>,
     Json(mut body): Json<PutBody>,
 ) -> Response {
     // The URL path addresses the record; the body must agree with it. Without
     // this check the path is decorative and authz/write key off the body alone,
     // so a path-based proxy control could be bypassed by a mismatched body
     // (#158). Reject the disagreement with 400 before any authz or write.
-    let key = &body.record.key;
-    if ns != key.namespace || col != key.collection || id != key.id {
-        return (
-            StatusCode::BAD_REQUEST,
-            "URL path does not match record key",
-        )
-            .into_response();
+    if let Some(bad) = path_key_mismatch(&path, &body.record.key) {
+        return bad;
     }
     let ns = &body.record.key.namespace;
     if !principal.allows(Access::Write, ns) {
@@ -163,22 +234,20 @@ async fn put_record(
     if principal.is_authenticated() {
         body.record.meta.author = Identity::new(principal.name());
     }
-    match svc.put(body.record, body.expected).await {
-        Ok(PutResult::Committed(revision)) => {
-            (StatusCode::OK, Json(PutOutcome::Committed { revision })).into_response()
-        }
-        Ok(PutResult::Conflict(conflict)) => (
-            StatusCode::CONFLICT,
-            Json(PutOutcome::Conflict { conflict }),
-        )
-            .into_response(),
-        Err(e) => server_error(e),
-    }
+    put_outcome_response(svc.put(body.record, body.expected).await)
 }
 
-/// The URL path addresses the record; the OCC precondition rides in an optional
-/// JSON body. Authorize `Write` on the path's namespace, then delegate — the key
-/// is taken from the path, so there is no body-key-vs-path check to make.
+/// The URL path addresses the record; the OCC precondition and an optional
+/// claimed deleter identity ride in an optional JSON body. Authorize `Write`
+/// on the path's namespace, then delegate — the key is taken from the path,
+/// so there is no body-key-vs-path check to make.
+///
+/// The tombstone's author follows `Principal::delete_author` (gonzalo#203,
+/// mirrors `put_raw`'s authorship rule): a non-admin is always stamped as
+/// itself and any claimed author in the body is ignored; an admin or open
+/// mode may name the deleter via the body's `author` field; and otherwise an
+/// authenticated admin is stamped as itself while open mode keeps the prior
+/// author (no identity to stamp, ADR 0015).
 async fn delete_record(
     State(svc): State<Arc<Service>>,
     Extension(principal): Extension<Principal>,
@@ -188,17 +257,12 @@ async fn delete_record(
     if !principal.allows(Access::Write, &ns) {
         return forbidden(&principal, Access::Write, &ns);
     }
-    let expected = body.map(|Json(b)| b.expected).unwrap_or_default();
+    let (expected, claimed) = body
+        .map(|Json(b)| (b.expected, b.author))
+        .unwrap_or_default();
+    let author = principal.delete_author(claimed);
     let key = RecordKey::new(ns, col, id);
-    match svc.delete(&key, expected).await {
-        Ok(DeleteResult::Deleted) => (StatusCode::OK, Json(DeleteOutcome::Deleted)).into_response(),
-        Ok(DeleteResult::Conflict(conflict)) => (
-            StatusCode::CONFLICT,
-            Json(DeleteOutcome::Conflict { conflict }),
-        )
-            .into_response(),
-        Err(e) => server_error(e),
-    }
+    delete_outcome_response(svc.delete_as(&key, expected, author).await)
 }
 
 #[derive(Deserialize)]
@@ -207,24 +271,124 @@ struct ListQuery {
     collection: Option<String>,
 }
 
+/// Authorize a key listing (`read` on the namespace; `read` on `"*"` when
+/// unscoped) and build its prefix. Shared by `/v1/keys` and `/v1/raw/keys`.
+// `Response` is large (axum::http::Response<Body>); boxing it isn't worth it
+// for an error path returned at most once per request (D12).
+#[allow(clippy::result_large_err)]
+fn list_prefix(principal: &Principal, q: ListQuery) -> Result<KeyPrefix, Response> {
+    // No namespace → spans all → requires admin (`read` on `"*"`).
+    let ns = q.namespace.as_deref().unwrap_or("*");
+    if !principal.allows(Access::Read, ns) {
+        return Err(forbidden(principal, Access::Read, ns));
+    }
+    Ok(KeyPrefix {
+        namespace: q.namespace,
+        collection: q.collection,
+    })
+}
+
 async fn list_keys(
     State(svc): State<Arc<Service>>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<ListQuery>,
 ) -> Response {
-    // No namespace → spans all → requires admin (`read` on `"*"`).
-    let ns = q.namespace.as_deref().unwrap_or("*");
-    if !principal.allows(Access::Read, ns) {
-        return forbidden(&principal, Access::Read, ns);
-    }
-    let prefix = KeyPrefix {
-        namespace: q.namespace,
-        collection: q.collection,
+    let prefix = match list_prefix(&principal, q) {
+        Ok(p) => p,
+        Err(denied) => return denied,
     };
     match svc.list(&prefix).await {
         Ok(keys) => (StatusCode::OK, Json(keys)).into_response(),
         Err(e) => server_error(e),
     }
+}
+
+/// `GET /v1/raw/records/{ns}/{col}/{id}` — replication read that includes
+/// tombstones (gonzalo#203). Always `200` with a [`RawRecordBody`]; absence is
+/// `{"record": null}` so `404` unambiguously means "no such route".
+async fn get_raw_record(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path((ns, col, id)): Path<(String, String, String)>,
+) -> Response {
+    if !principal.allows(Access::Read, &ns) {
+        return forbidden(&principal, Access::Read, &ns);
+    }
+    match svc.get_raw(&RecordKey::new(ns, col, id)).await {
+        Ok(record) => (StatusCode::OK, Json(RawRecordBody { record })).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `PUT /v1/raw/records/{ns}/{col}/{id}` with a [`PutBody`] — replication write
+/// (gonzalo#203). The store writes the record verbatim (revision and
+/// tombstones included). Authorization is `Write` on the namespace, with the
+/// same path/body agreement check as `put` (#158).
+///
+/// **Authorship stays unforgeable (ADR 0015).** An admin token is the
+/// replication credential: daemon-to-daemon and operator replication run with
+/// one, so an admin's raw write keeps the replicated record's original
+/// `meta.author`. Any other principal is restamped exactly as `put` restamps,
+/// so a namespace writer cannot forge authorship through the raw route. Open
+/// mode's implicit principal is an admin, so it keeps the author too.
+async fn put_raw_record(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path(path): Path<(String, String, String)>,
+    Json(mut body): Json<PutBody>,
+) -> Response {
+    if let Some(bad) = path_key_mismatch(&path, &body.record.key) {
+        return bad;
+    }
+    let ns = &body.record.key.namespace;
+    if !principal.allows(Access::Write, ns) {
+        return forbidden(&principal, Access::Write, &ns.clone());
+    }
+    if !principal.is_admin() {
+        body.record.meta.author = Identity::new(principal.name());
+    }
+    put_outcome_response(svc.put_raw(body.record, body.expected).await)
+}
+
+/// `GET /v1/raw/keys?namespace=&collection=` — replication list that includes
+/// tombstoned keys. Same authorization as `/v1/keys`: no namespace spans all
+/// namespaces and requires `read` on `"*"`.
+async fn list_raw_keys(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    let prefix = match list_prefix(&principal, q) {
+        Ok(p) => p,
+        Err(denied) => return denied,
+    };
+    match svc.list_raw(&prefix).await {
+        Ok(keys) => (StatusCode::OK, Json(keys)).into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
+/// `POST /v1/purge/{ns}/{col}/{id}` with a [`PurgeBody`] — physically remove the
+/// record iff its revision is `expected` (gonzalo#203). **Admin only**: an early
+/// purge is data loss that surfaces later on another machine (spec §5.2). The
+/// body is parsed only after the admin check (#146).
+async fn purge_record(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path((ns, col, id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Response {
+    if !principal.is_admin() {
+        return forbidden_admin(&principal, "purge");
+    }
+    let PurgeBody { expected } = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid purge body: {e}")).into_response();
+        }
+    };
+    let key = RecordKey::new(ns, col, id);
+    delete_outcome_response(svc.purge(&key, expected).await)
 }
 
 /// `GET /v1/blobs/{hash}` — raw blob bytes, or `404`. Authorized `Read` on the
@@ -501,16 +665,20 @@ mod tests {
     /// A store whose every operation fails — models an unreachable backend.
     struct DownStore;
 
+    fn down() -> CoreError {
+        CoreError::Backend("store unreachable".into())
+    }
+
     #[async_trait::async_trait]
     impl Store for DownStore {
         async fn get(&self, _key: &RecordKey) -> CoreResult<Option<Record>> {
-            Err(CoreError::Backend("store unreachable".into()))
+            Err(down())
         }
         async fn put(&self, _record: Record, _expected: Option<Revision>) -> CoreResult<PutResult> {
-            Err(CoreError::Backend("store unreachable".into()))
+            Err(down())
         }
         async fn list(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
-            Err(CoreError::Backend("store unreachable".into()))
+            Err(down())
         }
         async fn delete_as(
             &self,
@@ -518,23 +686,23 @@ mod tests {
             _expected: Option<Revision>,
             _author: Option<Identity>,
         ) -> CoreResult<DeleteResult> {
-            Err(CoreError::Backend("store unreachable".into()))
+            Err(down())
+        }
+        async fn get_raw(&self, _key: &RecordKey) -> CoreResult<Option<Record>> {
+            Err(down())
+        }
+        async fn list_raw(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
+            Err(down())
         }
         async fn put_raw(
             &self,
             _record: Record,
             _expected: Option<Revision>,
         ) -> CoreResult<PutResult> {
-            Err(CoreError::Backend("store unreachable".into()))
-        }
-        async fn get_raw(&self, _key: &RecordKey) -> CoreResult<Option<Record>> {
-            Err(CoreError::Backend("store unreachable".into()))
-        }
-        async fn list_raw(&self, _prefix: &KeyPrefix) -> CoreResult<Vec<RecordKey>> {
-            Err(CoreError::Backend("store unreachable".into()))
+            Err(down())
         }
         async fn purge(&self, _key: &RecordKey, _expected: Revision) -> CoreResult<DeleteResult> {
-            Err(CoreError::Backend("store unreachable".into()))
+            Err(down())
         }
     }
 
@@ -893,5 +1061,572 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         let (s, _) = call(svc, scoped(), "GET", "/v1/blobs", Some("atok"), None).await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    // --- replication surface: raw reads/writes, purge, delete stamping (#203) ---
+
+    /// `reader` reads `memory` only; `writer` reads and writes `memory`;
+    /// `admin` is `*`/`*`.
+    fn tomb_auth() -> Arc<Auth> {
+        Arc::new(Auth::Enabled(std::collections::HashMap::from([
+            (
+                "rtok".to_string(),
+                Principal::new("reader", vec!["memory".into()], vec![]),
+            ),
+            (
+                "wtok".to_string(),
+                Principal::new("writer", vec!["memory".into()], vec!["memory".into()]),
+            ),
+            ("atok".to_string(), Principal::admin("admin")),
+        ])))
+    }
+
+    const LIVE: &str = "/v1/records/memory/col/x";
+    const RAW: &str = "/v1/raw/records/memory/col/x";
+    const PURGE: &str = "/v1/purge/memory/col/x";
+
+    /// A record at memory/col/x with `author` and `revision`.
+    fn record_at(author: &str, revision: Revision) -> Record {
+        Record {
+            revision,
+            parent: None,
+            body: gonzalo_core::Body::Inline(b"{}".to_vec()),
+            kind: gonzalo_core::RecordKind::MemoryTier,
+            meta: gonzalo_core::Meta {
+                author: gonzalo_core::Identity::new(author),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: std::collections::BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+            key: RecordKey::new("memory", "col", "x"),
+        }
+    }
+
+    fn put_body_with(record: Record, expected: Option<Revision>) -> Vec<u8> {
+        serde_json::to_vec(&PutBody { record, expected }).unwrap()
+    }
+
+    fn delete_body() -> Vec<u8> {
+        serde_json::to_vec(&DeleteBody::default()).unwrap()
+    }
+
+    /// A DELETE body claiming `author` as the deleter (R1: gonzalo#203).
+    fn delete_body_claiming(author: &str) -> Vec<u8> {
+        serde_json::to_vec(&DeleteBody {
+            expected: None,
+            author: Some(gonzalo_core::Identity::new(author)),
+        })
+        .unwrap()
+    }
+
+    fn purge_body(expected: &Revision) -> Vec<u8> {
+        serde_json::to_vec(&PurgeBody {
+            expected: expected.clone(),
+        })
+        .unwrap()
+    }
+
+    /// PUT a live record at memory/col/x with `put_token`, then DELETE it with
+    /// `delete_token`, leaving a tombstone. Tokens are `None` in open mode.
+    async fn seed_tombstone(
+        svc: &Service,
+        auth: &Arc<Auth>,
+        put_token: Option<&str>,
+        delete_token: Option<&str>,
+    ) {
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            put_token,
+            Some(put_body("memory", "client")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "DELETE",
+            LIVE,
+            delete_token,
+            Some(delete_body()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    async fn raw_get(
+        svc: &Service,
+        auth: &Arc<Auth>,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, Option<Record>) {
+        let (s, body) = call(svc.clone(), auth.clone(), "GET", path, token, None).await;
+        let record = if s == StatusCode::OK {
+            serde_json::from_slice::<RawRecordBody>(&body)
+                .unwrap()
+                .record
+        } else {
+            None
+        };
+        (s, record)
+    }
+
+    async fn keys(svc: &Service, auth: &Arc<Auth>, path: &str, token: &str) -> Vec<RecordKey> {
+        let (s, body) = call(svc.clone(), auth.clone(), "GET", path, Some(token), None).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_over_the_wire_leaves_a_tombstone_for_raw_reads() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("wtok")).await;
+        let key = RecordKey::new("memory", "col", "x");
+
+        // Consumer surface: gone.
+        let (s, _) = call(svc.clone(), auth.clone(), "GET", LIVE, Some("rtok"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(
+            !keys(&svc, &auth, "/v1/keys?namespace=memory", "rtok")
+                .await
+                .contains(&key)
+        );
+
+        // Raw surface: a reader sees the tombstone.
+        let (s, tomb) = raw_get(&svc, &auth, RAW, Some("rtok")).await;
+        assert_eq!(s, StatusCode::OK);
+        let tomb = tomb.expect("tombstone");
+        assert_eq!(tomb.kind, gonzalo_core::RecordKind::Tombstone);
+        assert_eq!(tomb.revision.hash, gonzalo_core::tombstone_hash());
+        assert!(tomb.deleted_at.is_some());
+        assert!(
+            keys(&svc, &auth, "/v1/raw/keys?namespace=memory", "rtok")
+                .await
+                .contains(&key)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_stamps_the_deleter_on_the_tombstone() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        // `writer` wrote the live record; `admin` deletes it.
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("atok")).await;
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        assert_eq!(
+            tomb.expect("tombstone").meta.author,
+            gonzalo_core::Identity::new("admin")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_mode_delete_keeps_the_prior_author() {
+        // Open mode has no identity to stamp (ADR 0015), for delete as for put.
+        let (svc, _d) = fs_service();
+        let auth = open();
+        seed_tombstone(&svc, &auth, None, None).await;
+        let (_, tomb) = raw_get(&svc, &auth, RAW, None).await;
+        assert_eq!(
+            tomb.expect("tombstone").meta.author,
+            gonzalo_core::Identity::new("client")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_delete_by_non_admin_ignores_a_claimed_author() {
+        // A non-admin cannot forge the deleter's identity through the wire
+        // field either (R1, mirrors `Principal::delete_author`).
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            Some("wtok"),
+            Some(put_body("memory", "client")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "DELETE",
+            LIVE,
+            Some("wtok"),
+            Some(delete_body_claiming("forged")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("wtok")).await;
+        assert_eq!(
+            tomb.expect("tombstone").meta.author,
+            gonzalo_core::Identity::new("writer")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_delete_by_admin_keeps_a_claimed_author() {
+        // An admin token is the replication credential: it may name the
+        // deleter (R1, mirrors `Principal::delete_author`).
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            Some("wtok"),
+            Some(put_body("memory", "client")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "DELETE",
+            LIVE,
+            Some("atok"),
+            Some(delete_body_claiming("origin")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        assert_eq!(
+            tomb.expect("tombstone").meta.author,
+            gonzalo_core::Identity::new("origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_reads_need_read_scope_and_absence_is_200_null() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+
+        // In scope, absent: 200 with a null record, never 404 (404 is reserved
+        // for "this daemon has no raw route").
+        let (s, rec) = raw_get(
+            &svc,
+            &auth,
+            "/v1/raw/records/memory/col/absent",
+            Some("rtok"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(rec, None);
+
+        // Out of scope.
+        let (s, _) = raw_get(&svc, &auth, "/v1/raw/records/secrets/col/x", Some("rtok")).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "GET",
+            "/v1/raw/keys?namespace=secrets",
+            Some("rtok"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // No token.
+        let (s, _) = call(svc, auth, "GET", RAW, None, None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unscoped_list_raw_requires_admin() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        for token in ["rtok", "wtok"] {
+            let (s, _) = call(
+                svc.clone(),
+                auth.clone(),
+                "GET",
+                "/v1/raw/keys",
+                Some(token),
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{token}");
+        }
+        let (s, _) = call(svc, auth, "GET", "/v1/raw/keys", Some("atok"), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    /// `put_raw` a record claiming author `"origin"` with `token`, assert it
+    /// committed at the incoming revision, and return the stored author.
+    async fn put_raw_author(
+        svc: &Service,
+        auth: &Arc<Auth>,
+        token: Option<&str>,
+    ) -> gonzalo_core::Identity {
+        let replica = record_at("origin", Revision::initial(b"{}"));
+        let (s, body) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            RAW,
+            token,
+            Some(put_body_with(replica.clone(), None)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(matches!(
+            serde_json::from_slice::<PutOutcome>(&body).unwrap(),
+            PutOutcome::Committed { revision } if revision == replica.revision
+        ));
+        let (_, stored) = raw_get(svc, auth, RAW, token).await;
+        stored.expect("stored").meta.author
+    }
+
+    #[tokio::test]
+    async fn put_raw_needs_write_scope_and_matching_path() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let replica = record_at("origin", Revision::initial(b"{}"));
+
+        // A reader may not write.
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            RAW,
+            Some("rtok"),
+            Some(put_body_with(replica.clone(), None)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // Path and body key must agree (#158).
+        let (s, _) = call(
+            svc,
+            auth,
+            "PUT",
+            "/v1/raw/records/memory/col/y",
+            Some("wtok"),
+            Some(put_body_with(replica, None)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_raw_by_scoped_writer_is_stamped_with_the_writer() {
+        // A non-admin cannot forge authorship through the raw route (ADR 0015).
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        assert_eq!(
+            put_raw_author(&svc, &auth, Some("wtok")).await,
+            gonzalo_core::Identity::new("writer")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_raw_by_admin_keeps_the_incoming_author() {
+        // An admin token is the replication credential: the original writer
+        // survives replication.
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        assert_eq!(
+            put_raw_author(&svc, &auth, Some("atok")).await,
+            gonzalo_core::Identity::new("origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_raw_in_open_mode_keeps_the_incoming_author() {
+        // Open mode's implicit principal is an admin.
+        let (svc, _d) = fs_service();
+        let auth = open();
+        assert_eq!(
+            put_raw_author(&svc, &auth, None).await,
+            gonzalo_core::Identity::new("origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_raw_overwrites_a_tombstone_verbatim_and_none_conflicts() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("wtok")).await;
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let tomb = tomb.expect("tombstone");
+
+        // expected = None over a tombstone is a conflict for put_raw, and the
+        // conflict may carry the tombstone.
+        let peer = record_at("peer", Revision::initial(b"peer"));
+        let (s, body) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            RAW,
+            Some("wtok"),
+            Some(put_body_with(peer.clone(), None)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(matches!(
+            serde_json::from_slice::<PutOutcome>(&body).unwrap(),
+            PutOutcome::Conflict { conflict } if conflict.current.revision == tomb.revision
+        ));
+
+        // expected = the tombstone's revision writes the record unchanged.
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            RAW,
+            Some("wtok"),
+            Some(put_body_with(peer.clone(), Some(tomb.revision.clone()))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, stored) = raw_get(&svc, &auth, RAW, Some("rtok")).await;
+        let stored = stored.expect("stored");
+        assert_eq!(stored.revision, peer.revision);
+        assert_eq!(stored.kind, gonzalo_core::RecordKind::MemoryTier);
+    }
+
+    #[tokio::test]
+    async fn put_not_found_is_412_on_both_put_routes() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let never = Revision::initial(b"never current");
+
+        // put_raw with Some over an absent key → NotFound → 412.
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            RAW,
+            Some("wtok"),
+            Some(put_body_with(
+                record_at("w", Revision::initial(b"{}")),
+                Some(never.clone()),
+            )),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PRECONDITION_FAILED);
+
+        // Consumer put with Some over a tombstone → NotFound → 412.
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("wtok")).await;
+        let (s, _) = call(
+            svc,
+            auth,
+            "PUT",
+            LIVE,
+            Some("wtok"),
+            Some(put_body_with(
+                record_at("w", Revision::initial(b"{}")),
+                Some(never),
+            )),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn purge_requires_admin() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("wtok")).await;
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let rev = tomb.expect("tombstone").revision;
+
+        for token in ["rtok", "wtok"] {
+            let (s, _) = call(
+                svc.clone(),
+                auth.clone(),
+                "POST",
+                PURGE,
+                Some(token),
+                Some(purge_body(&rev)),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{token}");
+        }
+
+        let (s, body) = call(
+            svc.clone(),
+            auth.clone(),
+            "POST",
+            PURGE,
+            Some("atok"),
+            Some(purge_body(&rev)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(matches!(
+            serde_json::from_slice::<DeleteOutcome>(&body).unwrap(),
+            DeleteOutcome::Deleted
+        ));
+        let (s, rec) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(rec, None);
+    }
+
+    #[tokio::test]
+    async fn purge_with_stale_expected_is_409() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("wtok")).await;
+        let (s, body) = call(
+            svc,
+            auth,
+            "POST",
+            PURGE,
+            Some("atok"),
+            Some(purge_body(&Revision::initial(b"not the tombstone"))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(matches!(
+            serde_json::from_slice::<DeleteOutcome>(&body).unwrap(),
+            DeleteOutcome::Conflict { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn purge_authorizes_before_parsing_the_body() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "POST",
+            PURGE,
+            Some("wtok"),
+            Some(b"not json".to_vec()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _) = call(
+            svc,
+            auth,
+            "POST",
+            PURGE,
+            Some("atok"),
+            Some(b"not json".to_vec()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn raw_backend_error_is_opaque() {
+        let dir = TempDir::new().unwrap();
+        let blobs = Arc::new(FsStore::new(dir.path()));
+        let svc = Service::new(Arc::new(DownStore), blobs);
+        let (s, body) = call(svc, scoped(), "GET", RAW, Some("wtok"), None).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(String::from_utf8(body).unwrap(), "internal error");
     }
 }

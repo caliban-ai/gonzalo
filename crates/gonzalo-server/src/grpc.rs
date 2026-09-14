@@ -171,7 +171,7 @@ impl Gonzalo for GrpcAdapter {
         let key = RecordKey::new(r.namespace, r.collection, r.id);
         let outcome = self
             .service
-            .delete(&key, expected)
+            .delete_as(&key, expected, None)
             .await
             .map_err(internal)?;
         let resp = match outcome {

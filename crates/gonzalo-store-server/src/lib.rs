@@ -262,7 +262,12 @@ impl Store for ServerStore {
                 token,
             } => {
                 let url = Self::records_url(base, key)?;
-                let body = DeleteBody { expected };
+                // Task 4 sends the real author; this interim edit leaves the
+                // wire field unset.
+                let body = DeleteBody {
+                    expected,
+                    author: None,
+                };
                 let resp = maybe_auth(client.delete(url).json(&body), token)
                     .send()
                     .await
