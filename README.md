@@ -23,7 +23,7 @@ live in `docs/superpowers/specs/`, per-milestone build notes in `docs/superpower
 |---|---|
 | [caliban](https://github.com/caliban-ai/caliban) | the agent |
 | [prospero](https://github.com/caliban-ai/prospero) | runs the caliban agent fleet |
-| [ariel](https://github.com/caliban-ai/ariel) | chat bridge for the fleet (Discord first, then Slack and Teams). At the design stage. Its identity, role grants, channel configuration and audit trail are to be gonzalo records; ariel stores nothing of its own ([#277](https://github.com/caliban-ai/gonzalo/issues/277), [#278](https://github.com/caliban-ai/gonzalo/issues/278)). |
+| [ariel](https://github.com/caliban-ai/ariel) | chat bridge for the fleet (Discord first, then Slack and Teams). In early implementation (Discord backend and prospero client landed; gonzalo integration not yet wired). Its identity, role grants, channel configuration and audit trail are to be gonzalo records; ariel stores nothing of its own ([#277](https://github.com/caliban-ai/gonzalo/issues/277), [#278](https://github.com/caliban-ai/gonzalo/issues/278)). |
 | **gonzalo** | persistence: records, stores, capability layers, daemon, code-graph MCP server |
 
 ## Architecture
