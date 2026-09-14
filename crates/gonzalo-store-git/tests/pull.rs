@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use gonzalo_core::{
-    Body, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Revision, Store,
+    Body, DeleteResult, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind,
+    Revision, Store,
 };
 use gonzalo_store_git::GitStore;
 
@@ -264,4 +265,290 @@ async fn pull_up_to_date_is_a_noop() {
     let report = local.pull("origin", &branch).await.unwrap();
     assert!(!report.fast_forwarded);
     assert!(report.merged.is_empty() && report.conflicts.is_empty());
+}
+
+/// Delete `id` expecting `expected`, and return the tombstone it wrote.
+async fn tombstone(store: &GitStore, id: &str, expected: Revision) -> Record {
+    assert!(matches!(
+        store.delete(&key(id), Some(expected)).await.unwrap(),
+        DeleteResult::Deleted
+    ));
+    let t = store.get_raw(&key(id)).await.unwrap().unwrap();
+    assert!(t.is_tombstone());
+    t
+}
+
+/// Commit an unrelated new record `n`. Used to make a side diverge without
+/// touching `m`.
+async fn add_n(store: &GitStore) {
+    commit(
+        store,
+        record(
+            "n",
+            RecordKind::MemoryTier,
+            r#"{"added":true}"#,
+            Revision::initial(br#"{"added":true}"#),
+            None,
+        ),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pull_fast_forwards_tombstone() {
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let t = tombstone(&remote, "m", base_rev).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.fast_forwarded);
+    assert!(local.get(&key("m")).await.unwrap().is_none());
+    assert_eq!(
+        local.get_raw(&key("m")).await.unwrap().unwrap().revision,
+        t.revision
+    );
+    assert!(
+        !local
+            .list(&KeyPrefix::default())
+            .await
+            .unwrap()
+            .contains(&key("m"))
+    );
+}
+
+#[tokio::test]
+async fn nonff_pull_applies_remote_tombstone() {
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let t = tombstone(&remote, "m", base_rev).await;
+    add_n(&local).await; // diverge without touching `m`
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(!report.fast_forwarded);
+    assert!(report.merged.is_empty() && report.conflicts.is_empty());
+    assert!(local.get(&key("m")).await.unwrap().is_none());
+    assert_eq!(
+        local.get_raw(&key("m")).await.unwrap().unwrap().revision,
+        t.revision
+    );
+    assert!(local.get(&key("n")).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn nonff_pull_keeps_local_tombstone() {
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let t = tombstone(&local, "m", base_rev).await;
+    add_n(&remote).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(!report.fast_forwarded);
+    assert!(report.merged.is_empty() && report.conflicts.is_empty());
+    assert!(local.get(&key("m")).await.unwrap().is_none());
+    assert_eq!(
+        local.get_raw(&key("m")).await.unwrap().unwrap().revision,
+        t.revision
+    );
+    assert!(local.get(&key("n")).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn nonff_pull_surfaces_delete_vs_edit_conflict() {
+    // Topic is AppendOnly, and local is the live side, so without the
+    // tombstone check `merge(local.kind.merge_class(), ..)` would "merge"
+    // away the remote delete.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let _ = tombstone(&remote, "m", base_rev.clone()).await;
+    commit(
+        &local,
+        record(
+            "m",
+            RecordKind::Topic,
+            "base\nlocal\n",
+            base_rev.next(b"base\nlocal\n"),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev),
+    )
+    .await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].key, key("m"));
+    assert!(report.conflicts[0].remote.is_tombstone());
+    assert!(!report.conflicts[0].local.is_tombstone());
+    assert!(report.merged.is_empty());
+    // Local is kept.
+    assert_eq!(
+        local.get(&key("m")).await.unwrap().unwrap().body.bytes(),
+        b"base\nlocal\n"
+    );
+}
+
+#[tokio::test]
+async fn nonff_pull_converges_concurrent_tombstones() {
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    // Remote edits then deletes (tombstone counter 2); local deletes base (1).
+    let r1 = base_rev.next(b"base\nr1\n");
+    commit(
+        &remote,
+        record(
+            "m",
+            RecordKind::Topic,
+            "base\nr1\n",
+            r1.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+    let tr = tombstone(&remote, "m", r1.clone()).await;
+    let tl = tombstone(&local, "m", base_rev.clone()).await;
+    assert_eq!(tr.revision.counter, 2);
+    assert_eq!(tl.revision.counter, 1);
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert_eq!(report.merged, vec![key("m")]);
+    assert!(report.conflicts.is_empty());
+    let got = local.get_raw(&key("m")).await.unwrap().unwrap();
+    assert!(got.is_tombstone());
+    assert_eq!(got.revision, tr.revision);
+    assert!(got.ancestors.contains(&tl.revision));
+    assert!(got.ancestors.contains(&r1));
+    assert!(got.ancestors.contains(&base_rev));
+    assert!(!got.ancestors.contains(&tr.revision));
+}
+
+#[tokio::test]
+async fn nonff_pull_identical_tombstones_are_a_noop() {
+    // Both sides delete the same revision: equal revisions, but the files
+    // differ (deleted_at), so git sees a both-sided change.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let tr = tombstone(&remote, "m", base_rev.clone()).await;
+    let tl = tombstone(&local, "m", base_rev).await;
+    assert_eq!(tr.revision, tl.revision);
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.merged.is_empty() && report.conflicts.is_empty());
+    assert_eq!(
+        local.get_raw(&key("m")).await.unwrap().unwrap().revision,
+        tl.revision
+    );
+}
+
+#[tokio::test]
+async fn nonff_pull_applies_remote_purge() {
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let t = tombstone(&remote, "m", base_rev).await;
+    assert!(matches!(
+        remote.purge(&key("m"), t.revision).await.unwrap(),
+        DeleteResult::Deleted
+    ));
+    add_n(&local).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(!report.fast_forwarded);
+    assert!(report.merged.is_empty() && report.conflicts.is_empty());
+    assert!(local.get_raw(&key("m")).await.unwrap().is_none());
+    assert!(
+        !local
+            .list_raw(&KeyPrefix::default())
+            .await
+            .unwrap()
+            .contains(&key("m"))
+    );
+    assert!(local.get(&key("n")).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn nonff_pull_merged_record_folds_both_ancestries() {
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::MemoryTier, r#"{"name":"a","content":"x"}"#).await;
+    let remote_rev = base_rev.next(b"remote");
+    let local_rev = base_rev.next(b"local");
+    commit(
+        &remote,
+        record(
+            "m",
+            RecordKind::MemoryTier,
+            r#"{"name":"a","content":"y"}"#,
+            remote_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+    commit(
+        &local,
+        record(
+            "m",
+            RecordKind::MemoryTier,
+            r#"{"name":"b","content":"x"}"#,
+            local_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert_eq!(report.merged, vec![key("m")]);
+    let merged = local.get_raw(&key("m")).await.unwrap().unwrap();
+    assert!(merged.ancestors.contains(&local_rev));
+    assert!(merged.ancestors.contains(&remote_rev));
+    assert!(merged.ancestors.contains(&base_rev));
+    assert!(!merged.ancestors.contains(&merged.revision));
+}
+
+#[tokio::test]
+async fn nonff_pull_takes_remote_edit_over_local_purge() {
+    // Both sides change `m` against the merge base: the remote edits it, and
+    // local deletes then purges it (a git deletion). Pull must not silently
+    // drop the concurrent remote edit; it takes the remote record, matching
+    // sync's `(None, Some)` copy row (spec §3.5).
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let remote_rev = base_rev.next(b"base\nremote\n");
+    commit(
+        &remote,
+        record(
+            "m",
+            RecordKind::Topic,
+            "base\nremote\n",
+            remote_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+    let t = tombstone(&local, "m", base_rev).await;
+    assert!(matches!(
+        local.purge(&key("m"), t.revision).await.unwrap(),
+        DeleteResult::Deleted
+    ));
+    assert!(local.get_raw(&key("m")).await.unwrap().is_none());
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(!report.fast_forwarded);
+    assert!(report.merged.is_empty() && report.conflicts.is_empty());
+    let got = local.get(&key("m")).await.unwrap().unwrap();
+    assert_eq!(got.body.bytes(), b"base\nremote\n");
+    assert_eq!(got.revision, remote_rev);
+    let raw = local.get_raw(&key("m")).await.unwrap().unwrap();
+    assert_eq!(raw.revision, remote_rev);
+    assert!(!raw.is_tombstone());
 }
