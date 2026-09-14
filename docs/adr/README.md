@@ -42,9 +42,10 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted |
 | [0016](0016-threeway-merge-stored-ancestry.md) | 3-way merge with content-addressed stored ancestry | accepted |
 | [0017](0017-nonff-pull-content-merge.md) | Non-fast-forward git pull via content-aware merge | accepted |
-| [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted |
+| [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted (local-only deletion superseded by [0021](0021-replicated-deletion-with-tombstones.md)) |
 | [0019](0019-s3-backend-qualification-rustfs.md) | Qualified S3 backend for HA: RustFS | accepted |
 | [0020](0020-rust-native-deliverables.md) | Rust-native deliverables; the daemon is the non-Rust boundary | accepted |
+| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted |
 
 ## Adding a new ADR
 
