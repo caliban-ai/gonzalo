@@ -987,6 +987,163 @@ impl Debouncer {
     }
 }
 
+// ─── delete / reset / collect (tombstones, gonzalo#203) ─────────────────────
+
+/// Open the fs store at `root` with an explicit ancestor cap (spec §3.9).
+/// A cap of 0 is rejected here, before any record is touched.
+pub fn open_store(root: &Path, ancestor_cap: usize) -> Result<FsStore> {
+    FsStore::new(root)
+        .with_ancestor_cap(ancestor_cap)
+        .with_context(|| format!("opening store at {}", root.display()))
+}
+
+/// Outcome of [`delete`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// A tombstone was written, or the record was already absent or deleted.
+    Deleted,
+    /// `expected` did not match. Nothing was written. `current` is the live
+    /// record's revision.
+    Conflict { current: Revision },
+}
+
+/// The identity the CLI stamps on records it writes. Matches `migrate`
+/// (`Identity::new("gonzalo-cli")` above) and the `ticket sync --author`
+/// default. The CLI opens only `FsStore`, which honours a named deleter; over
+/// a daemon, spec §3.6 applies instead and a non-admin token is stamped as
+/// itself.
+pub const CLI_AUTHOR: &str = "gonzalo-cli";
+
+/// Delete one record by writing a tombstone attributed to [`CLI_AUTHOR`]
+/// (spec §3.1–§3.2). Deleting an absent or already-deleted key is `Deleted`.
+pub async fn delete(
+    root: &Path,
+    ancestor_cap: usize,
+    namespace: &str,
+    collection: &str,
+    id: &str,
+    expected: Option<Revision>,
+) -> Result<DeleteOutcome> {
+    let store = open_store(root, ancestor_cap)?;
+    let key = RecordKey::new(namespace, collection, id);
+    let author = Some(Identity::new(CLI_AUTHOR));
+    Ok(match store.delete_as(&key, expected, author).await? {
+        gonzalo_core::DeleteResult::Deleted => DeleteOutcome::Deleted,
+        gonzalo_core::DeleteResult::Conflict(conflict) => DeleteOutcome::Conflict {
+            current: conflict.current.revision,
+        },
+    })
+}
+
+/// Tombstone every live record in `namespace` (optionally one `collection`)
+/// via [`gonzalo_core::reset_as`], attributing each tombstone to
+/// [`CLI_AUTHOR`].
+pub async fn reset(
+    root: &Path,
+    ancestor_cap: usize,
+    namespace: String,
+    collection: Option<String>,
+) -> Result<gonzalo_core::ResetReport> {
+    let store = open_store(root, ancestor_cap)?;
+    let prefix = KeyPrefix {
+        namespace: Some(namespace),
+        collection,
+    };
+    Ok(gonzalo_core::reset_as(&store, &prefix, Some(Identity::new(CLI_AUTHOR))).await?)
+}
+
+/// Exit code for a write conflict (`delete` with a stale `--expected`, or
+/// `reset` leaving any record live). Distinct from 1 (error, via anyhow) and
+/// 2 (usage error, via clap), so automation can tell "retry" from "broken"
+/// (spec §3.10).
+pub const EXIT_CONFLICT: u8 = 3;
+
+/// The process exit code for a finished `reset`: 0 with no conflicts,
+/// [`EXIT_CONFLICT`] otherwise (re-run to finish, spec §3.10).
+pub fn reset_exit_code(report: &gonzalo_core::ResetReport) -> u8 {
+    if report.conflicts.is_empty() {
+        0
+    } else {
+        EXIT_CONFLICT
+    }
+}
+
+/// Purge tombstones at least `horizon` old via [`gonzalo_core::collect`].
+/// `namespace == None` collects across the whole store.
+pub async fn collect(
+    root: &Path,
+    ancestor_cap: usize,
+    namespace: Option<String>,
+    collection: Option<String>,
+    horizon: Duration,
+    now_ms: i64,
+) -> Result<gonzalo_core::CollectReport> {
+    let store = open_store(root, ancestor_cap)?;
+    let prefix = KeyPrefix {
+        namespace,
+        collection,
+    };
+    Ok(gonzalo_core::collect(&store, &prefix, horizon, now_ms).await?)
+}
+
+/// A collection horizon as the operator typed it, plus its parsed value, so
+/// command output can echo the horizon it used (spec §3.10, §8.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Horizon {
+    pub raw: String,
+    pub duration: Duration,
+}
+
+/// Parse a duration of one positive whole number followed by exactly one unit:
+/// `d`, `h`, `m` or `s` (e.g. `30d`, `12h`). Hand-rolled on purpose. The
+/// workspace has no `humantime`, and a horizon never needs compound or
+/// fractional forms.
+pub fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
+    let s = raw.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("{raw:?}: missing unit (use d, h, m or s, e.g. 30d)"))?;
+    let (digits, unit) = s.split_at(split);
+    if digits.is_empty() {
+        return Err(format!(
+            "{raw:?}: expected a number before the unit, e.g. 30d"
+        ));
+    }
+    let per_unit: u64 = match unit {
+        "d" => 86_400,
+        "h" => 3_600,
+        "m" => 60,
+        "s" => 1,
+        _ => return Err(format!("{raw:?}: unknown unit {unit:?} (use d, h, m or s)")),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("{raw:?}: duration is too large"))?;
+    if n == 0 {
+        return Err(format!("{raw:?}: horizon must be greater than zero"));
+    }
+    let secs = n
+        .checked_mul(per_unit)
+        .ok_or_else(|| format!("{raw:?}: duration is too large"))?;
+    Ok(Duration::from_secs(secs))
+}
+
+/// clap value parser for `--older-than`.
+pub fn parse_horizon(raw: &str) -> std::result::Result<Horizon, String> {
+    Ok(Horizon {
+        raw: raw.trim().to_string(),
+        duration: parse_duration(raw)?,
+    })
+}
+
+/// clap value parser for `--expected`: a revision as JSON, exactly as
+/// `gonzalo get` prints it, e.g. `{"counter":1,"hash":"…"}`.
+pub fn parse_revision(raw: &str) -> std::result::Result<Revision, String> {
+    serde_json::from_str(raw).map_err(|e| {
+        format!(r#"expected a revision as JSON, e.g. {{"counter":1,"hash":"…"}} ({e})"#)
+    })
+}
+
 // ─── sync_stores ─────────────────────────────────────────────────────────────
 
 /// Summary returned by [`sync_stores`].
@@ -1000,10 +1157,16 @@ pub struct SyncSummary {
     pub conflicts: usize,
 }
 
-/// Sync two filesystem stores via [`gonzalo_core::sync`].
+/// Sync two filesystem stores via [`gonzalo_core::sync`], at the default
+/// ancestor cap.
 pub async fn sync_stores(a: &Path, b: &Path) -> Result<SyncSummary> {
-    let store_a = FsStore::new(a);
-    let store_b = FsStore::new(b);
+    sync_stores_with_cap(a, b, gonzalo_core::DEFAULT_ANCESTOR_CAP).await
+}
+
+/// [`sync_stores`] with an explicit ancestor cap for both stores (spec §3.9).
+pub async fn sync_stores_with_cap(a: &Path, b: &Path, ancestor_cap: usize) -> Result<SyncSummary> {
+    let store_a = open_store(a, ancestor_cap)?;
+    let store_b = open_store(b, ancestor_cap)?;
     let report = gonzalo_core::sync(&store_a, &store_b).await?;
     Ok(SyncSummary {
         copied_to_a: report.copied_to_a.len(),
@@ -2404,5 +2567,188 @@ mod tests {
     #[test]
     fn no_skips_lists_nothing() {
         assert_eq!(named_skips(&[]), String::new());
+    }
+}
+
+#[cfg(test)]
+mod tombstone_cli_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn parse_duration_accepts_each_unit() {
+        assert_eq!(parse_duration("30d"), Ok(Duration::from_secs(30 * 86_400)));
+        assert_eq!(parse_duration("12h"), Ok(Duration::from_secs(12 * 3_600)));
+        assert_eq!(parse_duration("90m"), Ok(Duration::from_secs(90 * 60)));
+        assert_eq!(parse_duration("45s"), Ok(Duration::from_secs(45)));
+        assert_eq!(parse_duration(" 7d "), Ok(Duration::from_secs(7 * 86_400)));
+    }
+
+    #[test]
+    fn parse_duration_rejects_malformed_input() {
+        for (raw, needle) in [
+            ("", "missing unit"),
+            ("30", "missing unit"),
+            ("d", "expected a number"),
+            ("-5d", "expected a number"),
+            ("30x", "unknown unit"),
+            ("30dd", "unknown unit"),
+            ("1d2h", "unknown unit"),
+            ("0d", "greater than zero"),
+            ("99999999999999999999d", "too large"),
+            ("18446744073709551615d", "too large"),
+        ] {
+            let err = parse_duration(raw).expect_err(raw);
+            assert!(
+                err.contains(needle),
+                "{raw:?}: {err:?} should mention {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_horizon_keeps_the_operator_spelling() {
+        let h = parse_horizon(" 30d").unwrap();
+        assert_eq!(h.raw, "30d");
+        assert_eq!(h.duration, Duration::from_secs(2_592_000));
+    }
+
+    #[test]
+    fn parse_revision_reads_the_json_that_get_prints() {
+        let rev = parse_revision(r#"{"counter":3,"hash":"abc"}"#).unwrap();
+        assert_eq!(
+            rev,
+            Revision {
+                counter: 3,
+                hash: ContentHash("abc".into())
+            }
+        );
+        let err = parse_revision("3").unwrap_err();
+        assert!(err.contains("expected a revision as JSON"), "{err}");
+    }
+
+    #[test]
+    fn open_store_rejects_a_zero_ancestor_cap() {
+        let root = TempDir::new().unwrap();
+        let err = open_store(root.path(), 0).err().expect("cap 0 rejected");
+        assert!(
+            format!("{err:#}").contains("ancestor cap must be at least 1"),
+            "{err:#}"
+        );
+        assert!(open_store(root.path(), 1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_conflicts_on_a_stale_revision_and_attributes_the_tombstone() {
+        let root = TempDir::new().unwrap();
+        let store = FsStore::new(root.path());
+        let body = Body::Inline(b"x".to_vec());
+        let record = Record {
+            key: RecordKey::new("ns", "col", "k"),
+            kind: RecordKind::Topic,
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            meta: Meta {
+                author: Identity::new("t"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+        };
+        let live = record.revision.clone();
+        assert!(matches!(
+            store.put(record, None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+        let stale = Revision {
+            counter: 99,
+            hash: ContentHash("deadbeef".into()),
+        };
+
+        let outcome = delete(root.path(), 32, "ns", "col", "k", Some(stale))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DeleteOutcome::Conflict { ref current } if *current == live));
+
+        let outcome = delete(root.path(), 32, "ns", "col", "k", Some(live))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DeleteOutcome::Deleted));
+        assert_eq!(get(root.path(), "ns", "col", "k").await.unwrap(), None);
+
+        // The seeded record was authored by "t"; the tombstone names the CLI.
+        let tomb = store
+            .get_raw(&RecordKey::new("ns", "col", "k"))
+            .await
+            .unwrap()
+            .expect("tombstone stored");
+        assert!(tomb.is_tombstone());
+        assert_eq!(tomb.meta.author, Identity::new(CLI_AUTHOR));
+    }
+
+    #[tokio::test]
+    async fn reset_stamps_the_cli_author() {
+        let root = TempDir::new().unwrap();
+        let store = FsStore::new(root.path());
+        let body = Body::Inline(b"x".to_vec());
+        let record = Record {
+            key: RecordKey::new("ns", "col", "k"),
+            kind: RecordKind::Topic,
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            meta: Meta {
+                author: Identity::new("not-the-cli"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+        };
+        assert!(matches!(
+            store.put(record, None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+
+        let report = reset(
+            root.path(),
+            gonzalo_core::DEFAULT_ANCESTOR_CAP,
+            "ns".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.deleted, vec![RecordKey::new("ns", "col", "k")]);
+
+        let tomb = store
+            .get_raw(&RecordKey::new("ns", "col", "k"))
+            .await
+            .unwrap()
+            .expect("tombstone stored");
+        assert!(tomb.is_tombstone());
+        assert_eq!(tomb.meta.author, Identity::new(CLI_AUTHOR));
+    }
+
+    #[test]
+    fn reset_exit_code_is_three_only_with_conflicts() {
+        let clean = gonzalo_core::ResetReport {
+            deleted: vec![RecordKey::new("ns", "col", "a")],
+            conflicts: Vec::new(),
+        };
+        assert_eq!(reset_exit_code(&clean), 0);
+
+        let conflicted = gonzalo_core::ResetReport {
+            deleted: Vec::new(),
+            conflicts: vec![RecordKey::new("ns", "col", "b")],
+        };
+        assert_eq!(reset_exit_code(&conflicted), EXIT_CONFLICT);
     }
 }
