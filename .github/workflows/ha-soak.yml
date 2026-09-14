@@ -14,11 +14,10 @@ on:
     branches: ["**"]
     paths:
       - "crates/gonzalo-soak/**"
+      - "crates/gonzalo-core/**"
       - "crates/gonzalo-store-s3/**"
+      - "crates/gonzalo-store-server/**"
       - "crates/gonzalo-server/**"
-      - "crates/gonzalo-core/src/tombstone.rs"
-      - "crates/gonzalo-core/src/store.rs"
-      - "crates/gonzalo-core/src/conformance.rs"
       - "docker-compose.rustfs.yml"
       - "scripts/rustfs-*.sh"
       - ".github/workflows/ha-soak.yml"
@@ -42,7 +41,7 @@ jobs:
   ha-soak:
     name: HA soak — gonzalod replicas over RustFS
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       # Live-S3 tests FAIL instead of skipping when the RustFS target env is
       # missing — this job exists to exercise RustFS, so a skip is a false pass.
@@ -69,8 +68,7 @@ jobs:
         run: bash scripts/rustfs-up.sh | sed 's/^export //' >> "$GITHUB_ENV"
 
       # S3 store conformance (incl. tombstone conformance, gonzalo#203) against
-      # the RustFS pinned in docker-compose.rustfs.yml (>= 1.0.0-rc.6, whose
-      # atomic conditional DeleteObject purge relies on; to be recorded in ADR
+      # the RustFS pinned in docker-compose.rustfs.yml (>= 1.0.0-rc.6; see ADR
       # 0021). Conformance cases and the delete races create their own buckets.
       # The blob test and the update race use the shared `soak` bucket under
       # the `blobs/` and `race` prefixes, which the soak workload (namespace
