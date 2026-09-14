@@ -245,12 +245,13 @@ async fn writer(
             let life_id = life_ids.fetch_add(1, Ordering::Relaxed);
             let key_id = lifecycle_key_for(life_id, cfg.lifecycle_keys);
             let op = lifecycle_op_for(life_id);
-            let result = lifecycle_step(&d, &cfg, &key_id, life_id, op).await;
+            let (result, base) = lifecycle_step(&d, &cfg, &key_id, life_id, op).await;
             lifecycle.push(LifecycleRecord {
                 key: key_id,
                 op_id: life_id,
                 op,
                 result,
+                base,
             });
         }
     }
@@ -317,24 +318,35 @@ async fn rmw_append(
     (OpResult::Conflict, conflicts)
 }
 
-/// One lifecycle op: read, then a single conditional write against what was read.
+/// One lifecycle op: read, then a single conditional write against what was
+/// read. Returns the outcome plus the rendered base revision the op
+/// conditioned its write on (`None` for `Recreate`, and for any op that read
+/// the key as absent) — see [`oracle::LifecycleRecord::base`].
 async fn lifecycle_step(
     d: &Dispatcher,
     cfg: &WorkloadConfig,
     key_id: &str,
     life_id: u64,
     op: LifecycleOp,
-) -> LifecycleResult {
+) -> (LifecycleResult, Option<String>) {
     let key = RecordKey::new(&cfg.namespace, &cfg.collection, key_id);
     let current = match d.get(&key).await {
         Ok(c) => c,
-        Err(_) => return LifecycleResult::Failed,
+        Err(_) => return (LifecycleResult::Failed, None),
+    };
+    // The base this op read and conditioned its write on. Recreate never
+    // conditions on a live revision even in its Skipped arm below (the key
+    // was found live, so recreation didn't apply).
+    let base = if op == LifecycleOp::Recreate {
+        None
+    } else {
+        current.as_ref().map(|rec| rev_string(&rec.revision))
     };
     // Let other writers run between the read and the write, so deletes really do
     // race edits and recreations instead of completing uncontended.
     tokio::task::yield_now().await;
     let body = format!("op-{life_id}");
-    match (op, current) {
+    let result = match (op, current) {
         (LifecycleOp::Delete, Some(rec)) => match d.delete(&key, Some(rec.revision)).await {
             Ok(DeleteResult::Deleted) => LifecycleResult::Committed,
             Ok(DeleteResult::Conflict(_)) => LifecycleResult::Conflict,
@@ -353,7 +365,8 @@ async fn lifecycle_step(
         (LifecycleOp::Delete, None)
         | (LifecycleOp::Edit, None)
         | (LifecycleOp::Recreate, Some(_)) => LifecycleResult::Skipped,
-    }
+    };
+    (result, base)
 }
 
 fn lifecycle_put_result(r: gonzalo_core::Result<PutResult>) -> LifecycleResult {

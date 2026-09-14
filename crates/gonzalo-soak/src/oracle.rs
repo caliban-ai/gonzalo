@@ -16,8 +16,9 @@
 //! - **Replicas agree on deletion** (#203) — once the writers have stopped and every
 //!   replica is live again, each lifecycle key is live on every replica or a
 //!   tombstone on every replica (never a mix), every replica reports the same raw
-//!   revision, each replica's consumer read agrees with its own raw read, and a
-//!   key that had committed writes is never physically absent.
+//!   revision, each replica's consumer read agrees with its own raw read on
+//!   whether the key is live, and a key that had committed writes is never
+//!   physically absent.
 //! - **Liveness** — the run made progress and every writer finished.
 //!
 //! **What "replicas agree" means here.** The HA soak's replicas are `gonzalod`
@@ -35,7 +36,7 @@
 //! on set membership / agreement / completion, never on exact interleavings,
 //! so normal scheduling jitter cannot flake it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The result of a single conditional-write op, as observed by the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +75,13 @@ pub struct FinalUnique {
     pub readable_with_value: bool,
     /// The driver later deleted this key and the delete was acked (`Deleted`).
     pub deleted: bool,
-    /// A raw read returned a tombstone. Only meaningful when `deleted`.
+    /// A raw read returned a tombstone. Only meaningful when `deleted`. `false`
+    /// also covers a failed raw read (`get_raw` returning `Err`) — the collector
+    /// cannot distinguish "not a tombstone" from "couldn't tell". As of this
+    /// writing, `workload::collect_unique` folds `Err` into `false` via
+    /// `matches!(store.get_raw(&key).await, Ok(Some(rec)) if rec.is_tombstone())`,
+    /// so a raw read that errors on every replica during collection reads here
+    /// as a lost delete rather than a read failure.
     pub raw_tombstone: bool,
 }
 
@@ -111,6 +118,11 @@ pub struct LifecycleRecord {
     pub op_id: u64,
     pub op: LifecycleOp,
     pub result: LifecycleResult,
+    /// The `"<counter>:<hash>"` rendering of the revision this op read and
+    /// conditioned its write on. `None` for `Recreate`, and for any op that
+    /// never read a live record (its `get` returned absent, so it wrote
+    /// unconditionally or was skipped).
+    pub base: Option<String>,
 }
 
 /// What one replica's raw read (`get_raw`) returned for a key after settling.
@@ -179,8 +191,10 @@ pub enum Violation {
     /// Replicas that read successfully disagree on a lifecycle key's raw state
     /// (different revisions, or absent on some).
     ReplicasDisagree { key: String, states: Vec<RawState> },
-    /// A replica's consumer read disagrees with its own raw read: a tombstone
-    /// served to consumers, or a live record hidden from them.
+    /// A replica's consumer read disagrees with its own raw read on whether the
+    /// key is live: a tombstone served to consumers, or a live record hidden
+    /// from them. Checked on liveness only, not on revision — see the module
+    /// doc.
     ConsumerRawMismatch { key: String, replica: usize },
     /// A replica could not be read after settling.
     FinalReadFailed { key: String, replica: usize },
@@ -190,12 +204,17 @@ pub enum Violation {
     /// Lifecycle ops ran but no delete ever lost a race — the delete-conflict
     /// invariant was not exercised.
     NoDeleteConflictsObserved,
-    /// Lifecycle ops ran but no delete ever committed.
+    /// Lifecycle ops ran but no delete was ever acknowledged (a no-op delete
+    /// over an existing tombstone counts).
     NoDeletesCommitted,
     /// Lifecycle ops ran but no per-replica final state was collected.
     LifecycleNotChecked,
     /// An acked delete of a unique key reads as live again, or not as a tombstone.
     AckedDeleteLost { key: String },
+    /// Two conditional writes committed on the same base revision of one key: an
+    /// edit plus an edit, or an edit plus a delete. Under OCC at most one can win,
+    /// so this is a resurrection over a tombstone or a lost update (spec §3.2, §5.4).
+    StaleBaseCommitted { key: String, base: String },
 }
 
 /// Delete ops that lost a race (`Conflict`). Edit and recreate conflicts don't count.
@@ -310,6 +329,36 @@ fn check_lifecycle(stats: &SoakStats, out: &mut Vec<Violation>) {
         out.push(Violation::NoDeletesCommitted);
     }
 
+    // Under OCC at most one conditional non-delete write may commit on a given
+    // base revision. Group committed ops by (key, base) — skipping ops that
+    // never read a live record — and flag any group of 2+ that includes an
+    // Edit: an edit racing a delete on the same base is either a resurrection
+    // (the edit wrongly won over a tombstone) or a lost update (the delete
+    // wrongly won over the edit). A BTreeMap keeps the emitted order
+    // deterministic. Two Deletes sharing a base are legal: the second is a
+    // no-op that still reports `Deleted`.
+    let mut committed_by_base: BTreeMap<(&str, &str), Vec<LifecycleOp>> = BTreeMap::new();
+    for o in &stats.lifecycle_ops {
+        if o.result != LifecycleResult::Committed {
+            continue;
+        }
+        let Some(base) = o.base.as_deref() else {
+            continue;
+        };
+        committed_by_base
+            .entry((o.key.as_str(), base))
+            .or_default()
+            .push(o.op);
+    }
+    for ((key, base), ops) in &committed_by_base {
+        if ops.len() >= 2 && ops.contains(&LifecycleOp::Edit) {
+            out.push(Violation::StaleBaseCommitted {
+                key: (*key).to_string(),
+                base: (*base).to_string(),
+            });
+        }
+    }
+
     let written: BTreeSet<&str> = stats
         .lifecycle_ops
         .iter()
@@ -391,12 +440,19 @@ mod tests {
         }
     }
 
-    fn lop(key: &str, op_id: u64, op: LifecycleOp, result: LifecycleResult) -> LifecycleRecord {
+    fn lop(
+        key: &str,
+        op_id: u64,
+        op: LifecycleOp,
+        result: LifecycleResult,
+        base: Option<&str>,
+    ) -> LifecycleRecord {
         LifecycleRecord {
             key: key.into(),
             op_id,
             op,
             result,
+            base: base.map(String::from),
         }
     }
 
@@ -464,16 +520,36 @@ mod tests {
                     0,
                     LifecycleOp::Recreate,
                     LifecycleResult::Committed,
+                    None,
                 ),
-                lop("life-0", 1, LifecycleOp::Delete, LifecycleResult::Committed),
-                lop("life-0", 2, LifecycleOp::Delete, LifecycleResult::Conflict),
+                lop(
+                    "life-0",
+                    1,
+                    LifecycleOp::Delete,
+                    LifecycleResult::Committed,
+                    Some("0:aaa"),
+                ),
+                lop(
+                    "life-0",
+                    2,
+                    LifecycleOp::Delete,
+                    LifecycleResult::Conflict,
+                    Some("0:bbb"),
+                ),
                 lop(
                     "life-1",
                     3,
                     LifecycleOp::Recreate,
                     LifecycleResult::Committed,
+                    None,
                 ),
-                lop("life-1", 4, LifecycleOp::Edit, LifecycleResult::Skipped),
+                lop(
+                    "life-1",
+                    4,
+                    LifecycleOp::Edit,
+                    LifecycleResult::Skipped,
+                    None,
+                ),
             ],
             lifecycle: vec![
                 FinalLifecycle {
@@ -544,7 +620,10 @@ mod tests {
     fn detects_acked_delete_lost_when_readable_again() {
         let mut s = clean_stats();
         s.unique[1].readable_with_value = true; // resurrected
-        assert!(check(&s).contains(&Violation::AckedDeleteLost { key: "u2".into() }));
+        assert_eq!(
+            check(&s),
+            vec![Violation::AckedDeleteLost { key: "u2".into() }]
+        );
     }
 
     #[test]
@@ -570,13 +649,23 @@ mod tests {
     fn detects_replicas_disagree_on_revision() {
         let mut s = clean_stats();
         s.lifecycle[0].replicas[1] = tomb("2:t");
-        let v = check(&s);
-        assert!(
-            v.iter().any(|x| matches!(
-                x,
-                Violation::ReplicasDisagree { key, .. } if key == "life-0"
-            )),
-            "two tombstones at different revisions must be flagged: {v:?}"
+        assert_eq!(
+            check(&s),
+            vec![Violation::ReplicasDisagree {
+                key: "life-0".into(),
+                states: vec![
+                    RawState::Tombstone {
+                        revision: "1:t".into()
+                    },
+                    RawState::Tombstone {
+                        revision: "2:t".into()
+                    },
+                    RawState::Tombstone {
+                        revision: "1:t".into()
+                    },
+                ],
+            }],
+            "two tombstones at different revisions must be flagged, exactly once"
         );
     }
 
@@ -587,17 +676,59 @@ mod tests {
             raw: RawState::Absent,
             consumer_live: Some(false),
         };
-        let v = check(&s);
-        assert!(
-            v.iter().any(|x| matches!(
-                x,
-                Violation::ReplicasDisagree { key, .. } if key == "life-1"
-            )),
-            "{v:?}"
+        assert_eq!(
+            check(&s),
+            vec![
+                Violation::ReplicasDisagree {
+                    key: "life-1".into(),
+                    states: vec![
+                        RawState::Absent,
+                        RawState::Live {
+                            revision: "0:h".into()
+                        },
+                        RawState::Live {
+                            revision: "0:h".into()
+                        },
+                    ],
+                },
+                Violation::LifecycleKeyVanished {
+                    key: "life-1".into()
+                },
+            ]
         );
-        assert!(v.contains(&Violation::LifecycleKeyVanished {
-            key: "life-1".into()
-        }));
+    }
+
+    /// m6: the #203-shaped read-path bug — a deleted key is a tombstone on some
+    /// replicas but physically absent on another. Must be pinned as exactly
+    /// `ReplicasDisagree` plus `LifecycleKeyVanished`, not `MixedLiveAndTombstone`
+    /// (absent is not live).
+    #[test]
+    fn detects_tombstone_on_some_replicas_absent_on_another() {
+        let mut s = clean_stats();
+        s.lifecycle[0].replicas[2] = ReplicaView {
+            raw: RawState::Absent,
+            consumer_live: Some(false),
+        };
+        assert_eq!(
+            check(&s),
+            vec![
+                Violation::ReplicasDisagree {
+                    key: "life-0".into(),
+                    states: vec![
+                        RawState::Tombstone {
+                            revision: "1:t".into()
+                        },
+                        RawState::Tombstone {
+                            revision: "1:t".into()
+                        },
+                        RawState::Absent,
+                    ],
+                },
+                Violation::LifecycleKeyVanished {
+                    key: "life-0".into()
+                },
+            ]
+        );
     }
 
     #[test]
@@ -609,12 +740,12 @@ mod tests {
                 consumer_live: Some(false),
             };
         }
-        let v = check(&s);
-        assert!(
-            v.contains(&Violation::LifecycleKeyVanished {
+        assert_eq!(
+            check(&s),
+            vec![Violation::LifecycleKeyVanished {
                 key: "life-0".into()
-            }),
-            "a committed-then-deleted key must be a tombstone, never physically gone: {v:?}"
+            }],
+            "a committed-then-deleted key must be a tombstone, never physically gone"
         );
     }
 
@@ -643,10 +774,13 @@ mod tests {
         let mut s = clean_stats();
         // Replica 1 serves a tombstoned key to consumers.
         s.lifecycle[0].replicas[1].consumer_live = Some(true);
-        assert!(check(&s).contains(&Violation::ConsumerRawMismatch {
-            key: "life-0".into(),
-            replica: 1
-        }));
+        assert_eq!(
+            check(&s),
+            vec![Violation::ConsumerRawMismatch {
+                key: "life-0".into(),
+                replica: 1
+            }]
+        );
     }
 
     #[test]
@@ -694,6 +828,7 @@ mod tests {
             9,
             LifecycleOp::Edit,
             LifecycleResult::Conflict,
+            Some("9:ccc"),
         ));
         assert!(check(&s).contains(&Violation::NoDeleteConflictsObserved));
     }
@@ -704,6 +839,90 @@ mod tests {
         s.lifecycle_ops
             .retain(|o| !(o.op == LifecycleOp::Delete && o.result == LifecycleResult::Committed));
         assert!(check(&s).contains(&Violation::NoDeletesCommitted));
+    }
+
+    /// I1 / F3.1: a committed Delete and a committed Edit share one base — the
+    /// edit was wrongly accepted over the tombstone (a resurrection), or the
+    /// delete wrongly overwrote the edit (a lost update). `clean_stats`'s
+    /// life-0 already has a committed Delete on base "0:aaa"; adding one
+    /// committed Edit on the same base is the whole mutation.
+    #[test]
+    fn detects_edit_committed_over_deleted_base() {
+        let mut s = clean_stats();
+        s.lifecycle_ops.push(lop(
+            "life-0",
+            100,
+            LifecycleOp::Edit,
+            LifecycleResult::Committed,
+            Some("0:aaa"),
+        ));
+        assert_eq!(
+            check(&s),
+            vec![Violation::StaleBaseCommitted {
+                key: "life-0".into(),
+                base: "0:aaa".into(),
+            }]
+        );
+    }
+
+    /// F3.2: two committed Edits share one base — also a lost update, with no
+    /// delete involved at all.
+    #[test]
+    fn detects_two_edits_committed_on_one_base() {
+        let mut s = clean_stats();
+        s.lifecycle_ops.push(lop(
+            "life-1",
+            101,
+            LifecycleOp::Edit,
+            LifecycleResult::Committed,
+            Some("9:zzz"),
+        ));
+        s.lifecycle_ops.push(lop(
+            "life-1",
+            102,
+            LifecycleOp::Edit,
+            LifecycleResult::Committed,
+            Some("9:zzz"),
+        ));
+        assert_eq!(
+            check(&s),
+            vec![Violation::StaleBaseCommitted {
+                key: "life-1".into(),
+                base: "9:zzz".into(),
+            }]
+        );
+    }
+
+    /// F3.3: two committed Deletes sharing a base are legitimate — the second
+    /// is a no-op delete over the tombstone the first just wrote, and still
+    /// reports `Deleted`. Must not be flagged.
+    #[test]
+    fn concurrent_noop_deletes_share_a_base_without_violation() {
+        let mut s = clean_stats();
+        s.lifecycle_ops.push(lop(
+            "life-0",
+            103,
+            LifecycleOp::Delete,
+            LifecycleResult::Committed,
+            Some("0:aaa"), // same base as the existing committed Delete op-id 1
+        ));
+        assert_eq!(check(&s), vec![]);
+    }
+
+    /// F3.4: a committed Delete and an Edit that lost the race (`Conflict`) on
+    /// the same base is the expected, correct outcome of OCC — only one
+    /// conditional write may commit. Must not be flagged.
+    #[test]
+    fn conflicted_edit_on_a_deleted_base_is_fine() {
+        let mut s = clean_stats();
+        s.lifecycle_ops.push(lop(
+            "life-0",
+            104,
+            LifecycleOp::Edit,
+            LifecycleResult::Conflict,
+            Some("0:aaa"), // same base as the existing committed Delete op-id 1
+        ));
+        assert_eq!(check(&s), vec![]);
     }
 
     #[test]
