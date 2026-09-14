@@ -86,6 +86,8 @@ pub async fn run(dispatcher: Arc<Dispatcher>, cfg: WorkloadConfig) -> SoakStats 
         conflicts_observed,
         writers_completed,
         writers_total: cfg.writers,
+        lifecycle_ops: Vec::new(),
+        lifecycle: Vec::new(),
     }
 }
 
@@ -208,6 +210,8 @@ async fn collect_unique(
             key: key_id.clone(),
             acked: true,
             readable_with_value,
+            deleted: false,
+            raw_tombstone: false,
         });
     }
     out
