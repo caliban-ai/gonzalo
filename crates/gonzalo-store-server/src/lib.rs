@@ -9,12 +9,24 @@ use gonzalo_core::{
     BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, Record,
     RecordKey, Result, Revision, Store, store::Conflict,
 };
-use gonzalo_proto::http::{DeleteBody, DeleteOutcome, PutBody, PutOutcome};
+use gonzalo_proto::http::{
+    DeleteBody, DeleteOutcome, PurgeBody, PutBody, PutOutcome, RawRecordBody,
+};
 use gonzalo_proto::v1::{
     DeleteBlobRequest, DeleteRequest, GetBlobRequest, GetRequest, ListBlobsRequest, ListRequest,
-    PutBlobRequest, PutRequest, gonzalo_client::GonzaloClient,
+    ListResponse, PurgeRequest, PutBlobRequest, PutRequest, PutResponse,
+    gonzalo_client::GonzaloClient,
 };
 use tonic::transport::Channel;
+
+/// The error every replication call (`get_raw`, `list_raw`, `put_raw`,
+/// `purge`) returns against a daemon without the replication surface: HTTP
+/// `404` on the route, or gRPC `Unimplemented`. There is deliberately **no
+/// fallback** to the consumer routes. Consumer reads hide tombstones and
+/// consumer put re-stamps recreations, so replicating through them resurrects
+/// deleted records (spec §3.6).
+pub const DAEMON_PREDATES_REPLICATION: &str =
+    "daemon predates replication reads (gonzalo#203); upgrade gonzalod";
 
 enum Backend {
     Http {
@@ -75,11 +87,50 @@ impl ServerStore {
         })
     }
 
-    fn records_url(base: &reqwest::Url, key: &RecordKey) -> Result<reqwest::Url> {
+    /// `base` + `segments` + the record key's three segments.
+    fn key_url(base: &reqwest::Url, segments: &[&str], key: &RecordKey) -> Result<reqwest::Url> {
         let mut url = base.clone();
         url.path_segments_mut()
             .map_err(|_| CoreError::Backend("base URL cannot be a base".into()))?
-            .extend(["v1", "records", &key.namespace, &key.collection, &key.id]);
+            .extend(segments)
+            .extend([&key.namespace, &key.collection, &key.id]);
+        Ok(url)
+    }
+
+    fn records_url(base: &reqwest::Url, key: &RecordKey) -> Result<reqwest::Url> {
+        Self::key_url(base, &["v1", "records"], key)
+    }
+
+    /// `…/v1/raw/records/{ns}/{col}/{id}` (gonzalo#203).
+    fn raw_records_url(base: &reqwest::Url, key: &RecordKey) -> Result<reqwest::Url> {
+        Self::key_url(base, &["v1", "raw", "records"], key)
+    }
+
+    /// `…/v1/purge/{ns}/{col}/{id}` (gonzalo#203).
+    fn purge_url(base: &reqwest::Url, key: &RecordKey) -> Result<reqwest::Url> {
+        Self::key_url(base, &["v1", "purge"], key)
+    }
+
+    /// `base` + `segments` + `?namespace=&collection=` from `prefix` (shared by
+    /// `/v1/keys` and `/v1/raw/keys`).
+    fn keys_url(
+        base: &reqwest::Url,
+        segments: &[&str],
+        prefix: &KeyPrefix,
+    ) -> Result<reqwest::Url> {
+        let mut url = base.clone();
+        url.path_segments_mut()
+            .map_err(|_| CoreError::Backend("base URL cannot be a base".into()))?
+            .extend(segments);
+        {
+            let mut q = url.query_pairs_mut();
+            if let Some(ns) = &prefix.namespace {
+                q.append_pair("namespace", ns);
+            }
+            if let Some(col) = &prefix.collection {
+                q.append_pair("collection", col);
+            }
+        }
         Ok(url)
     }
 
@@ -149,23 +200,20 @@ impl Store for ServerStore {
                     token,
                 )?;
                 let resp = client.get(req).await.map_err(status)?.into_inner();
-                if resp.found {
-                    Ok(Some(serde_json::from_slice(&resp.record_json).map_err(se)?))
-                } else {
-                    Ok(None)
-                }
+                decode_get_response(resp)
             }
         }
     }
 
     async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        let key = record.key.clone();
         match &self.backend {
             Backend::Http {
                 base,
                 client,
                 token,
             } => {
-                let url = Self::records_url(base, &record.key)?;
+                let url = Self::records_url(base, &key)?;
                 let body = PutBody { record, expected };
                 let resp = maybe_auth(client.put(url).json(&body), token)
                     .send()
@@ -176,7 +224,7 @@ impl Store for ServerStore {
                 // message instead of being masked as a JSON decode error (#147).
                 let status = resp.status();
                 let text = resp.text().await.map_err(be)?;
-                classify_put_response(status, &text)
+                classify_put_response_for(&key, status, &text)
             }
             Backend::Grpc { client, token } => {
                 let mut client = client.clone();
@@ -187,19 +235,12 @@ impl Store for ServerStore {
                     },
                     token,
                 )?;
-                let resp = client.put(req).await.map_err(status)?.into_inner();
-                match resp.outcome.as_str() {
-                    "committed" => {
-                        let rev: Revision =
-                            serde_json::from_slice(&resp.payload_json).map_err(se)?;
-                        Ok(PutResult::Committed(rev))
-                    }
-                    "conflict" => {
-                        let c: Conflict = serde_json::from_slice(&resp.payload_json).map_err(se)?;
-                        Ok(PutResult::Conflict(Box::new(c)))
-                    }
-                    other => Err(CoreError::Backend(format!("unknown put outcome: {other}"))),
-                }
+                let resp = client
+                    .put(req)
+                    .await
+                    .map_err(|s| put_status(s, &key))?
+                    .into_inner();
+                decode_put_response(resp)
             }
         }
     }
@@ -211,19 +252,7 @@ impl Store for ServerStore {
                 client,
                 token,
             } => {
-                let mut url = base.clone();
-                url.path_segments_mut()
-                    .map_err(|_| CoreError::Backend("base URL cannot be a base".into()))?
-                    .extend(["v1", "keys"]);
-                {
-                    let mut q = url.query_pairs_mut();
-                    if let Some(ns) = &prefix.namespace {
-                        q.append_pair("namespace", ns);
-                    }
-                    if let Some(col) = &prefix.collection {
-                        q.append_pair("collection", col);
-                    }
-                }
+                let url = Self::keys_url(base, &["v1", "keys"], prefix)?;
                 let resp = maybe_auth(client.get(url), token)
                     .send()
                     .await
@@ -241,19 +270,19 @@ impl Store for ServerStore {
                     token,
                 )?;
                 let resp = client.list(req).await.map_err(status)?.into_inner();
-                resp.keys_json
-                    .iter()
-                    .map(|b| serde_json::from_slice::<RecordKey>(b).map_err(se))
-                    .collect()
+                decode_keys(resp)
             }
         }
     }
 
+    /// Sends the delete with its author. The daemon honours a named deleter
+    /// only for an admin credential or open mode; a non-admin token is always
+    /// stamped as itself (ADR 0015, gonzalo#203).
     async fn delete_as(
         &self,
         key: &RecordKey,
         expected: Option<Revision>,
-        _author: Option<Identity>,
+        author: Option<Identity>,
     ) -> Result<DeleteResult> {
         match &self.backend {
             Backend::Http {
@@ -262,7 +291,7 @@ impl Store for ServerStore {
                 token,
             } => {
                 let url = Self::records_url(base, key)?;
-                let body = DeleteBody { expected };
+                let body = DeleteBody { expected, author };
                 let resp = maybe_auth(client.delete(url).json(&body), token)
                     .send()
                     .await
@@ -276,8 +305,155 @@ impl Store for ServerStore {
             }
             Backend::Grpc { client, token } => {
                 let mut client = client.clone();
+                let author_json = match &author {
+                    None => Vec::new(),
+                    Some(a) => serde_json::to_vec(a).map_err(se)?,
+                };
                 let req = grpc_request(
                     DeleteRequest {
+                        namespace: key.namespace.clone(),
+                        collection: key.collection.clone(),
+                        id: key.id.clone(),
+                        expected_json: serde_json::to_vec(&expected).map_err(se)?,
+                        author_json,
+                    },
+                    token,
+                )?;
+                let resp = client.delete(req).await.map_err(status)?.into_inner();
+                decode_delete_outcome(&resp.outcome, &resp.payload_json)
+            }
+        }
+    }
+
+    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::raw_records_url(base, key)?;
+                let resp = maybe_auth(client.get(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_raw_get_response(status, &text)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    GetRequest {
+                        namespace: key.namespace.clone(),
+                        collection: key.collection.clone(),
+                        id: key.id.clone(),
+                    },
+                    token,
+                )?;
+                let resp = client
+                    .get_raw(req)
+                    .await
+                    .map_err(replication_status)?
+                    .into_inner();
+                decode_get_response(resp)
+            }
+        }
+    }
+
+    async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::keys_url(base, &["v1", "raw", "keys"], prefix)?;
+                let resp = maybe_auth(client.get(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_raw_list_response(status, &text)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    ListRequest {
+                        namespace: prefix.namespace.clone(),
+                        collection: prefix.collection.clone(),
+                    },
+                    token,
+                )?;
+                let resp = client
+                    .list_raw(req)
+                    .await
+                    .map_err(replication_status)?
+                    .into_inner();
+                decode_keys(resp)
+            }
+        }
+    }
+
+    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+        let key = record.key.clone();
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::raw_records_url(base, &key)?;
+                let body = PutBody { record, expected };
+                let resp = maybe_auth(client.put(url).json(&body), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_raw_put_response(&key, status, &text)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    PutRequest {
+                        record_json: serde_json::to_vec(&record).map_err(se)?,
+                        expected_json: serde_json::to_vec(&expected).map_err(se)?,
+                    },
+                    token,
+                )?;
+                let resp = client
+                    .put_raw(req)
+                    .await
+                    .map_err(|s| raw_put_status(s, &key))?
+                    .into_inner();
+                decode_put_response(resp)
+            }
+        }
+    }
+
+    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::purge_url(base, key)?;
+                let body = PurgeBody { expected };
+                let resp = maybe_auth(client.post(url).json(&body), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(be)?;
+                classify_purge_response(status, &text)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    PurgeRequest {
                         namespace: key.namespace.clone(),
                         collection: key.collection.clone(),
                         id: key.id.clone(),
@@ -285,39 +461,14 @@ impl Store for ServerStore {
                     },
                     token,
                 )?;
-                let resp = client.delete(req).await.map_err(status)?.into_inner();
-                match resp.outcome.as_str() {
-                    "deleted" => Ok(DeleteResult::Deleted),
-                    "conflict" => {
-                        let c: Conflict = serde_json::from_slice(&resp.payload_json).map_err(se)?;
-                        Ok(DeleteResult::Conflict(Box::new(c)))
-                    }
-                    other => Err(CoreError::Backend(format!(
-                        "unknown delete outcome: {other}"
-                    ))),
-                }
+                let resp = client
+                    .purge(req)
+                    .await
+                    .map_err(replication_status)?
+                    .into_inner();
+                decode_delete_outcome(&resp.outcome, &resp.payload_json)
             }
         }
-    }
-
-    // Interim (gonzalo#203 slice 1): this store does not write tombstones yet,
-    // so `put_raw` delegates to `put`, raw reads equal consumer reads, and
-    // purge is the existing conditional physical delete. That is only correct
-    // while no tombstones are stored; replaced by the store's tombstone slice.
-    async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
-        <Self as Store>::put(self, record, expected).await
-    }
-
-    async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
-        Store::get(self, key).await
-    }
-
-    async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
-        Store::list(self, prefix).await
-    }
-
-    async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
-        Store::delete(self, key, Some(expected)).await
     }
 }
 
@@ -499,6 +650,147 @@ fn classify_put_response(status: reqwest::StatusCode, body: &str) -> Result<PutR
             "daemon returned {other}: {body}"
         ))),
     }
+}
+
+/// [`classify_put_response`], plus `412 Precondition Failed`: the daemon's
+/// `CoreError::NotFound` (`expected` names a revision the store does not hold),
+/// restored as `NotFound(key)`.
+fn classify_put_response_for(
+    key: &RecordKey,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<PutResult> {
+    match status {
+        reqwest::StatusCode::PRECONDITION_FAILED => Err(CoreError::NotFound(key.clone())),
+        other => classify_put_response(other, body),
+    }
+}
+
+/// A raw put's result: `404` means the route does not exist →
+/// [`upgrade_required`], never a fallback; otherwise as a consumer put.
+fn classify_raw_put_response(
+    key: &RecordKey,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<PutResult> {
+    match status {
+        reqwest::StatusCode::NOT_FOUND => Err(upgrade_required()),
+        other => classify_put_response_for(key, other, body),
+    }
+}
+
+/// Decode a gRPC `PutResponse` (shared by `Put` and `PutRaw`).
+fn decode_put_response(resp: PutResponse) -> Result<PutResult> {
+    match resp.outcome.as_str() {
+        "committed" => {
+            let rev: Revision = serde_json::from_slice(&resp.payload_json).map_err(se)?;
+            Ok(PutResult::Committed(rev))
+        }
+        "conflict" => {
+            let c: Conflict = serde_json::from_slice(&resp.payload_json).map_err(se)?;
+            Ok(PutResult::Conflict(Box::new(c)))
+        }
+        other => Err(CoreError::Backend(format!("unknown put outcome: {other}"))),
+    }
+}
+
+/// Decode a gRPC `GetResponse` (shared by `Get` and `GetRaw`).
+fn decode_get_response(resp: gonzalo_proto::v1::GetResponse) -> Result<Option<Record>> {
+    if resp.found {
+        Ok(Some(serde_json::from_slice(&resp.record_json).map_err(se)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Decode a gRPC delete-shaped outcome (shared by `Delete` and `Purge`).
+fn decode_delete_outcome(outcome: &str, payload_json: &[u8]) -> Result<DeleteResult> {
+    match outcome {
+        "deleted" => Ok(DeleteResult::Deleted),
+        "conflict" => {
+            let c: Conflict = serde_json::from_slice(payload_json).map_err(se)?;
+            Ok(DeleteResult::Conflict(Box::new(c)))
+        }
+        other => Err(CoreError::Backend(format!(
+            "unknown delete outcome: {other}"
+        ))),
+    }
+}
+
+/// [`DAEMON_PREDATES_REPLICATION`] as a `CoreError`.
+fn upgrade_required() -> CoreError {
+    CoreError::Backend(DAEMON_PREDATES_REPLICATION.into())
+}
+
+/// Decide a raw `get` from the HTTP status and body text. `200` carries a
+/// [`RawRecordBody`] (absence is `{"record": null}`); `404` →
+/// [`upgrade_required`]; any other status surfaces the daemon's body (#195).
+fn classify_raw_get_response(status: reqwest::StatusCode, body: &str) -> Result<Option<Record>> {
+    match status {
+        reqwest::StatusCode::OK => Ok(serde_json::from_str::<RawRecordBody>(body)
+            .map_err(se)?
+            .record),
+        reqwest::StatusCode::NOT_FOUND => Err(upgrade_required()),
+        other => Err(read_response_error(other, body)),
+    }
+}
+
+/// Decide a raw `list`: `200` → keys, `404` → [`upgrade_required`], otherwise
+/// the daemon's body.
+fn classify_raw_list_response(status: reqwest::StatusCode, body: &str) -> Result<Vec<RecordKey>> {
+    match status {
+        reqwest::StatusCode::OK => serde_json::from_str(body).map_err(se),
+        reqwest::StatusCode::NOT_FOUND => Err(upgrade_required()),
+        other => Err(read_response_error(other, body)),
+    }
+}
+
+/// Decide a `purge`: `200`/`409` carry a [`DeleteOutcome`], `404` →
+/// [`upgrade_required`], and any other status (`403` non-admin, `400` bad body)
+/// surfaces verbatim, as `delete` does.
+fn classify_purge_response(status: reqwest::StatusCode, body: &str) -> Result<DeleteResult> {
+    match status {
+        reqwest::StatusCode::NOT_FOUND => Err(upgrade_required()),
+        other => classify_delete_response(other, body),
+    }
+}
+
+/// Map a gRPC failure on a replication RPC: `Unimplemented` means the daemon
+/// has no such RPC → [`upgrade_required`]; anything else maps as usual.
+fn replication_status(s: tonic::Status) -> CoreError {
+    if s.code() == tonic::Code::Unimplemented {
+        upgrade_required()
+    } else {
+        status(s)
+    }
+}
+
+/// Map a gRPC failure on `Put`: `FailedPrecondition` is the daemon's
+/// `CoreError::NotFound`, restored as `NotFound(key)`.
+fn put_status(s: tonic::Status, key: &RecordKey) -> CoreError {
+    if s.code() == tonic::Code::FailedPrecondition {
+        CoreError::NotFound(key.clone())
+    } else {
+        status(s)
+    }
+}
+
+/// Map a gRPC failure on `PutRaw`: `Unimplemented` → [`upgrade_required`],
+/// otherwise as [`put_status`].
+fn raw_put_status(s: tonic::Status, key: &RecordKey) -> CoreError {
+    if s.code() == tonic::Code::Unimplemented {
+        upgrade_required()
+    } else {
+        put_status(s, key)
+    }
+}
+
+/// Decode a `ListResponse`'s JSON keys (shared by `List` and `ListRaw`).
+fn decode_keys(resp: ListResponse) -> Result<Vec<RecordKey>> {
+    resp.keys_json
+        .iter()
+        .map(|b| serde_json::from_slice::<RecordKey>(b).map_err(se))
+        .collect()
 }
 
 /// Decide a blob `put`'s result from the HTTP response status and body text.
@@ -753,5 +1045,255 @@ mod tests {
             }
             other => panic!("expected Backend error, got {other:?}"),
         }
+    }
+
+    // ── replication surface: upgrade error, never a fallback (#203) ─────────
+
+    fn upgrade_error() -> String {
+        CoreError::Backend(DAEMON_PREDATES_REPLICATION.into()).to_string()
+    }
+
+    #[test]
+    fn raw_get_200_null_is_absent_and_200_record_is_present() {
+        assert_eq!(
+            classify_raw_get_response(StatusCode::OK, r#"{"record":null}"#).unwrap(),
+            None
+        );
+        let rec = sample_record();
+        let body = serde_json::to_string(&RawRecordBody {
+            record: Some(rec.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            classify_raw_get_response(StatusCode::OK, &body).unwrap(),
+            Some(rec)
+        );
+    }
+
+    #[test]
+    fn replication_404_is_the_upgrade_error() {
+        let key = RecordKey::new("ns", "col", "id");
+        for err in [
+            classify_raw_get_response(StatusCode::NOT_FOUND, "")
+                .unwrap_err()
+                .to_string(),
+            classify_raw_list_response(StatusCode::NOT_FOUND, "")
+                .unwrap_err()
+                .to_string(),
+            classify_raw_put_response(&key, StatusCode::NOT_FOUND, "")
+                .unwrap_err()
+                .to_string(),
+            classify_purge_response(StatusCode::NOT_FOUND, "")
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert_eq!(err, upgrade_error());
+        }
+    }
+
+    #[test]
+    fn put_412_is_not_found_for_the_record_key() {
+        let key = RecordKey::new("ns", "col", "id");
+        assert!(matches!(
+            classify_put_response_for(&key, StatusCode::PRECONDITION_FAILED, "record not found"),
+            Err(CoreError::NotFound(k)) if k == key
+        ));
+        assert!(matches!(
+            classify_raw_put_response(&key, StatusCode::PRECONDITION_FAILED, "record not found"),
+            Err(CoreError::NotFound(k)) if k == key
+        ));
+        // The consumer put route never turns a 404 into the upgrade error.
+        let msg = classify_put_response_for(&key, StatusCode::NOT_FOUND, "nope")
+            .unwrap_err()
+            .to_string();
+        assert_ne!(msg, upgrade_error());
+    }
+
+    #[test]
+    fn replication_403_keeps_the_daemon_body() {
+        let body = "principal \"w\" is not an admin; purge requires admin";
+        let msg = classify_purge_response(StatusCode::FORBIDDEN, body)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("403") && msg.contains(body), "{msg}");
+        let msg = classify_raw_list_response(StatusCode::FORBIDDEN, "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("403") && msg.contains("nope"), "{msg}");
+    }
+
+    #[test]
+    fn purge_200_and_409_parse_delete_outcomes() {
+        let ok = serde_json::to_string(&DeleteOutcome::Deleted).unwrap();
+        assert_eq!(
+            classify_purge_response(StatusCode::OK, &ok).unwrap(),
+            DeleteResult::Deleted
+        );
+        let rec = sample_record();
+        let conflict = serde_json::to_string(&DeleteOutcome::Conflict {
+            conflict: Box::new(Conflict {
+                key: rec.key.clone(),
+                expected: None,
+                current: rec,
+            }),
+        })
+        .unwrap();
+        assert!(matches!(
+            classify_purge_response(StatusCode::CONFLICT, &conflict).unwrap(),
+            DeleteResult::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn grpc_status_mapping_for_replication_and_puts() {
+        let key = RecordKey::new("ns", "col", "id");
+        assert_eq!(
+            replication_status(tonic::Status::unimplemented("GetRaw")).to_string(),
+            upgrade_error()
+        );
+        assert_ne!(
+            replication_status(tonic::Status::permission_denied("no")).to_string(),
+            upgrade_error()
+        );
+        assert!(matches!(
+            put_status(tonic::Status::failed_precondition("record not found"), &key),
+            CoreError::NotFound(k) if k == key
+        ));
+        assert_eq!(
+            raw_put_status(tonic::Status::unimplemented("PutRaw"), &key).to_string(),
+            upgrade_error()
+        );
+        assert!(matches!(
+            raw_put_status(tonic::Status::failed_precondition("x"), &key),
+            CoreError::NotFound(_)
+        ));
+    }
+
+    /// Spec §6.5: against a daemon without the replication routes, every
+    /// replication call fails with the upgrade error and **no consumer route is
+    /// ever hit**.
+    #[tokio::test]
+    async fn http_old_daemon_errors_and_never_falls_back_to_consumer_routes() {
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Any consumer-route hit is a fallback: verification fails the test.
+        Mock::given(path_regex(r"^/v1/(records|keys)(/|$)"))
+            .respond_with(ResponseTemplate::new(200))
+            .named("consumer route (fallback)")
+            .expect(0)
+            .mount(&server)
+            .await;
+        // An old daemon has no replication routes.
+        Mock::given(path_regex(r"^/v1/(raw|purge)/"))
+            .respond_with(ResponseTemplate::new(404))
+            .named("replication route")
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let store = ServerStore::http(&server.uri()).unwrap();
+        let key = RecordKey::new("ns", "col", "id");
+        let errors = [
+            store.get_raw(&key).await.unwrap_err(),
+            store.list_raw(&KeyPrefix::default()).await.unwrap_err(),
+            store.put_raw(sample_record(), None).await.unwrap_err(),
+            store
+                .purge(&key, Revision::initial(b"x"))
+                .await
+                .unwrap_err(),
+        ];
+        for err in errors {
+            assert_eq!(err.to_string(), upgrade_error());
+        }
+        server.verify().await;
+    }
+
+    /// A tonic server with no services answers every RPC `Unimplemented`,
+    /// which is what a pre-#203 daemon does for the replication RPCs.
+    #[tokio::test]
+    async fn grpc_old_daemon_errors_with_the_upgrade_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let store = ServerStore::grpc(format!("http://{addr}")).await.unwrap();
+        let key = RecordKey::new("ns", "col", "id");
+        let errors = [
+            store.get_raw(&key).await.unwrap_err(),
+            store.list_raw(&KeyPrefix::default()).await.unwrap_err(),
+            store.put_raw(sample_record(), None).await.unwrap_err(),
+            store
+                .purge(&key, Revision::initial(b"x"))
+                .await
+                .unwrap_err(),
+        ];
+        for err in errors {
+            assert_eq!(err.to_string(), upgrade_error());
+        }
+    }
+
+    // ── delete_as sends its author (R1, spec §3.6 amended in 4355f4d) ───────
+
+    /// A struct-based matcher (wiremock's `Match` trait has no built-in
+    /// negation) asserting the request body carries no `author` key at all —
+    /// `DeleteBody`'s `skip_serializing_if` omits it entirely when `None`.
+    struct NoAuthorField;
+    impl wiremock::Match for NoAuthorField {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .map(|v| v.get("author").is_none())
+                .unwrap_or(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn http_delete_as_sends_the_author() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Identity's real serde shape is `{"id": ..., "display": ...}`, not a
+        // bare string, so match on the nested field (wiremock's partial-JSON
+        // matcher is inclusive at every level).
+        Mock::given(method("DELETE"))
+            .and(path("/v1/records/ns/col/with-author"))
+            .and(body_partial_json(
+                serde_json::json!({"author": {"id": "origin"}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&DeleteOutcome::Deleted))
+            .named("delete with author")
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/v1/records/ns/col/no-author"))
+            .and(NoAuthorField)
+            .respond_with(ResponseTemplate::new(200).set_body_json(&DeleteOutcome::Deleted))
+            .named("delete without author")
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = ServerStore::http(&server.uri()).unwrap();
+
+        let with_key = RecordKey::new("ns", "col", "with-author");
+        let result = store
+            .delete_as(&with_key, None, Some(Identity::new("origin")))
+            .await
+            .unwrap();
+        assert_eq!(result, DeleteResult::Deleted);
+
+        let no_key = RecordKey::new("ns", "col", "no-author");
+        let result = store.delete_as(&no_key, None, None).await.unwrap();
+        assert_eq!(result, DeleteResult::Deleted);
+
+        server.verify().await;
     }
 }

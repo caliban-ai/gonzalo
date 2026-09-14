@@ -55,6 +55,23 @@ impl StoreConfig {
     }
 }
 
+/// Resolve the backing store's ancestor cap from `GONZALO_ANCESTOR_CAP`
+/// (gonzalo#203, spec §3.9), via the environment accessor `get`.
+///
+/// Unset or empty → `gonzalo_core::DEFAULT_ANCESTOR_CAP`. Zero or a
+/// non-number is an error, so the daemon fails fast with a clear message
+/// instead of silently running at the default — the same policy as
+/// [`StoreConfig::from_env`].
+pub fn ancestor_cap_from_env(get: impl Fn(&str) -> Option<String>) -> Result<usize, String> {
+    let Some(raw) = get("GONZALO_ANCESTOR_CAP").filter(|s| !s.is_empty()) else {
+        return Ok(gonzalo_core::DEFAULT_ANCESTOR_CAP);
+    };
+    let cap: usize = raw
+        .parse()
+        .map_err(|e| format!("GONZALO_ANCESTOR_CAP must be a positive integer: {e}"))?;
+    gonzalo_core::validate_ancestor_cap(cap).map_err(|e| format!("GONZALO_ANCESTOR_CAP: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +153,35 @@ mod tests {
     fn unknown_store_is_an_error() {
         let err = StoreConfig::from_env(env(&[("GONZALO_STORE", "cassandra")])).unwrap_err();
         assert!(err.contains("cassandra"), "got {err}");
+    }
+
+    #[test]
+    fn ancestor_cap_defaults_when_unset_or_empty() {
+        assert_eq!(
+            ancestor_cap_from_env(env(&[])).unwrap(),
+            gonzalo_core::DEFAULT_ANCESTOR_CAP
+        );
+        // An empty value is unset, like the other GONZALO_* knobs.
+        assert_eq!(
+            ancestor_cap_from_env(env(&[("GONZALO_ANCESTOR_CAP", "")])).unwrap(),
+            gonzalo_core::DEFAULT_ANCESTOR_CAP
+        );
+    }
+
+    #[test]
+    fn ancestor_cap_reads_the_variable() {
+        assert_eq!(
+            ancestor_cap_from_env(env(&[("GONZALO_ANCESTOR_CAP", "8")])).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn ancestor_cap_rejects_zero_and_garbage() {
+        let zero = ancestor_cap_from_env(env(&[("GONZALO_ANCESTOR_CAP", "0")])).unwrap_err();
+        assert!(zero.contains("GONZALO_ANCESTOR_CAP"), "{zero}");
+        let garbage = ancestor_cap_from_env(env(&[("GONZALO_ANCESTOR_CAP", "lots")])).unwrap_err();
+        assert!(garbage.contains("GONZALO_ANCESTOR_CAP"), "{garbage}");
+        assert!(ancestor_cap_from_env(env(&[("GONZALO_ANCESTOR_CAP", "-1")])).is_err());
     }
 }

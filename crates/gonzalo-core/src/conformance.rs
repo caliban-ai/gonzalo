@@ -1,6 +1,9 @@
 //! A reusable conformance suite every `Store` impl must pass. Substrate
 //! crates call `run_store_conformance(factory)` from their integration
-//! tests. The factory returns a fresh, empty store per invocation.
+//! tests. The factory returns a fresh, empty store per invocation, built at
+//! the default ancestor cap. `run_store_conformance` includes every tombstone
+//! case (gonzalo#203) at that cap. Stores built with a smaller cap also call
+//! `run_tombstone_conformance(factory, cap)` directly.
 
 use crate::{
     BlobStore, Body, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, Meta, PutResult,
@@ -29,7 +32,9 @@ fn sample(key: RecordKey, payload: &[u8]) -> Record {
     }
 }
 
-/// Run the full suite against a store produced by `factory`.
+/// Run the full suite against a store produced by `factory`, including the
+/// tombstone cases at [`DEFAULT_ANCESTOR_CAP`](crate::DEFAULT_ANCESTOR_CAP).
+/// `factory` must build fresh, empty stores at the default cap.
 pub async fn run_store_conformance<S, F, Fut>(factory: F)
 where
     S: Store,
@@ -46,6 +51,10 @@ where
     delete_absent_is_idempotent(&factory().await).await;
     delete_stale_expected_conflicts(&factory().await).await;
     delete_matching_expected_removes(&factory().await).await;
+
+    // Every store gets the tombstone cases, so a new substrate cannot pass
+    // conformance without replicated deletion (gonzalo#203).
+    run_tombstone_conformance(&factory, crate::DEFAULT_ANCESTOR_CAP).await;
 }
 
 /// (a) A `put` then an unconditional `delete` (`expected = None`) removes the
@@ -737,11 +746,6 @@ mod self_test {
     #[tokio::test]
     async fn memstore_passes_store_conformance() {
         run_store_conformance(|| async { MemStore::new() }).await;
-    }
-
-    #[tokio::test]
-    async fn memstore_passes_tombstone_conformance_default_cap() {
-        run_tombstone_conformance(|| async { MemStore::new() }, crate::DEFAULT_ANCESTOR_CAP).await;
     }
 
     #[tokio::test]

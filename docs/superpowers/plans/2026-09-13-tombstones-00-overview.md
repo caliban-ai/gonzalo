@@ -59,6 +59,13 @@ Slice 5 fixes this. It's another reason nothing is tagged before slice 5.
 - **For slice 6:** fs: `delete`/`purge` of a key that was never stored takes the per-record lock, which creates the `<ns>/<col>/` directories and a `<id>.json.lock` file. `collect_keys` ignores lock files, but `reset` and `collect` over many absent keys will leave these behind; slice 6 may want to prune empty collection directories and stale lock files.
 - ADR 0021 (slice 7) must record the S3 backend requirement discovered in slice 3: purge needs an atomic conditional `DeleteObject` (`If-Match`). RustFS `1.0.0-beta.8` is not atomic (it evaluates `If-Match` on arrival and deletes whatever object is current when the removal lands: 197/200 violations in a raw purge-vs-create probe, 39/50 through the real `S3Store`), while `1.0.0-rc.6` is (0/200, 0/50); `docker-compose.rustfs.yml` pins rc.6. ADR 0019 is left unamended because `docs/adr/README.md` makes accepted ADRs append-only; its qualification table still reflects the original beta.8 run, and the HA soak has not yet been re-run on rc.6 outside CI.
 - Slice 7's spec/doc alignment must also update spec §3.3 "s3 lost races" (docs/superpowers/specs/2026-09-13-tombstone-replication-design.md), which still names only HTTP 412: a lost conditional write is `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey`, each re-read and re-planned up to 8 attempts, then `CoreError::Backend` — the rule already stated under "Rules every store follows".
+- Carried from slice 4's final review, for slice 7:
+  - **Spec §6.5.** The bullet at about line 699 still says an authenticated delete stamps the principal. Align it with §3.6: the deleter is `Principal::delete_author(claimed)`.
+  - **ADR 0021 content.** Record these alongside the RustFS minimum above:
+    - An admin token is the replication credential that preserves authors.
+    - An admin, or an open-mode caller, can name a tombstone's deleter (Ruling Q1(a)).
+    - Raw-write trust equals namespace-write trust. A namespace writer's `put_raw` supplies its own revision, ancestors and `deleted_at`, including tombstones.
+  - **Soak dispatcher.** When the soak gains Delete/Recreate, `crates/gonzalo-soak/src/dispatch.rs` must fail over only on transport or `Backend` errors. `CoreError::NotFound` (a `Some(expected)` put over a tombstone) is a re-read, like `Conflict`, not a dead replica.
 
 ---
 
@@ -250,6 +257,7 @@ The consumer methods keep their signatures. From slice 2/3/4 onward per store: `
 - s3 only: a lost conditional write — `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey` (the object vanished to a concurrent purge) — re-reads and re-plans, up to 8 attempts, then returns `CoreError::Backend`. That gives the same outcomes as the lock-based stores.
 - Daemon only: a `put`/`put_raw` that the backing store rejects with `CoreError::NotFound` crosses the wire as HTTP `412` / gRPC `FailedPrecondition`. `ServerStore` maps it back to `CoreError::NotFound`, because conformance asserts that variant. It is never `404`, which on raw routes means "old daemon", and never an opaque `500`.
 - Daemon only: `put_raw` from a non-admin principal restamps `meta.author` to the caller (ADR 0015). Admin and open mode keep the replicated author.
+- Daemon only: `delete` carries an optional claimed deleter (HTTP `DeleteBody.author`, gRPC `DeleteRequest.author_json`), and `ServerStore::delete_as` sends its author. The daemon stamps `Principal::delete_author(claimed)`, which follows the same rule as `put_raw`. A non-admin is stamped as itself. An admin keeps the claim, or is stamped as itself when there is none. Open mode keeps the claim, or stamps `None` when there is none. This is a slice 4 pre-flight ruling (Q1): `delete_as_stamps_author` must pass over the daemon.
 
 ### `gonzalo-core/src/memstore.rs`, `#[cfg(any(test, feature = "conformance"))]`
 

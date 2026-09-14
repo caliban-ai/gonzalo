@@ -131,7 +131,7 @@ A tombstone written by `delete` over a live record `cur` has these fields:
 | `parent` | `Some(cur.revision)` |
 | `ancestors` | `[cur.revision] ++ cur.ancestors`, capped |
 | `deleted_at` | `Some(now_ms)` |
-| `meta` | `cur.meta`, with `author` replaced by the deleter when one is given (`Store::delete_as`, §3.2). The daemon passes the authenticated principal, as it stamps `put` today (`grpc.rs:139-143`, `http.rs:161-165`). |
+| `meta` | `cur.meta`, with `author` replaced by the deleter when one is given (`Store::delete_as`, §3.2). Over the daemon, the deleter follows the `put_raw` author rule (§3.6). A non-admin is always stamped as itself, as consumer `put` is stamped today (`grpc.rs:139-143`, `http.rs:161-165`). |
 | `links` | empty |
 
 **`TOMBSTONE_HASH` is a fixed domain-separated hash,
@@ -414,8 +414,16 @@ paths and gain the hide-tombstones meaning through the backing store.
 | `POST /v1/purge/{ns}/{col}/{id}` (body: expected revision JSON) | `Purge` | `purge` | **admin** |
 
 - **Delete.** Existing `DELETE /v1/records/...` keeps requiring `write` on the
-  namespace and now calls `delete_as` with the authenticated principal's
-  identity (open mode passes `None`).
+  namespace and now calls `delete_as`. The request may name a deleter
+  (HTTP body `author`, gRPC `DeleteRequest.author_json`), so `ServerStore`
+  can pass its `delete_as` author through. The daemon applies the `put_raw`
+  author rule below:
+  - A non-admin principal is always stamped as itself, whatever it claims.
+  - An admin keeps the named deleter, and is stamped as itself when none is
+    named.
+  - Open mode keeps the named deleter, and passes `None` when none is named.
+  - An old daemon ignores the extra field. Amended during slice 4 because
+    `delete_as_stamps_author` (§6.1) runs over the daemon.
 - **Author on `put_raw`.** ADR 0015 promises authorship can't be forged, and
   the daemon keeps that promise.
   - When auth is enabled and the principal is **not** admin, `put_raw`

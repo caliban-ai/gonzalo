@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use gonzalo_core::Identity;
 use serde::Deserialize;
 
 /// The kind of access an operation needs on a namespace.
@@ -62,6 +63,26 @@ impl Principal {
     /// Whether authorship should be stamped from this principal on writes.
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
+    }
+
+    /// Whether this principal is an admin: `read` **and** `write` on every
+    /// namespace (`"*"` in both lists). Operations whose damage is not confined
+    /// to one namespace's readers and writers require it, such as `purge`
+    /// (gonzalo#203): purging a tombstone early resurrects the record later, on
+    /// another machine. Open mode's implicit principal is an admin.
+    pub fn is_admin(&self) -> bool {
+        self.read.iter().any(|s| s == "*") && self.write.iter().any(|s| s == "*")
+    }
+
+    /// The author a delete stamps on its tombstone (ADR 0015, gonzalo#203): the
+    /// same rule as `put_raw`. A non-admin is always stamped from its token; an
+    /// admin (the replication credential) or open mode may name the deleter,
+    /// and otherwise an authenticated admin is stamped and open mode stamps none.
+    pub fn delete_author(&self, claimed: Option<Identity>) -> Option<Identity> {
+        if !self.is_admin() {
+            return Some(Identity::new(self.name()));
+        }
+        claimed.or_else(|| self.is_authenticated().then(|| Identity::new(self.name())))
     }
 
     /// Whether this principal has `access` on `namespace` (exact match or `"*"`).
@@ -205,6 +226,42 @@ token = "same"
         let auth = Auth::Disabled;
         let p = auth.authenticate(None).unwrap();
         assert!(p.allows(Access::Write, "any"));
+    }
+
+    #[test]
+    fn is_admin_needs_wildcard_read_and_write() {
+        assert!(Principal::admin("root").is_admin());
+        // Open mode's implicit identity is an admin (it can purge).
+        assert!(Principal::open().is_admin());
+        // Wildcard on only one side is not an admin.
+        assert!(!Principal::new("r", vec!["*".into()], vec![]).is_admin());
+        assert!(!Principal::new("w", vec![], vec!["*".into()]).is_admin());
+        // Scoped principals are never admins.
+        assert!(!Principal::new("s", vec!["memory".into()], vec!["memory".into()]).is_admin());
+    }
+
+    #[test]
+    fn delete_author_follows_the_put_raw_rule() {
+        let writer = Principal::new("writer", vec!["memory".into()], vec!["memory".into()]);
+        assert_eq!(
+            writer.delete_author(Some(Identity::new("forged"))),
+            Some(Identity::new("writer"))
+        );
+        assert_eq!(writer.delete_author(None), Some(Identity::new("writer")));
+
+        let admin = Principal::admin("admin");
+        assert_eq!(
+            admin.delete_author(Some(Identity::new("origin"))),
+            Some(Identity::new("origin"))
+        );
+        assert_eq!(admin.delete_author(None), Some(Identity::new("admin")));
+
+        let open = Principal::open();
+        assert_eq!(
+            open.delete_author(Some(Identity::new("origin"))),
+            Some(Identity::new("origin"))
+        );
+        assert_eq!(open.delete_author(None), None);
     }
 
     #[test]

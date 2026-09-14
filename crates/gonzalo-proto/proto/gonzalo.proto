@@ -10,6 +10,16 @@ service Gonzalo {
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc List(ListRequest) returns (ListResponse);
+  // Replication surface (gonzalo#203). Raw reads include tombstones; PutRaw
+  // stores a record verbatim (revision never re-stamped; the author is kept
+  // only for an admin principal (including open mode's implicit admin), per
+  // ADR 0015); Purge is the only physical removal and requires an admin.
+  // GetRaw/ListRaw/PutRaw reuse the Get/List/Put messages: the shapes are
+  // identical, only the store call differs.
+  rpc GetRaw(GetRequest) returns (GetResponse);
+  rpc ListRaw(ListRequest) returns (ListResponse);
+  rpc PutRaw(PutRequest) returns (PutResponse);
+  rpc Purge(PurgeRequest) returns (PurgeResponse);
   rpc TicketSync(TicketSyncRequest) returns (TicketSyncResponse);
   // Code graph queries (EPIC C). Each selects a view by (repo, view_id).
   rpc GraphDefinitions(GraphQueryRequest) returns (GraphLocatedResponse);
@@ -56,6 +66,9 @@ message DeleteRequest {
   string id = 3;
   // JSON of Option<gonzalo_core::Revision> (the expected current revision).
   bytes expected_json = 4;
+  // JSON of gonzalo_core::Identity naming the deleter (gonzalo#203); empty
+  // means none. Honoured only for an admin or open mode (Principal::delete_author).
+  bytes author_json = 5;
 }
 
 message DeleteResponse {
@@ -138,3 +151,19 @@ message DeleteBlobRequest {
   string hash = 1;
 }
 message DeleteBlobResponse {}
+
+// --- Replication surface (gonzalo#203) ---
+message PurgeRequest {
+  string namespace = 1;
+  string collection = 2;
+  string id = 3;
+  // JSON of gonzalo_core::Revision. Required: purge is always conditional.
+  bytes expected_json = 4;
+}
+
+message PurgeResponse {
+  // "deleted" or "conflict".
+  string outcome = 1;
+  // Empty (deleted) or JSON of Conflict (conflict).
+  bytes payload_json = 2;
+}

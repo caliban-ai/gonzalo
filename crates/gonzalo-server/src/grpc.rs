@@ -4,14 +4,15 @@
 use crate::Service;
 use crate::auth::{Access, Auth, Principal};
 use gonzalo_core::{
-    ContentHash, DeleteResult, Identity, KeyPrefix, PutResult, Record, RecordKey, Revision,
+    ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, Record, RecordKey,
+    Revision,
 };
 use gonzalo_proto::v1::{
     DeleteBlobRequest, DeleteBlobResponse, DeleteRequest, DeleteResponse, GetBlobRequest,
     GetBlobResponse, GetRequest, GetResponse, GraphLocatedResponse, GraphNamesResponse,
     GraphQueryRequest, ListBlobsRequest, ListBlobsResponse, ListRequest, ListResponse,
-    PutBlobRequest, PutBlobResponse, PutRequest, PutResponse, TicketSyncRequest,
-    TicketSyncResponse,
+    PurgeRequest, PurgeResponse, PutBlobRequest, PutBlobResponse, PutRequest, PutResponse,
+    TicketSyncRequest, TicketSyncResponse,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };
 use serde::Serialize;
@@ -83,6 +84,61 @@ impl GrpcAdapter {
             )))
         }
     }
+
+    /// Authenticate the call and require an admin principal (`read` and
+    /// `write` on `"*"`). Used by `purge` (gonzalo#203): an early purge is data
+    /// loss that surfaces later on another machine, so no namespace scope is
+    /// enough. Takes no body, so it runs before any deserialization (#146).
+    #[allow(clippy::result_large_err)]
+    fn authorize_admin(
+        &self,
+        metadata: &MetadataMap,
+        operation: &str,
+    ) -> Result<Principal, Status> {
+        let principal = self.authenticate(metadata)?;
+        if principal.is_admin() {
+            Ok(principal)
+        } else {
+            Err(Status::permission_denied(format!(
+                "principal {:?} is not an admin; {operation} requires admin",
+                principal.name()
+            )))
+        }
+    }
+
+    /// Authenticate, parse a `PutRequest` (malformed → `InvalidArgument`) and
+    /// authorize `Write` on the record's namespace. Shared by `Put` and `PutRaw`,
+    /// in #146 order.
+    #[allow(clippy::result_large_err)]
+    fn authorize_put(
+        &self,
+        metadata: &MetadataMap,
+        r: &PutRequest,
+    ) -> Result<(Principal, Record, Option<Revision>), Status> {
+        let principal = self.authenticate(metadata)?;
+        let record: Record = serde_json::from_slice(&r.record_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let expected: Option<Revision> = serde_json::from_slice(&r.expected_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.check_access(&principal, Access::Write, &record.key.namespace)?;
+        Ok((principal, record, expected))
+    }
+
+    /// Authenticate the call and authorize a key listing (`read` on the
+    /// namespace, or on `"*"` when unscoped), then build its prefix. Shared by
+    /// `List` and `ListRaw`.
+    #[allow(clippy::result_large_err)]
+    fn authorize_list(&self, metadata: &MetadataMap, r: ListRequest) -> Result<KeyPrefix, Status> {
+        self.authorize(
+            metadata,
+            Access::Read,
+            r.namespace.as_deref().unwrap_or("*"),
+        )?;
+        Ok(KeyPrefix {
+            namespace: r.namespace,
+            collection: r.collection,
+        })
+    }
 }
 
 /// The bearer token from gRPC `authorization: Bearer <token>` metadata.
@@ -110,17 +166,7 @@ impl Gonzalo for GrpcAdapter {
         self.authorize(&metadata, Access::Read, &r.namespace)?;
         let key = RecordKey::new(r.namespace, r.collection, r.id);
         let rec = self.service.get(&key).await.map_err(internal)?;
-        let resp = match rec {
-            Some(rec) => GetResponse {
-                found: true,
-                record_json: serde_json::to_vec(&rec).map_err(internal)?,
-            },
-            None => GetResponse {
-                found: false,
-                record_json: Vec::new(),
-            },
-        };
-        Ok(Response::new(resp))
+        Ok(Response::new(get_response(rec)?))
     }
 
     async fn put(&self, req: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
@@ -130,29 +176,18 @@ impl Gonzalo for GrpcAdapter {
         // serde. Only then parse the body (malformed input is the caller's
         // error → invalid_argument, not internal) and authorize the write
         // against the namespace named in the record's key.
-        let principal = self.authenticate(&metadata)?;
-        let mut record: Record = serde_json::from_slice(&r.record_json)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let expected: Option<Revision> = serde_json::from_slice(&r.expected_json)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        self.check_access(&principal, Access::Write, &record.key.namespace)?;
+        let (principal, mut record, expected) = self.authorize_put(&metadata, &r)?;
         // Stamp the author from the authenticated principal — unforgeable (ADR
         // 0015). Open mode (no auth) leaves the record's author untouched.
         if principal.is_authenticated() {
             record.meta.author = Identity::new(principal.name());
         }
-        let outcome = self.service.put(record, expected).await.map_err(internal)?;
-        let resp = match outcome {
-            PutResult::Committed(rev) => PutResponse {
-                outcome: "committed".into(),
-                payload_json: serde_json::to_vec(&rev).map_err(internal)?,
-            },
-            PutResult::Conflict(c) => PutResponse {
-                outcome: "conflict".into(),
-                payload_json: serde_json::to_vec(&*c).map_err(internal)?,
-            },
-        };
-        Ok(Response::new(resp))
+        let outcome = self
+            .service
+            .put(record, expected)
+            .await
+            .map_err(put_error)?;
+        Ok(Response::new(put_response(outcome)?))
     }
 
     async fn delete(
@@ -161,52 +196,98 @@ impl Gonzalo for GrpcAdapter {
     ) -> Result<Response<DeleteResponse>, Status> {
         let (metadata, _ext, r) = req.into_parts();
         // Authenticate BEFORE deserializing attacker-controlled JSON (#146), then
-        // parse the precondition (malformed input is the caller's error →
-        // invalid_argument), authorize the write against the path's namespace,
-        // and build the key from (namespace, collection, id).
+        // parse the precondition and the optional claimed-author (malformed
+        // input is the caller's error → invalid_argument), authorize the write
+        // against the path's namespace, and build the key from
+        // (namespace, collection, id). The tombstone's author follows
+        // `Principal::delete_author` (gonzalo#203, mirrors `put_raw`'s
+        // authorship rule): a non-admin is always stamped as itself and any
+        // claimed author is ignored; an admin or open mode may name the
+        // deleter via `author_json`; and otherwise an authenticated admin is
+        // stamped as itself while open mode keeps the prior author (no
+        // identity to stamp, ADR 0015).
         let principal = self.authenticate(&metadata)?;
         let expected: Option<Revision> = serde_json::from_slice(&r.expected_json)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let claimed: Option<Identity> = if r.author_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&r.author_json)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?,
+            )
+        };
         self.check_access(&principal, Access::Write, &r.namespace)?;
+        let author = principal.delete_author(claimed);
         let key = RecordKey::new(r.namespace, r.collection, r.id);
         let outcome = self
             .service
-            .delete(&key, expected)
+            .delete_as(&key, expected, author)
             .await
             .map_err(internal)?;
-        let resp = match outcome {
-            DeleteResult::Deleted => DeleteResponse {
-                outcome: "deleted".into(),
-                payload_json: Vec::new(),
-            },
-            DeleteResult::Conflict(c) => DeleteResponse {
-                outcome: "conflict".into(),
-                payload_json: serde_json::to_vec(&*c).map_err(internal)?,
-            },
-        };
-        Ok(Response::new(resp))
+        let (outcome, payload_json) = delete_outcome_parts(outcome)?;
+        Ok(Response::new(DeleteResponse {
+            outcome,
+            payload_json,
+        }))
     }
 
     async fn list(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let (metadata, _ext, r) = req.into_parts();
-        // Listing without a namespace spans all namespaces → requires admin
-        // (`read` on `"*"`); a namespaced list needs read on that namespace.
-        self.authorize(
-            &metadata,
-            Access::Read,
-            r.namespace.as_deref().unwrap_or("*"),
-        )?;
-        let prefix = KeyPrefix {
-            namespace: r.namespace,
-            collection: r.collection,
-        };
+        let prefix = self.authorize_list(&metadata, r)?;
         let keys = self.service.list(&prefix).await.map_err(internal)?;
-        let keys_json = keys
-            .iter()
-            .map(serde_json::to_vec)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(internal)?;
-        Ok(Response::new(ListResponse { keys_json }))
+        Ok(Response::new(list_response(&keys)?))
+    }
+
+    async fn get_raw(&self, req: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, &r.namespace)?;
+        let key = RecordKey::new(r.namespace, r.collection, r.id);
+        let rec = self.service.get_raw(&key).await.map_err(internal)?;
+        Ok(Response::new(get_response(rec)?))
+    }
+
+    async fn list_raw(&self, req: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        // Same authorization as `List`: unscoped requires `read` on `"*"`.
+        let prefix = self.authorize_list(&metadata, r)?;
+        let keys = self.service.list_raw(&prefix).await.map_err(internal)?;
+        Ok(Response::new(list_response(&keys)?))
+    }
+
+    async fn put_raw(&self, req: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        // Replication write (gonzalo#203). Authorship stays unforgeable (ADR
+        // 0015): an admin token is the replication credential, so an admin's
+        // PutRaw keeps the replicated record's original author. Any other
+        // principal is restamped exactly as `Put` restamps. Open mode's
+        // implicit principal is an admin, so it keeps the author too.
+        let (principal, mut record, expected) = self.authorize_put(&metadata, &r)?;
+        if !principal.is_admin() {
+            record.meta.author = Identity::new(principal.name());
+        }
+        let outcome = self
+            .service
+            .put_raw(record, expected)
+            .await
+            .map_err(put_error)?;
+        Ok(Response::new(put_response(outcome)?))
+    }
+
+    async fn purge(&self, req: Request<PurgeRequest>) -> Result<Response<PurgeResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        // Admin check first, then parse the attacker-controlled precondition
+        // (malformed → invalid_argument, the caller's error).
+        self.authorize_admin(&metadata, "purge")?;
+        let expected: Revision = serde_json::from_slice(&r.expected_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let key = RecordKey::new(r.namespace, r.collection, r.id);
+        let outcome = self.service.purge(&key, expected).await.map_err(internal)?;
+        let (outcome, payload_json) = delete_outcome_parts(outcome)?;
+        Ok(Response::new(PurgeResponse {
+            outcome,
+            payload_json,
+        }))
     }
 
     async fn ticket_sync(
@@ -372,6 +453,71 @@ impl Gonzalo for GrpcAdapter {
             .map_err(internal)?;
         Ok(Response::new(DeleteBlobResponse {}))
     }
+}
+
+/// Map a put failure. `CoreError::NotFound` (`expected` names a revision the
+/// store does not hold) is the caller's precondition failing →
+/// `FailedPrecondition`, which the client maps back to `NotFound`. Everything
+/// else is opaque (#148).
+fn put_error(e: CoreError) -> Status {
+    match e {
+        CoreError::NotFound(key) => Status::failed_precondition(format!("record not found: {key}")),
+        other => internal(other),
+    }
+}
+
+/// `PutResponse` for a `PutResult` (shared by `Put` and `PutRaw`).
+#[allow(clippy::result_large_err)]
+fn put_response(outcome: PutResult) -> Result<PutResponse, Status> {
+    Ok(match outcome {
+        PutResult::Committed(rev) => PutResponse {
+            outcome: "committed".into(),
+            payload_json: serde_json::to_vec(&rev).map_err(internal)?,
+        },
+        PutResult::Conflict(c) => PutResponse {
+            outcome: "conflict".into(),
+            payload_json: serde_json::to_vec(&*c).map_err(internal)?,
+        },
+    })
+}
+
+/// `GetResponse` for an optional record (shared by `Get` and `GetRaw`).
+#[allow(clippy::result_large_err)]
+fn get_response(rec: Option<Record>) -> Result<GetResponse, Status> {
+    Ok(match rec {
+        Some(rec) => GetResponse {
+            found: true,
+            record_json: serde_json::to_vec(&rec).map_err(internal)?,
+        },
+        None => GetResponse {
+            found: false,
+            record_json: Vec::new(),
+        },
+    })
+}
+
+/// `ListResponse` of JSON-encoded keys (shared by `List` and `ListRaw`).
+#[allow(clippy::result_large_err)]
+fn list_response(keys: &[RecordKey]) -> Result<ListResponse, Status> {
+    let keys_json = keys
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    Ok(ListResponse { keys_json })
+}
+
+/// `(outcome, payload_json)` for a `DeleteResult` (shared by `Delete` and
+/// `Purge`): `"deleted"` + empty, or `"conflict"` + JSON of `Conflict`.
+#[allow(clippy::result_large_err)]
+fn delete_outcome_parts(outcome: DeleteResult) -> Result<(String, Vec<u8>), Status> {
+    Ok(match outcome {
+        DeleteResult::Deleted => ("deleted".into(), Vec::new()),
+        DeleteResult::Conflict(c) => (
+            "conflict".into(),
+            serde_json::to_vec(&*c).map_err(internal)?,
+        ),
+    })
 }
 
 /// JSON-encode each located item into a `GraphLocatedResponse` (the shared
@@ -563,6 +709,10 @@ mod tests {
     /// A store whose every op fails, to force the `internal` (server-error) path.
     struct DownStore;
 
+    fn leaky() -> gonzalo_core::CoreError {
+        gonzalo_core::CoreError::Backend("s3://secret-bucket".into())
+    }
+
     #[async_trait::async_trait]
     impl Store for DownStore {
         async fn get(&self, _key: &RecordKey) -> gonzalo_core::Result<Option<Record>> {
@@ -575,17 +725,13 @@ mod tests {
             _record: Record,
             _expected: Option<Revision>,
         ) -> gonzalo_core::Result<PutResult> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
+            Err(leaky())
         }
         async fn list(
             &self,
             _prefix: &gonzalo_core::KeyPrefix,
         ) -> gonzalo_core::Result<Vec<RecordKey>> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
+            Err(leaky())
         }
         async fn delete_as(
             &self,
@@ -593,40 +739,30 @@ mod tests {
             _expected: Option<Revision>,
             _author: Option<Identity>,
         ) -> gonzalo_core::Result<DeleteResult> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
+            Err(leaky())
+        }
+        async fn get_raw(&self, _key: &RecordKey) -> gonzalo_core::Result<Option<Record>> {
+            Err(leaky())
+        }
+        async fn list_raw(
+            &self,
+            _prefix: &gonzalo_core::KeyPrefix,
+        ) -> gonzalo_core::Result<Vec<RecordKey>> {
+            Err(leaky())
         }
         async fn put_raw(
             &self,
             _record: Record,
             _expected: Option<Revision>,
         ) -> gonzalo_core::Result<PutResult> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
-        }
-        async fn get_raw(&self, _key: &RecordKey) -> gonzalo_core::Result<Option<Record>> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
-        }
-        async fn list_raw(
-            &self,
-            _prefix: &gonzalo_core::KeyPrefix,
-        ) -> gonzalo_core::Result<Vec<RecordKey>> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
+            Err(leaky())
         }
         async fn purge(
             &self,
             _key: &RecordKey,
             _expected: Revision,
         ) -> gonzalo_core::Result<DeleteResult> {
-            Err(gonzalo_core::CoreError::Backend(
-                "s3://secret-bucket".into(),
-            ))
+            Err(leaky())
         }
     }
 
@@ -843,5 +979,477 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(callers.names, vec!["main".to_string()]);
+    }
+
+    // --- replication RPCs: GetRaw / ListRaw / PutRaw / Purge (gonzalo#203) ---
+
+    /// `reader` reads `memory` only; `writer` reads and writes `memory`; `admin`.
+    fn tomb_auth() -> Arc<Auth> {
+        Arc::new(Auth::Enabled(HashMap::from([
+            (
+                "rtok".to_string(),
+                Principal::new("reader", vec!["memory".into()], vec![]),
+            ),
+            (
+                "wtok".to_string(),
+                Principal::new("writer", vec!["memory".into()], vec!["memory".into()]),
+            ),
+            ("atok".to_string(), Principal::admin("admin")),
+        ])))
+    }
+
+    fn delete_req(namespace: &str) -> DeleteRequest {
+        DeleteRequest {
+            namespace: namespace.into(),
+            collection: "col".into(),
+            id: "x".into(),
+            expected_json: serde_json::to_vec(&Option::<Revision>::None).unwrap(),
+            author_json: Vec::new(),
+        }
+    }
+
+    fn purge_req(namespace: &str, expected: &Revision) -> PurgeRequest {
+        PurgeRequest {
+            namespace: namespace.into(),
+            collection: "col".into(),
+            id: "x".into(),
+            expected_json: serde_json::to_vec(expected).unwrap(),
+        }
+    }
+
+    /// A `PutRequest` for memory/col/x with an explicit author and precondition.
+    fn put_req_with(author: &str, payload: &[u8], expected: Option<Revision>) -> PutRequest {
+        let body = gonzalo_core::Body::Inline(payload.to_vec());
+        let record = Record {
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            kind: RecordKind::MemoryTier,
+            meta: Meta {
+                author: Identity::new(author),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+            key: RecordKey::new("memory", "col", "x"),
+        };
+        PutRequest {
+            record_json: serde_json::to_vec(&record).unwrap(),
+            expected_json: serde_json::to_vec(&expected).unwrap(),
+        }
+    }
+
+    fn memory_list() -> ListRequest {
+        ListRequest {
+            namespace: Some("memory".into()),
+            collection: None,
+        }
+    }
+
+    async fn raw_record(adapter: &GrpcAdapter) -> Option<Record> {
+        let raw = adapter
+            .get_raw(with_token(get_req("memory"), "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        raw.found
+            .then(|| serde_json::from_slice(&raw.record_json).unwrap())
+    }
+
+    /// Put memory/col/x as `writer`, delete it with `delete_token`; return the
+    /// tombstone.
+    async fn seed_tombstone(adapter: &GrpcAdapter, delete_token: &str) -> Record {
+        adapter
+            .put(with_token(put_req("memory", "writer"), "wtok"))
+            .await
+            .unwrap();
+        let del = adapter
+            .delete(with_token(delete_req("memory"), delete_token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(del.outcome, "deleted");
+        raw_record(adapter).await.expect("tombstone")
+    }
+
+    fn decode_keys(resp: ListResponse) -> Vec<RecordKey> {
+        resp.keys_json
+            .iter()
+            .map(|b| serde_json::from_slice(b).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn grpc_delete_leaves_a_stamped_tombstone_for_raw_reads() {
+        let adapter = fs_adapter(tomb_auth());
+        // `writer` wrote it; `admin` deletes it; the tombstone names the deleter.
+        let tomb = seed_tombstone(&adapter, "atok").await;
+        assert_eq!(tomb.kind, RecordKind::Tombstone);
+        assert_eq!(tomb.revision.hash, gonzalo_core::tombstone_hash());
+        assert_eq!(tomb.meta.author, Identity::new("admin"));
+        let key = RecordKey::new("memory", "col", "x");
+
+        let got = adapter
+            .get(with_token(get_req("memory"), "rtok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!got.found);
+        let live = decode_keys(
+            adapter
+                .list(with_token(memory_list(), "rtok"))
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        assert!(!live.contains(&key));
+
+        let raw = adapter
+            .get_raw(with_token(get_req("memory"), "rtok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(raw.found);
+        let raw_keys = decode_keys(
+            adapter
+                .list_raw(with_token(memory_list(), "rtok"))
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        assert!(raw_keys.contains(&key));
+    }
+
+    #[tokio::test]
+    async fn grpc_raw_reads_are_read_scoped() {
+        let adapter = fs_adapter(tomb_auth());
+        let err = adapter
+            .get_raw(with_token(get_req("secrets"), "rtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let err = adapter
+            .get_raw(Request::new(get_req("memory")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn grpc_unscoped_list_raw_requires_admin() {
+        let adapter = fs_adapter(tomb_auth());
+        for token in ["rtok", "wtok"] {
+            let err = adapter
+                .list_raw(with_token(ListRequest::default(), token))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{token}");
+        }
+        assert!(
+            adapter
+                .list_raw(with_token(ListRequest::default(), "atok"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_put_raw_is_write_scoped() {
+        let adapter = fs_adapter(tomb_auth());
+        let err = adapter
+            .put_raw(with_token(put_req_with("origin", b"{}", None), "rtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn grpc_put_raw_by_scoped_writer_is_stamped_with_the_writer() {
+        // A non-admin cannot forge authorship through PutRaw (ADR 0015).
+        let adapter = fs_adapter(tomb_auth());
+        let resp = adapter
+            .put_raw(with_token(put_req_with("origin", b"{}", None), "wtok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.outcome, "committed");
+        assert_eq!(
+            raw_record(&adapter).await.expect("stored").meta.author,
+            Identity::new("writer")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_put_raw_by_admin_keeps_the_incoming_author() {
+        // An admin token is the replication credential.
+        let adapter = fs_adapter(tomb_auth());
+        let resp = adapter
+            .put_raw(with_token(put_req_with("origin", b"{}", None), "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.outcome, "committed");
+        assert_eq!(
+            raw_record(&adapter).await.expect("stored").meta.author,
+            Identity::new("origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_put_raw_in_open_mode_keeps_the_incoming_author() {
+        // Open mode's implicit principal is an admin.
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(fs.clone(), fs));
+        let resp = adapter
+            .put_raw(Request::new(put_req_with("origin", b"{}", None)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.outcome, "committed");
+        let raw = adapter
+            .get_raw(Request::new(get_req("memory")))
+            .await
+            .unwrap()
+            .into_inner();
+        let stored: Record = serde_json::from_slice(&raw.record_json).unwrap();
+        assert_eq!(stored.meta.author, Identity::new("origin"));
+    }
+
+    #[tokio::test]
+    async fn grpc_put_raw_over_tombstone_none_conflicts_some_overwrites() {
+        let adapter = fs_adapter(tomb_auth());
+        let tomb = seed_tombstone(&adapter, "wtok").await;
+
+        let conflict = adapter
+            .put_raw(with_token(put_req_with("peer", b"peer", None), "wtok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(conflict.outcome, "conflict");
+
+        let ok = adapter
+            .put_raw(with_token(
+                put_req_with("peer", b"peer", Some(tomb.revision.clone())),
+                "wtok",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ok.outcome, "committed");
+        let stored = raw_record(&adapter).await.expect("stored");
+        assert_eq!(stored.revision, Revision::initial(b"peer"));
+    }
+
+    #[tokio::test]
+    async fn grpc_put_not_found_is_failed_precondition() {
+        let adapter = fs_adapter(tomb_auth());
+        let never = Some(Revision::initial(b"never current"));
+        let err = adapter
+            .put_raw(with_token(put_req_with("w", b"{}", never.clone()), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        seed_tombstone(&adapter, "wtok").await;
+        let err = adapter
+            .put(with_token(put_req_with("w", b"{}", never), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn grpc_purge_requires_admin() {
+        let adapter = fs_adapter(tomb_auth());
+        let tomb = seed_tombstone(&adapter, "wtok").await;
+
+        for token in ["rtok", "wtok"] {
+            let err = adapter
+                .purge(with_token(purge_req("memory", &tomb.revision), token))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{token}");
+        }
+        let err = adapter
+            .purge(Request::new(purge_req("memory", &tomb.revision)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        let ok = adapter
+            .purge(with_token(purge_req("memory", &tomb.revision), "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ok.outcome, "deleted");
+        assert_eq!(raw_record(&adapter).await, None);
+    }
+
+    #[tokio::test]
+    async fn grpc_purge_stale_expected_is_conflict() {
+        let adapter = fs_adapter(tomb_auth());
+        let tomb = seed_tombstone(&adapter, "wtok").await;
+        let resp = adapter
+            .purge(with_token(
+                purge_req("memory", &Revision::initial(b"not the tombstone")),
+                "atok",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.outcome, "conflict");
+        let conflict: gonzalo_core::Conflict = serde_json::from_slice(&resp.payload_json).unwrap();
+        assert_eq!(conflict.current.revision, tomb.revision);
+    }
+
+    #[tokio::test]
+    async fn grpc_purge_authorizes_before_parsing() {
+        let adapter = fs_adapter(tomb_auth());
+        let garbage = PurgeRequest {
+            namespace: "memory".into(),
+            collection: "col".into(),
+            id: "x".into(),
+            expected_json: b"not json".to_vec(),
+        };
+        let err = adapter
+            .purge(with_token(garbage.clone(), "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let err = adapter
+            .purge(with_token(garbage, "atok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn grpc_raw_backend_error_is_opaque() {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(Arc::new(DownStore), fs));
+        let err = adapter
+            .get_raw(Request::new(get_req("any")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+
+        // The same opaque mapping applies to every other replication RPC
+        // that reaches the store: `put_raw` (via `put_error`'s fallback),
+        // `list_raw` and `purge`. Open mode's implicit principal is an admin,
+        // so each request clears authorization and reaches `DownStore`.
+        let err = adapter
+            .put_raw(Request::new(put_req_with("origin", b"{}", None)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+
+        let err = adapter
+            .list_raw(Request::new(memory_list()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+
+        let err = adapter
+            .purge(Request::new(purge_req("memory", &Revision::initial(b"x"))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+    }
+
+    // --- gRPC delete carries a claimed author (R1) ---
+
+    #[tokio::test]
+    async fn grpc_delete_by_non_admin_ignores_a_claimed_author() {
+        // The live record is seeded by admin, so the prior author is "admin" —
+        // distinct from both "forged" (the claim) and "writer" (the deleter).
+        let adapter = fs_adapter(tomb_auth());
+        adapter
+            .put(with_token(put_req("memory", "admin"), "atok"))
+            .await
+            .unwrap();
+        let mut req = delete_req("memory");
+        req.author_json = serde_json::to_vec(&Identity::new("forged")).unwrap();
+        let del = adapter
+            .delete(with_token(req, "wtok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(del.outcome, "deleted");
+        let tomb = raw_record(&adapter).await.expect("tombstone");
+        assert_eq!(tomb.meta.author, Identity::new("writer"));
+    }
+
+    #[tokio::test]
+    async fn grpc_delete_by_admin_keeps_a_claimed_author() {
+        let adapter = fs_adapter(tomb_auth());
+        adapter
+            .put(with_token(put_req("memory", "writer"), "wtok"))
+            .await
+            .unwrap();
+        let mut req = delete_req("memory");
+        req.author_json = serde_json::to_vec(&Identity::new("origin")).unwrap();
+        let del = adapter
+            .delete(with_token(req, "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(del.outcome, "deleted");
+        let tomb = raw_record(&adapter).await.expect("tombstone");
+        assert_eq!(tomb.meta.author, Identity::new("origin"));
+    }
+
+    #[tokio::test]
+    async fn grpc_open_mode_delete_keeps_a_claimed_author() {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(fs.clone(), fs));
+        adapter
+            .put(Request::new(put_req("memory", "writer")))
+            .await
+            .unwrap();
+        let mut req = delete_req("memory");
+        req.author_json = serde_json::to_vec(&Identity::new("origin")).unwrap();
+        let del = adapter
+            .delete(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(del.outcome, "deleted");
+        let raw = adapter
+            .get_raw(Request::new(get_req("memory")))
+            .await
+            .unwrap()
+            .into_inner();
+        let tomb: Record = serde_json::from_slice(&raw.record_json).unwrap();
+        assert_eq!(tomb.meta.author, Identity::new("origin"));
+    }
+
+    #[tokio::test]
+    async fn grpc_delete_rejects_a_malformed_author() {
+        let adapter = fs_adapter(tomb_auth());
+        adapter
+            .put(with_token(put_req("memory", "admin"), "atok"))
+            .await
+            .unwrap();
+        let mut req = delete_req("memory");
+        req.author_json = b"not json".to_vec();
+        let err = adapter.delete(with_token(req, "atok")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // The malformed author aborted the delete before the store call: the
+        // record is still live.
+        let got = adapter
+            .get(with_token(get_req("memory"), "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.found);
     }
 }

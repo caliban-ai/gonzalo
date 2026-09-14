@@ -9,7 +9,8 @@ pub mod v1 {
 
 pub use v1::{
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, GraphLocatedResponse,
-    GraphNamesResponse, GraphQueryRequest, ListRequest, ListResponse, PutRequest, PutResponse,
+    GraphNamesResponse, GraphQueryRequest, ListRequest, ListResponse, PurgeRequest, PurgeResponse,
+    PutRequest, PutResponse,
     gonzalo_client::GonzaloClient,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };

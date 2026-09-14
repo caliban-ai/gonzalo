@@ -1,4 +1,3 @@
-use gonzalo_core::DEFAULT_ANCESTOR_CAP;
 use gonzalo_core::conformance::{run_store_conformance, run_tombstone_conformance};
 use gonzalo_store_fs::FsStore;
 
@@ -17,15 +16,6 @@ fn fresh_root() -> std::path::PathBuf {
 #[tokio::test]
 async fn fs_store_passes_conformance() {
     run_store_conformance(|| async { FsStore::new(fresh_root()) }).await;
-}
-
-#[tokio::test]
-async fn fs_store_passes_tombstone_conformance_default_cap() {
-    run_tombstone_conformance(
-        || async { FsStore::new(fresh_root()) },
-        DEFAULT_ANCESTOR_CAP,
-    )
-    .await;
 }
 
 #[tokio::test]

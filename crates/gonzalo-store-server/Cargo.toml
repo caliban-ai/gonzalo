@@ -21,7 +21,13 @@ reqwest       = { workspace = true }
 # live in the `gonzalo-integration-tests` crate, not here — so this published
 # library carries no dev-dep on the gonzalo-server binary or gonzalo-graph, and
 # its crates.io publish order tracks only its runtime deps (gonzalo#190). The
-# inline unit tests in src/lib.rs need only the normal deps above.
+# inline unit tests use only third-party dev-deps: wiremock stands in for an
+# old HTTP daemon and a service-less tonic server for an old gRPC daemon
+# (gonzalo#203).
+[dev-dependencies]
+tokio        = { workspace = true, features = ["rt", "macros", "net"] }
+tokio-stream = { workspace = true }
+wiremock     = { workspace = true }
 
 [lints]
 workspace = true
