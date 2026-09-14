@@ -245,7 +245,7 @@ The consumer methods keep their signatures. From slice 2/3/4 onward per store: `
 - A conformance factory returns a fresh, empty store on every call.
 - A stored object that fails to deserialize is still included by consumer `list`, as today, so `get` surfaces the parse error.
 - Unreadable entries differ by substrate. fs and git (local filesystem): an entry whose read fails for any reason other than NotFound (for example a stray directory named `*.json`) stays listed, and `get` surfaces the error. s3: an object that fails to deserialize stays listed, a missing object (NotFound) is not listed, but any other read error (network, 5xx, permission) fails the whole consumer `list` with that error — on s3 such errors can be transient, and silently listing a key that may be a tombstone would be wrong.
-- s3 only: a lost conditional write (HTTP 412) re-reads and re-plans, up to 8 attempts, then returns `CoreError::Backend`. That gives the same outcomes as the lock-based stores.
+- s3 only: a lost conditional write — `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey` (the object vanished to a concurrent purge) — re-reads and re-plans, up to 8 attempts, then returns `CoreError::Backend`. That gives the same outcomes as the lock-based stores.
 - Daemon only: a `put`/`put_raw` that the backing store rejects with `CoreError::NotFound` crosses the wire as HTTP `412` / gRPC `FailedPrecondition`. `ServerStore` maps it back to `CoreError::NotFound`, because conformance asserts that variant. It is never `404`, which on raw routes means "old daemon", and never an opaque `500`.
 - Daemon only: `put_raw` from a non-admin principal restamps `meta.author` to the caller (ADR 0015). Admin and open mode keep the replicated author.
 
