@@ -3,7 +3,7 @@
 - **Ticket:** gonzalo#203 (namespace reset), which pulls in the deferred half of
   ADR 0018 (replicated deletion)
 - **Date:** 2026-09-13
-- **Status:** Proposed
+- **Status:** Implemented (ADR 0021)
 - **Refs:** `crates/gonzalo-core/src/{store,record,revision,sync,conformance}.rs`,
   `crates/gonzalo-store-{fs,git,s3,server}/src/lib.rs`,
   `crates/gonzalo-server/src/{http,grpc,service}.rs`,
@@ -427,7 +427,7 @@ paths and gain the hide-tombstones meaning through the backing store.
 | `GET /v1/raw/records/{ns}/{col}/{id}` | `GetRaw` | `get_raw` | `read` on `ns` |
 | `GET /v1/raw/keys?namespace=&collection=` | `ListRaw` | `list_raw` | `read` on `ns`; read on `*` when unscoped, like `/v1/keys` today |
 | `PUT /v1/raw/records/{ns}/{col}/{id}` (body as consumer put) | `PutRaw` | `put_raw` | `write` on `ns` |
-| `POST /v1/purge/{ns}/{col}/{id}` (body: expected revision JSON) | `Purge` | `purge` | **admin** |
+| `POST /v1/purge/{ns}/{col}/{id}` (body: `{"expected": <revision>}`) | `Purge` | `purge` | **admin** |
 
 - **Delete.** Existing `DELETE /v1/records/...` keeps requiring `write` on the
   namespace and now calls `delete_as`. The request may name a deleter

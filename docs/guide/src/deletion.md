@@ -40,7 +40,8 @@ yourself. On the daemon they are separate routes
 
 The `gonzalo delete`, `reset` and `collect` commands below work on a local store
 directory given by `--root`, which defaults to the current directory. For a store
-behind `gonzalod`, use the daemon's routes.
+behind `gonzalod`, call `gonzalo_core::reset_as` or `collect` with a `ServerStore`:
+each tombstone goes through the daemon's delete route and its authorization.
 
 ## Exit codes
 
@@ -262,7 +263,7 @@ meaning, with tombstones hidden:
 | Raw read of one record | `GET /v1/raw/records/{ns}/{col}/{id}` | `read` on the namespace |
 | Raw write (replication; revision stored verbatim, never re-stamped) | `PUT /v1/raw/records/{ns}/{col}/{id}` | `write` on the namespace |
 | Raw key listing | `GET /v1/raw/keys?namespace=&collection=` | `read` on the namespace; `read` on `*` without `namespace` |
-| Purge (physical removal) | `POST /v1/purge/{ns}/{col}/{id}` with the expected revision as the JSON body | admin |
+| Purge (physical removal) | `POST /v1/purge/{ns}/{col}/{id}` with body `{"expected": <revision>}` | admin |
 
 gRPC has the matching `GetRaw`, `ListRaw`, `PutRaw` and `Purge` RPCs, with the same
 permissions.
