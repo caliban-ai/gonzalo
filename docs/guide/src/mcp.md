@@ -62,7 +62,7 @@ macOS arm64 is the only prebuilt target. Everywhere else, build from the registr
 ### Anywhere else: from crates.io
 
 ```sh
-v=0.5.0   # the version you want; `cargo search gonzalo-cli` shows the newest
+v=0.6.0   # the version you want; `cargo search gonzalo-cli` shows the newest
 cargo install "gonzalo-cli@$v" "gonzalo-mcp@$v" "gonzalo-parse@$v"
 ```
 
@@ -83,6 +83,32 @@ path to the binary.
 ```sh
 gonzalo index --root /Users/you/.gonzalo --repo acme/widgets --view main /path/to/checkout
 ```
+
+Files are parsed by extension. Supported languages:
+
+| language | extensions |
+|---|---|
+| Rust | `.rs` |
+| Python | `.py` |
+| JavaScript | `.js` `.jsx` `.mjs` `.cjs` |
+| TypeScript | `.ts` `.mts` `.cts` `.tsx` |
+| Go | `.go` |
+| Java | `.java` |
+| Kotlin | `.kt` `.kts` |
+| C# | `.cs` |
+| C | `.c` |
+| C++ | `.h` `.cpp` `.cc` `.cxx` `.hpp` `.hh` |
+| Ruby | `.rb` |
+| PHP | `.php` |
+| Bash | `.sh` `.bash` |
+| Swift | `.swift` |
+| Lua | `.lua` |
+| Scala | `.scala` `.sc` |
+| Elixir | `.ex` `.exs` |
+
+How much each language records varies: imports, qualifiers and receiver types are
+recorded for some languages and not others. [Capability boundaries](#capability-boundaries)
+says which.
 
 Output tells you what happened:
 
@@ -220,6 +246,24 @@ better question than what a textual diff shows.
 
 Every whole-view result is bounded and reports `total` and `truncated`, so a capped
 list never masquerades as a complete one.
+
+### Parameters
+
+Every tool except `status` and `views` selects a view with `repo` and `view_id`
+(`diff` takes `view_a` and `view_b` instead), and all of those are required.
+
+| tool | other parameters |
+|---|---|
+| `search`, `node`, `callers`, `callees`, `explore` | `name` (required) |
+| `impact` | `name` (required); `max_depth`, where 0 or omitted means unbounded |
+| `diff` | `view_a`, `view_b` (both required) |
+| `overview` | `largest`: how many of the largest files to list (default 20) |
+| `top` | `by` (required): `fan_in`, `fan_out` or `definitions`; `limit` (default 20) |
+| `list` | `path_prefix`, `kind`, `name_contains`, `limit` (default 100) |
+| `unreferenced` | `path_prefix`, `kind`, `name_contains`, `exclude_tests`, `limit` (default 100) |
+
+`kind` is one of `function`, `struct`, `enum`, `trait`, `impl`, `module`, `const`,
+`static`, `type_alias`, `class` or `interface`.
 
 ## Capability boundaries
 
