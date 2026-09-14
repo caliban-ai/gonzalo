@@ -260,6 +260,7 @@ where
     purge_conflicts_after_recreation(&factory().await).await;
     ancestors_capped_and_ordered(&factory().await, cap).await;
     put_raw_truncates_ancestors_and_excludes_own_revision(&factory().await, cap).await;
+    reset_tombstones_a_collection_and_leaves_siblings(&factory().await).await;
 }
 
 fn tomb_key(id: &str) -> RecordKey {
@@ -650,6 +651,59 @@ async fn put_raw_truncates_ancestors_and_excludes_own_revision<S: Store>(store: 
             "ancestors not newest-first: {a:?} before {b:?}"
         );
     }
+}
+
+/// `crate::reset` (spec §3.7, §6.4) tombstones every live key in one
+/// collection of a namespace and leaves a sibling collection in the same
+/// namespace untouched. A dedicated namespace keeps this case's keys from
+/// colliding with any other case's, the way `tomb_key`'s ids do within `ns`.
+async fn reset_tombstones_a_collection_and_leaves_siblings<S: Store>(store: &S) {
+    fn key(collection: &str, id: &str) -> RecordKey {
+        RecordKey::new("ns-reset", collection, id)
+    }
+
+    let a1 = key("col-a", "1");
+    let a2 = key("col-a", "2");
+    let b1 = key("col-b", "1");
+    committed(store, sample(a1.clone(), b"a1"), None).await;
+    committed(store, sample(a2.clone(), b"a2"), None).await;
+    let b_rev = committed(store, sample(b1.clone(), b"b1"), None).await;
+
+    let prefix = KeyPrefix {
+        namespace: Some("ns-reset".into()),
+        collection: Some("col-a".into()),
+    };
+
+    let report = crate::reset(store, &prefix).await.unwrap();
+
+    // `reset` reports keys in `list` order, and `Store::list` promises no
+    // order (a filesystem walk differs by platform), so compare as sorted.
+    let mut deleted = report.deleted.clone();
+    deleted.sort();
+    assert_eq!(deleted, vec![a1.clone(), a2.clone()]);
+    assert!(report.conflicts.is_empty());
+
+    for k in [&a1, &a2] {
+        assert_eq!(store.get(k).await.unwrap(), None, "{k} hidden from get");
+        let raw = store
+            .get_raw(k)
+            .await
+            .unwrap()
+            .expect("tombstone kept by get_raw");
+        assert!(raw.is_tombstone());
+    }
+    assert!(store.list(&prefix).await.unwrap().is_empty());
+
+    let sibling = store
+        .get(&b1)
+        .await
+        .unwrap()
+        .expect("sibling collection untouched");
+    assert_eq!(sibling.revision, b_rev);
+
+    // Idempotent: nothing left in `col-a` to tombstone on a second run.
+    let second = crate::reset(store, &prefix).await.unwrap();
+    assert_eq!(second, crate::ResetReport::default());
 }
 
 /// Run the full blob-store suite against a store produced by `factory`

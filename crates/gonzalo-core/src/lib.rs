@@ -44,8 +44,17 @@ pub use ancestry::AncestryStore;
 pub mod sync;
 pub use sync::{SyncConflict, SyncReport, sync, sync_with_ancestry};
 
+pub mod reset;
+pub use reset::{ResetReport, reset, reset_as};
+
+pub mod collect;
+pub use collect::{CollectReport, collect};
+
 #[cfg(any(test, feature = "conformance"))]
 pub mod memstore;
+
+#[cfg(test)]
+mod test_support;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;

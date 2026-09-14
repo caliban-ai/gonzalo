@@ -3,12 +3,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
-    IndexFilter, WatchConfig, gc, get, index_with_gc_filtered, list, migrate, resolve_parse_worker,
-    status, sync_stores, ticket_move, ticket_sync, watch,
+    DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, WatchConfig, collect, delete, gc, get,
+    index_with_gc_filtered, list, migrate, parse_horizon, parse_revision, reset, reset_exit_code,
+    resolve_parse_worker, status, sync_stores_with_cap, ticket_move, ticket_sync, watch,
 };
-use gonzalo_core::RecordKind;
+use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
 use gonzalo_store_fs::expand_tilde;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 /// Admin/ops CLI for the gonzalo persistence layer.
@@ -134,6 +136,79 @@ enum Commands {
         /// Root directory of store B.
         #[arg(value_parser = store_root)]
         b: PathBuf,
+        /// Most recent revisions a record remembers in `ancestors` (at least 1).
+        #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
+        ancestor_cap: usize,
+    },
+    /// Delete one record by writing a tombstone, which replicates on sync.
+    /// Deleting an absent or already-deleted record succeeds. Exits 3 when
+    /// `--expected` doesn't match the current revision.
+    #[command(after_help = "Exit codes: 0 deleted, 1 error, 2 usage error, 3 conflict")]
+    Delete {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".", value_parser = store_root)]
+        root: PathBuf,
+        /// Namespace of the record.
+        #[arg(long)]
+        namespace: String,
+        /// Collection of the record.
+        #[arg(long)]
+        collection: String,
+        /// ID of the record.
+        #[arg(long)]
+        id: String,
+        /// Only delete if the current revision is this one, as JSON exactly as
+        /// `gonzalo get` prints it: '{"counter":1,"hash":"…"}'.
+        #[arg(long, value_parser = parse_revision)]
+        expected: Option<Revision>,
+        /// Most recent revisions a record remembers in `ancestors` (at least 1).
+        #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
+        ancestor_cap: usize,
+    },
+    /// Tombstone every live record in a namespace, or in one collection of it.
+    /// Not atomic but idempotent: re-run to finish after conflicts. Exits 3 if
+    /// any record was edited concurrently and left live.
+    #[command(
+        after_help = "Exit codes: 0 no conflicts, 1 error, 2 usage error, 3 one or more conflicts"
+    )]
+    Reset {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".", value_parser = store_root)]
+        root: PathBuf,
+        /// Namespace to reset (required).
+        #[arg(long)]
+        namespace: String,
+        /// Limit the reset to this collection.
+        #[arg(long)]
+        collection: Option<String>,
+        /// Most recent revisions a record remembers in `ancestors` (at least 1).
+        #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
+        ancestor_cap: usize,
+    },
+    /// Physically purge tombstones older than a horizon. A peer that hasn't
+    /// synced since a purged delete will bring that record back, so choose a
+    /// horizon longer than any peer's longest gap between syncs. (Unrelated
+    /// to `gc`, which sweeps code-graph slices.)
+    #[command(
+        after_help = "Exit codes: 0 success (conflicts are reported, not failures), 1 error, 2 usage error"
+    )]
+    Collect {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".", value_parser = store_root)]
+        root: PathBuf,
+        /// Minimum tombstone age to purge: a number and one unit of d, h, m or
+        /// s, e.g. 30d. Required; there is no default.
+        #[arg(long, value_parser = parse_horizon)]
+        older_than: Horizon,
+        /// Limit collection to this namespace (default: the whole store).
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Limit collection to this collection of `--namespace`.
+        #[arg(long, requires = "namespace")]
+        collection: Option<String>,
+        /// Most recent revisions a record remembers in `ancestors` (at least 1).
+        #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
+        ancestor_cap: usize,
     },
     /// Read external ticket boards into the store, and inspect imported tickets.
     Ticket {
@@ -210,7 +285,7 @@ impl From<KindArg> for RecordKind {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -303,7 +378,7 @@ async fn main() -> Result<()> {
                 // Thread `--gc` into the watch loop so each reconcile sweeps when
                 // requested, rather than silently dropping the flag (#157).
                 watch(&root, &src, &repo, &view, config, gc).await?;
-                return Ok(());
+                return Ok(ExitCode::SUCCESS);
             }
             let (summary, swept) =
                 index_with_gc_filtered(&root, &src, &repo, &view, gc, &filter).await?;
@@ -358,13 +433,88 @@ async fn main() -> Result<()> {
             println!("retained:  {}", summary.retained);
         }
 
-        Commands::Sync { a, b } => {
-            let summary = sync_stores(&a, &b).await?;
+        Commands::Sync { a, b, ancestor_cap } => {
+            let summary = sync_stores_with_cap(&a, &b, ancestor_cap).await?;
             println!("copied_to_a: {}", summary.copied_to_a);
             println!("copied_to_b: {}", summary.copied_to_b);
             println!("fast_forwarded: {}", summary.fast_forwarded);
             println!("merged:      {}", summary.merged);
             println!("conflicts:   {}", summary.conflicts);
+        }
+
+        Commands::Delete {
+            root,
+            namespace,
+            collection,
+            id,
+            expected,
+            ancestor_cap,
+        } => {
+            let key = RecordKey::new(&namespace, &collection, &id);
+            match delete(&root, ancestor_cap, &namespace, &collection, &id, expected).await? {
+                DeleteOutcome::Deleted => println!("deleted: {key}"),
+                DeleteOutcome::Conflict { current } => {
+                    println!("conflict: {key}");
+                    println!("current:  {}", serde_json::to_string(&current)?);
+                    return Ok(ExitCode::from(EXIT_CONFLICT));
+                }
+            }
+        }
+
+        Commands::Reset {
+            root,
+            namespace,
+            collection,
+            ancestor_cap,
+        } => {
+            let report = reset(&root, ancestor_cap, namespace, collection).await?;
+            for key in &report.conflicts {
+                eprintln!("conflict: {key}");
+            }
+            println!(
+                "{} deleted, {} conflicts",
+                report.deleted.len(),
+                report.conflicts.len()
+            );
+            if !report.conflicts.is_empty() {
+                eprintln!(
+                    "re-run `gonzalo reset` to delete the {} conflicted record(s)",
+                    report.conflicts.len()
+                );
+            }
+            let code = reset_exit_code(&report);
+            if code != 0 {
+                return Ok(ExitCode::from(code));
+            }
+        }
+
+        Commands::Collect {
+            root,
+            older_than,
+            namespace,
+            collection,
+            ancestor_cap,
+        } => {
+            let report = collect(
+                &root,
+                ancestor_cap,
+                namespace,
+                collection,
+                older_than.duration,
+                gonzalo_core::now_ms(),
+            )
+            .await?;
+            println!(
+                "horizon:   {} ({}s)",
+                older_than.raw,
+                older_than.duration.as_secs()
+            );
+            println!("purged:    {}", report.purged.len());
+            println!("unstamped: {}", report.unstamped);
+            println!("conflicts: {}", report.conflicts.len());
+            for key in &report.conflicts {
+                eprintln!("conflict: {key}");
+            }
         }
 
         Commands::Ticket { command } => match command {
@@ -426,7 +576,7 @@ async fn main() -> Result<()> {
         },
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// ` (.ipynb, .org)` for a report, or empty when nothing has an extension to
