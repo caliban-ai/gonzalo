@@ -287,6 +287,9 @@ impl Store for ServerStore {
                         collection: key.collection.clone(),
                         id: key.id.clone(),
                         expected_json: serde_json::to_vec(&expected).map_err(se)?,
+                        // Task 4 sends the real author; this interim edit
+                        // leaves the wire field unset.
+                        author_json: Vec::new(),
                     },
                     token,
                 )?;
