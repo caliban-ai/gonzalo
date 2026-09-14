@@ -31,7 +31,7 @@ back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
   0.7 still read on 0.6. See ADR 0021. (#203)
 - **`gonzalo delete --namespace <N> --collection <C> --id <I> [--expected <REVISION_JSON>] [--root <DIR>] [--ancestor-cap <K>]`**:
   delete one record by writing a tombstone attributed to `gonzalo-cli`.
-  - `--expected` is the `revision` object from `gonzalo get`'s JSON output.
+  - `--expected` is the `revision` object from `gonzalo get`'s JSON output (e.g. `{"counter":3,"hash":"…"}`).
   - On success, including an absent or already-deleted record, prints `deleted: N/C/I` and exits `0`.
   - On a stale `--expected`, prints `conflict: N/C/I` and `current:  {…}` and exits `3`.
   - Malformed `--expected` exits `2`.
@@ -111,7 +111,7 @@ back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
 - **s3 retries lost conditional writes.** A write that loses an `If-Match` race —
   `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey`
   (the object vanished to a concurrent purge) — re-reads, re-plans and retries
-  up to 8 times before returning a backend error, so s3 reaches the same
+  for up to 8 attempts before returning a backend error, so s3 reaches the same
   outcomes as the lock-based fs and git stores. (#203)
 - **`Store::delete` writes a tombstone instead of removing the record.** `get`
   and `list` hide tombstones, so applications see no difference. Deleting an
@@ -153,19 +153,15 @@ back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
   a concurrent recreation. `docker-compose.rustfs.yml` pins it. (#203)
 - **The HA soak adds replicated-deletion invariants.** It races deletes against
   edits and recreations across `gonzalod` replicas under replica-kill chaos, and
-  checks that acknowledged deletes survive, that no two conditional writes
-  commit on the same base revision (`StaleBaseCommitted`), that every run
+  checks that acknowledged deletes survive replica kills, that no two edits
+  commit on the same base revision and no edit commits on the same base as a
+  delete that actually wrote a tombstone (`StaleBaseCommitted`), that every run
   observes at least one delete conflict seeded deterministically so the check
-  doesn't depend on scheduling, and that every replica agrees on each
-  lifecycle key's deletion state. It now also triggers on changes to
-  `gonzalo-core` and `gonzalo-store-server`, and its timeout is 30 minutes.
-  (#203)
-
-Testing: the HA soak races deletes against edits and recreations across
-`gonzalod` replicas under replica-kill chaos, and checks that every replica
-agrees on each key's deletion state, that consumer reads match raw reads, and
-that acked deletes survive replica kills. The tombstone conformance cases run on
-fs, git, s3 and the daemon client. (#203)
+  doesn't depend on scheduling, that every replica agrees on each lifecycle
+  key's deletion state, and that consumer reads match raw reads. It now also
+  triggers on changes to `gonzalo-core` and `gonzalo-store-server`, and its
+  timeout is 30 minutes. The tombstone conformance cases run on fs, git, s3 and
+  the daemon client. (#203)
 
 ### Docs
 

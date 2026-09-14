@@ -4,9 +4,10 @@
 //! contended + lifecycle (edit/delete/recreate) + unique-key workload while
 //! killing and recovering one replica, and asserts gonzalo's invariants (no lost
 //! update, conflicts surface for writes and deletes, durability of writes and
-//! deletes, replicas agree on deletion, liveness). **Skips** (does not fail) unless a S3 target is configured via
-//! `GONZALO_S3_TEST_ENDPOINT` / `GONZALO_S3_TEST_BUCKET` / `AWS_*` — mirroring the
-//! existing S3 integration test. See `scripts/rustfs-up.sh` and the `ha-soak` CI
+//! deletes, replicas agree on deletion, liveness). **Skips** (does not fail)
+//! unless a S3 target is configured via `GONZALO_S3_TEST_ENDPOINT` /
+//! `GONZALO_S3_TEST_BUCKET` / `AWS_*` — mirroring the existing S3 integration
+//! test. See `scripts/rustfs-up.sh` and the `ha-soak` CI
 //! job for provisioning; requires the `gonzalod` binary to be built.
 
 use gonzalo_soak::harness::run_rounds;

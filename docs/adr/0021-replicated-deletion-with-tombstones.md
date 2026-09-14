@@ -258,9 +258,12 @@ Rejected alternatives for the mechanism:
   deletes converge without coordination, and delete-versus-edit is surfaced rather
   than silently decided. The HA soak (`crates/gonzalo-soak/`) races deletes against
   edits and recreations across daemon replicas under replica-kill chaos. It checks
-  that acknowledged deletes survive; that no two conditional writes commit on the
-  same base revision (`StaleBaseCommitted`), which catches both a resurrection over
-  a tombstone and a delete that wipes out a committed edit; that every run
+  that acknowledged deletes survive; that no two edits commit on the same base
+  revision, and no edit commits on the same base as a delete that actually wrote
+  a tombstone (`StaleBaseCommitted`), which catches both a resurrection over a
+  tombstone and a delete that wipes out a committed edit (a delete acknowledged
+  as a no-op over a later tombstone, or whose write can't be confirmed, is
+  skipped rather than flagged); that every run
   observes at least one delete conflict, seeded deterministically so the check
   doesn't depend on scheduling; and that the replicas agree on each lifecycle
   key's deletion state. Every soak replica fronts one shared bucket and no sync

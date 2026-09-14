@@ -5,12 +5,16 @@
 //! under concurrent multi-replica load and replica-kill chaos:
 //!
 //! - **No lost update** — every *committed* op-id on a contended key survives in
-//!   that key's final record, exactly once, and the revision chain grew by one
-//!   per committed put.
+//!   that key's final record, exactly once.
 //! - **Conflicts surface** — racing writers observed `Conflict` (never a silent
 //!   overwrite). Zero observed conflicts means the invariant was never actually
 //!   exercised, which is itself a failure. The same holds for deletes racing
 //!   edits: zero delete conflicts is a failure.
+//! - **One commit per base** — on a lifecycle key, two edits never both commit
+//!   on the same base revision, and an edit never commits on the same base as a
+//!   delete that actually wrote a tombstone there. A delete acknowledged without
+//!   evidence that it wrote (a no-op over a later tombstone, or a raced evidence
+//!   read) is ambiguous and skipped, never flagged.
 //! - **Durability under churn** — every acked unique-key write is still readable,
 //!   and every acked delete still reads as a tombstone (no resurrection).
 //! - **Replicas agree on deletion** (#203) — once the writers have stopped and every
@@ -103,7 +107,9 @@ pub enum LifecycleOp {
 pub enum LifecycleResult {
     /// The conditional put or delete committed.
     Committed,
-    /// A concurrent writer moved the key between the read and the write.
+    /// A concurrent writer moved the key between the read and the write. A
+    /// failover retry after a lost acknowledgement is also recorded here, which
+    /// errs safe.
     Conflict,
     /// The op did not apply to the key's state (e.g. delete of an absent key).
     Skipped,
@@ -123,6 +129,13 @@ pub struct LifecycleRecord {
     /// never read a live record (its `get` returned absent, so it wrote
     /// unconditionally or was skipped).
     pub base: Option<String>,
+    /// For an acknowledged conditional `Delete`, whether it actually wrote the
+    /// tombstone on its base: `Some(true)` when a raw read straight after the
+    /// delete found a tombstone whose parent is `base`, `Some(false)` when it
+    /// found a tombstone with a different parent (a no-op over an existing
+    /// tombstone), and `None` when that read failed or found the key live or
+    /// absent (a later op raced it). `None` for every other op and result.
+    pub delete_wrote: Option<bool>,
 }
 
 /// What one replica's raw read (`get_raw`) returned for a key after settling.
@@ -211,9 +224,14 @@ pub enum Violation {
     LifecycleNotChecked,
     /// An acked delete of a unique key reads as live again, or not as a tombstone.
     AckedDeleteLost { key: String },
-    /// Two conditional writes committed on the same base revision of one key: an
-    /// edit plus an edit, or an edit plus a delete. Under OCC at most one can win,
-    /// so this is a resurrection over a tombstone or a lost update (spec §3.2, §5.4).
+    /// Two conditional writes committed on the same base revision of one key:
+    /// (a) two edits, or (b) an edit plus a delete that actually wrote a
+    /// tombstone on that base (`delete_wrote == Some(true)`). Under OCC at most
+    /// one can win, so this is a lost update or a resurrection over a tombstone
+    /// (spec §3.2, §5.4). An edit sharing a base only with deletes whose write
+    /// evidence is `Some(false)` or `None` is ambiguous (a stale delete can land
+    /// as a no-op over a later tombstone and still report `Deleted`) and is
+    /// skipped, never flagged.
     StaleBaseCommitted { key: String, base: String },
 }
 
@@ -329,15 +347,23 @@ fn check_lifecycle(stats: &SoakStats, out: &mut Vec<Violation>) {
         out.push(Violation::NoDeletesCommitted);
     }
 
-    // Under OCC at most one conditional non-delete write may commit on a given
-    // base revision. Group committed ops by (key, base) — skipping ops that
-    // never read a live record — and flag any group of 2+ that includes an
-    // Edit: an edit racing a delete on the same base is either a resurrection
-    // (the edit wrongly won over a tombstone) or a lost update (the delete
-    // wrongly won over the edit). A BTreeMap keeps the emitted order
-    // deterministic. Two Deletes sharing a base are legal: the second is a
-    // no-op that still reports `Deleted`.
-    let mut committed_by_base: BTreeMap<(&str, &str), Vec<LifecycleOp>> = BTreeMap::new();
+    // Under OCC at most one conditional write may commit on a given base
+    // revision. Group committed ops by (key, base), skipping ops that never
+    // read a live record, and flag a group that holds (a) two or more Edits —
+    // `put` reports Committed only when it wrote — or (b) an Edit plus a Delete
+    // with evidence that it wrote its tombstone on that base. Either is a lost
+    // update or a resurrection over a tombstone. Deletes alone are legal: a
+    // second delete on the same base is a no-op that still reports `Deleted`.
+    // An Edit alongside only Deletes without write evidence is ambiguous: a
+    // stale delete that reaches a later tombstone returns `Deleted` without
+    // writing (spec §3.2), so it is skipped rather than flagged. A BTreeMap
+    // keeps the emitted order deterministic.
+    #[derive(Default)]
+    struct BaseGroup {
+        edits: usize,
+        deletes_that_wrote: usize,
+    }
+    let mut committed_by_base: BTreeMap<(&str, &str), BaseGroup> = BTreeMap::new();
     for o in &stats.lifecycle_ops {
         if o.result != LifecycleResult::Committed {
             continue;
@@ -345,13 +371,15 @@ fn check_lifecycle(stats: &SoakStats, out: &mut Vec<Violation>) {
         let Some(base) = o.base.as_deref() else {
             continue;
         };
-        committed_by_base
-            .entry((o.key.as_str(), base))
-            .or_default()
-            .push(o.op);
+        let group = committed_by_base.entry((o.key.as_str(), base)).or_default();
+        match o.op {
+            LifecycleOp::Edit => group.edits += 1,
+            LifecycleOp::Delete if o.delete_wrote == Some(true) => group.deletes_that_wrote += 1,
+            LifecycleOp::Delete | LifecycleOp::Recreate => {}
+        }
     }
-    for ((key, base), ops) in &committed_by_base {
-        if ops.len() >= 2 && ops.contains(&LifecycleOp::Edit) {
+    for ((key, base), group) in &committed_by_base {
+        if group.edits >= 2 || (group.edits >= 1 && group.deletes_that_wrote >= 1) {
             out.push(Violation::StaleBaseCommitted {
                 key: (*key).to_string(),
                 base: (*base).to_string(),
@@ -453,7 +481,14 @@ mod tests {
             op,
             result,
             base: base.map(String::from),
+            delete_wrote: None,
         }
+    }
+
+    /// `rec` with its delete write evidence set.
+    fn wrote(mut rec: LifecycleRecord, delete_wrote: Option<bool>) -> LifecycleRecord {
+        rec.delete_wrote = delete_wrote;
+        rec
     }
 
     /// A clean run: two contended keys whose final sets hold exactly their
@@ -522,12 +557,15 @@ mod tests {
                     LifecycleResult::Committed,
                     None,
                 ),
-                lop(
-                    "life-0",
-                    1,
-                    LifecycleOp::Delete,
-                    LifecycleResult::Committed,
-                    Some("0:aaa"),
+                wrote(
+                    lop(
+                        "life-0",
+                        1,
+                        LifecycleOp::Delete,
+                        LifecycleResult::Committed,
+                        Some("0:aaa"),
+                    ),
+                    Some(true),
                 ),
                 lop(
                     "life-0",
@@ -698,7 +736,7 @@ mod tests {
         );
     }
 
-    /// m6: the #203-shaped read-path bug — a deleted key is a tombstone on some
+    /// The #203-shaped read-path bug — a deleted key is a tombstone on some
     /// replicas but physically absent on another. Must be pinned as exactly
     /// `ReplicasDisagree` plus `LifecycleKeyVanished`, not `MixedLiveAndTombstone`
     /// (absent is not live).
@@ -841,13 +879,14 @@ mod tests {
         assert!(check(&s).contains(&Violation::NoDeletesCommitted));
     }
 
-    /// I1 / F3.1: a committed Delete and a committed Edit share one base — the
-    /// edit was wrongly accepted over the tombstone (a resurrection), or the
-    /// delete wrongly overwrote the edit (a lost update). `clean_stats`'s
-    /// life-0 already has a committed Delete on base "0:aaa"; adding one
-    /// committed Edit on the same base is the whole mutation.
+    /// A committed Edit and a committed Delete that wrote its tombstone share
+    /// one base: the edit was wrongly accepted over the tombstone (a
+    /// resurrection), or the delete wrongly overwrote the edit (a lost update).
+    /// `clean_stats`'s life-0 already has a committed Delete on base "0:aaa"
+    /// with `delete_wrote: Some(true)`; adding one committed Edit on the same
+    /// base is the whole mutation.
     #[test]
-    fn detects_edit_committed_over_deleted_base() {
+    fn delete_that_wrote_on_an_edited_base_is_flagged() {
         let mut s = clean_stats();
         s.lifecycle_ops.push(lop(
             "life-0",
@@ -865,10 +904,71 @@ mod tests {
         );
     }
 
-    /// F3.2: two committed Edits share one base — also a lost update, with no
-    /// delete involved at all.
+    /// The legal interleaving on one key at live revision r: W1 reads r to
+    /// delete it; W2's edit r → r1 commits; W3 deletes r1 and writes tombstone
+    /// t; W1's stale delete on r then reaches t, writes nothing and still
+    /// reports `Deleted`. W1 and W2 both commit on base r, but the write
+    /// evidence shows W1 was a no-op, so nothing is flagged.
     #[test]
-    fn detects_two_edits_committed_on_one_base() {
+    fn stale_delete_noop_over_later_tombstone_is_not_flagged() {
+        let mut s = clean_stats();
+        s.lifecycle_ops.push(lop(
+            "life-1",
+            110,
+            LifecycleOp::Edit,
+            LifecycleResult::Committed,
+            Some("1:r"),
+        ));
+        s.lifecycle_ops.push(wrote(
+            lop(
+                "life-1",
+                111,
+                LifecycleOp::Delete,
+                LifecycleResult::Committed,
+                Some("2:r1"),
+            ),
+            Some(true),
+        ));
+        s.lifecycle_ops.push(wrote(
+            lop(
+                "life-1",
+                112,
+                LifecycleOp::Delete,
+                LifecycleResult::Committed,
+                Some("1:r"),
+            ),
+            Some(false),
+        ));
+        assert_eq!(check(&s), vec![]);
+    }
+
+    /// An Edit and a Delete committed on one base, where the delete's write
+    /// evidence couldn't be taken (the raw read failed or found the key live
+    /// or absent): ambiguous, so skipped rather than flagged.
+    #[test]
+    fn delete_with_unknown_write_evidence_is_not_flagged() {
+        let mut s = clean_stats();
+        s.lifecycle_ops.push(lop(
+            "life-1",
+            120,
+            LifecycleOp::Edit,
+            LifecycleResult::Committed,
+            Some("1:r"),
+        ));
+        s.lifecycle_ops.push(lop(
+            "life-1",
+            121,
+            LifecycleOp::Delete,
+            LifecycleResult::Committed,
+            Some("1:r"),
+        ));
+        assert_eq!(check(&s), vec![]);
+    }
+
+    /// Two committed Edits share one base: a lost update, with no delete
+    /// involved at all.
+    #[test]
+    fn two_edits_on_one_base_are_flagged() {
         let mut s = clean_stats();
         s.lifecycle_ops.push(lop(
             "life-1",
@@ -893,23 +993,28 @@ mod tests {
         );
     }
 
-    /// F3.3: two committed Deletes sharing a base are legitimate — the second
-    /// is a no-op delete over the tombstone the first just wrote, and still
-    /// reports `Deleted`. Must not be flagged.
+    /// Two committed Deletes sharing a base are legitimate — the second is a
+    /// no-op delete over the tombstone the first just wrote, and still reports
+    /// `Deleted`. Its evidence read finds the first delete's tombstone, whose
+    /// parent is the shared base, so both can carry `Some(true)`. Must not be
+    /// flagged.
     #[test]
     fn concurrent_noop_deletes_share_a_base_without_violation() {
         let mut s = clean_stats();
-        s.lifecycle_ops.push(lop(
-            "life-0",
-            103,
-            LifecycleOp::Delete,
-            LifecycleResult::Committed,
-            Some("0:aaa"), // same base as the existing committed Delete op-id 1
+        s.lifecycle_ops.push(wrote(
+            lop(
+                "life-0",
+                103,
+                LifecycleOp::Delete,
+                LifecycleResult::Committed,
+                Some("0:aaa"), // same base as the existing committed Delete op-id 1
+            ),
+            Some(true),
         ));
         assert_eq!(check(&s), vec![]);
     }
 
-    /// F3.4: a committed Delete and an Edit that lost the race (`Conflict`) on
+    /// A committed Delete and an Edit that lost the race (`Conflict`) on
     /// the same base is the expected, correct outcome of OCC — only one
     /// conditional write may commit. Must not be flagged.
     #[test]

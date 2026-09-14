@@ -2,12 +2,12 @@
 //!
 //! Holds one [`Store`] handle per `gonzalod` replica, round-robins each op
 //! (`get`, `get_raw`, `put`, `delete`) to a replica, and fails over on a
-//! `Backend` error (transport, dead replica); `Conflict` and `NotFound` are
-//! answers, never failover triggers. A [`PutResult::Conflict`] is a valid
-//! answer from a live replica and is returned unchanged — it is never a
-//! failover trigger (the caller re-reads and retries the RMW). This is
-//! exactly the failover path a k8s agent pod relies on when a `gonzalod` pod
-//! dies behind the Service.
+//! `Backend` error (transport, dead replica). `Conflict` (including a
+//! [`PutResult::Conflict`], which the caller answers by re-reading and
+//! retrying the RMW), `NotFound` and `Serde` are answers from a live replica,
+//! returned unchanged and never failover triggers. This is exactly the
+//! failover path a k8s agent pod relies on when a `gonzalod` pod dies behind
+//! the Service.
 
 use gonzalo_core::{
     CoreError, DeleteResult, PutResult, Record, RecordKey, Result, Revision, Store,

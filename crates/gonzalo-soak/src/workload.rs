@@ -127,10 +127,10 @@ pub async fn run(dispatcher: Arc<Dispatcher>, cfg: WorkloadConfig) -> SoakStats 
     let life_ids = Arc::new(AtomicU64::new(0));
 
     // Seed one deterministic delete conflict before the chaotic writers start,
-    // so `NoDeleteConflictsObserved` never depends on scheduling (Task 3 review
-    // I1). Ids come from the same counter the random stream uses below, so they
-    // stay unique; running before any writer spawns means nothing else can race
-    // the seed itself.
+    // so `NoDeleteConflictsObserved` never depends on scheduling. Ids come from
+    // the same counter the random stream uses below, so they stay unique;
+    // running before any writer spawns means nothing else can race the seed
+    // itself.
     let mut lifecycle_ops = if cfg.seed_delete_conflict && cfg.lifecycle_keys > 0 {
         seed_delete_conflict(&dispatcher, &cfg, &life_ids).await
     } else {
@@ -182,9 +182,15 @@ pub async fn run(dispatcher: Arc<Dispatcher>, cfg: WorkloadConfig) -> SoakStats 
 /// Retry a final read up to three attempts, 200 ms apart, on errors only, so a
 /// connection pooled to a restarted replica can't fail the soak. A read that
 /// keeps failing still returns its last error (a `FinalReadFailed` violation).
-async fn read_settled<T>(
-    mut read: impl AsyncFnMut() -> gonzalo_core::Result<T>,
-) -> gonzalo_core::Result<T> {
+///
+/// Takes a plain closure returning a future rather than an `AsyncFnMut`: the
+/// latter's lending signature makes callers inside `tokio::spawn` fail the
+/// `Send` check.
+async fn read_settled<T, F, Fut>(mut read: F) -> gonzalo_core::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = gonzalo_core::Result<T>>,
+{
     let mut last = read().await;
     for _ in 0..2 {
         if last.is_ok() {
@@ -211,8 +217,8 @@ pub async fn collect_lifecycle(
         let key = RecordKey::new(&cfg.namespace, &cfg.collection, &key_id);
         let mut views = Vec::with_capacity(replicas.len());
         for store in replicas {
-            let raw = raw_state(read_settled(async || store.get_raw(&key).await).await);
-            let consumer_live = read_settled(async || store.get(&key).await)
+            let raw = raw_state(read_settled(|| store.get_raw(&key)).await);
+            let consumer_live = read_settled(|| store.get(&key))
                 .await
                 .ok()
                 .map(|r| r.is_some());
@@ -261,14 +267,7 @@ async fn writer(
             let life_id = life_ids.fetch_add(1, Ordering::Relaxed);
             let key_id = lifecycle_key_for(life_id, cfg.lifecycle_keys);
             let op = lifecycle_op_for(life_id);
-            let (result, base) = lifecycle_step(&d, &cfg, &key_id, life_id, op).await;
-            lifecycle.push(LifecycleRecord {
-                key: key_id,
-                op_id: life_id,
-                op,
-                result,
-                base,
-            });
+            lifecycle.push(lifecycle_step(&d, &cfg, &key_id, life_id, op).await);
         }
     }
 
@@ -343,10 +342,19 @@ async fn lifecycle_step(
     key_id: &str,
     life_id: u64,
     op: LifecycleOp,
-) -> (LifecycleResult, Option<String>) {
+) -> LifecycleRecord {
     let current = match lifecycle_read(d, cfg, key_id).await {
         Ok(c) => c,
-        Err(_) => return (LifecycleResult::Failed, None),
+        Err(_) => {
+            return LifecycleRecord {
+                key: key_id.to_string(),
+                op_id: life_id,
+                op,
+                result: LifecycleResult::Failed,
+                base: None,
+                delete_wrote: None,
+            };
+        }
     };
     lifecycle_write(d, cfg, key_id, life_id, op, current).await
 }
@@ -363,10 +371,11 @@ async fn lifecycle_read(
 }
 
 /// The write phase of one lifecycle op: a single conditional write against
-/// `current`, whatever the read phase saw. Returns the outcome plus the
-/// rendered base revision the op conditioned its write on (`None` for
-/// `Recreate`, and for any op that read the key as absent) — see
-/// [`oracle::LifecycleRecord::base`].
+/// `current`, whatever the read phase saw. Returns the recorded op: its
+/// outcome, the rendered base revision it conditioned its write on (`None` for
+/// `Recreate`, and for any op that read the key as absent), and, for an
+/// acknowledged delete, the write evidence — see
+/// [`LifecycleRecord::base`] and [`LifecycleRecord::delete_wrote`].
 async fn lifecycle_write(
     d: &Dispatcher,
     cfg: &WorkloadConfig,
@@ -374,7 +383,7 @@ async fn lifecycle_write(
     life_id: u64,
     op: LifecycleOp,
     current: Option<Record>,
-) -> (LifecycleResult, Option<String>) {
+) -> LifecycleRecord {
     let key = RecordKey::new(&cfg.namespace, &cfg.collection, key_id);
     // The base this op read and conditioned its write on. Recreate never
     // conditions on a live revision even in its Skipped arm below (the key
@@ -384,13 +393,17 @@ async fn lifecycle_write(
     } else {
         current.as_ref().map(|rec| rev_string(&rec.revision))
     };
-    // Let other writers run between the read and the write, so deletes really do
-    // race edits and recreations instead of completing uncontended.
+    // A scheduling point between read and write; contention comes from
+    // overlapping store I/O.
     tokio::task::yield_now().await;
     let body = format!("op-{life_id}");
+    let mut delete_wrote = None;
     let result = match (op, current) {
         (LifecycleOp::Delete, Some(rec)) => match d.delete(&key, Some(rec.revision)).await {
-            Ok(DeleteResult::Deleted) => LifecycleResult::Committed,
+            Ok(DeleteResult::Deleted) => {
+                delete_wrote = delete_write_evidence(d, &key, base.as_deref()).await;
+                LifecycleResult::Committed
+            }
             Ok(DeleteResult::Conflict(_)) => LifecycleResult::Conflict,
             Err(_) => LifecycleResult::Failed,
         },
@@ -408,10 +421,36 @@ async fn lifecycle_write(
         | (LifecycleOp::Edit, None)
         | (LifecycleOp::Recreate, Some(_)) => LifecycleResult::Skipped,
     };
-    (result, base)
+    LifecycleRecord {
+        key: key_id.to_string(),
+        op_id: life_id,
+        op,
+        result,
+        base,
+        delete_wrote,
+    }
 }
 
-/// Guarantee one store-arbitrated delete conflict per run (Task 3 review I1):
+/// Evidence that an acknowledged conditional delete on `base` actually wrote
+/// its tombstone: one raw read through the dispatcher, straight after the
+/// delete, with no retries. `Some(true)` when the key is a tombstone whose
+/// parent renders as `base`, `Some(false)` when it is a tombstone with another
+/// parent (the delete was a no-op over an existing tombstone), and `None` when
+/// the read fails or finds the key live or absent (a later op raced it).
+async fn delete_write_evidence(
+    d: &Dispatcher,
+    key: &RecordKey,
+    base: Option<&str>,
+) -> Option<bool> {
+    match d.get_raw(key).await {
+        Ok(Some(rec)) if rec.is_tombstone() => {
+            Some(rec.parent.as_ref().map(rev_string).as_deref() == base)
+        }
+        _ => None,
+    }
+}
+
+/// Guarantee one store-arbitrated delete conflict per run:
 /// read → committed edit → stale conditional delete, on `life-0` — a key the
 /// random lifecycle stream also targets, so the final per-replica collection
 /// and the oracle see it like any other lifecycle op. Runs sequentially before
@@ -438,15 +477,9 @@ async fn seed_delete_conflict(
 
     if current.is_none() {
         let life_id = life_ids.fetch_add(1, Ordering::Relaxed);
-        let (result, base) =
-            lifecycle_write(d, cfg, &key_id, life_id, LifecycleOp::Recreate, None).await;
-        out.push(LifecycleRecord {
-            key: key_id.clone(),
-            op_id: life_id,
-            op: LifecycleOp::Recreate,
-            result,
-            base,
-        });
+        let recreate = lifecycle_write(d, cfg, &key_id, life_id, LifecycleOp::Recreate, None).await;
+        let result = recreate.result;
+        out.push(recreate);
         if result != LifecycleResult::Committed {
             return out; // couldn't establish a live key to seed the conflict on
         }
@@ -461,36 +494,24 @@ async fn seed_delete_conflict(
     };
 
     let edit_id = life_ids.fetch_add(1, Ordering::Relaxed);
-    let (edit_result, edit_base) = lifecycle_write(
-        d,
-        cfg,
-        &key_id,
-        edit_id,
-        LifecycleOp::Edit,
-        Some(rec.clone()),
-    )
-    .await;
-    out.push(LifecycleRecord {
-        key: key_id.clone(),
-        op_id: edit_id,
-        op: LifecycleOp::Edit,
-        result: edit_result,
-        base: edit_base,
-    });
+    out.push(
+        lifecycle_write(
+            d,
+            cfg,
+            &key_id,
+            edit_id,
+            LifecycleOp::Edit,
+            Some(rec.clone()),
+        )
+        .await,
+    );
 
     // The stale conditional delete: still conditioned on `rec`'s (pre-edit)
     // revision, so on a correct store this loses to the edit that just
-    // committed above. Its real result is recorded as-is (see doc comment).
+    // committed above. Its real result, and write evidence if it was
+    // acknowledged, are recorded as-is (see doc comment).
     let delete_id = life_ids.fetch_add(1, Ordering::Relaxed);
-    let (delete_result, delete_base) =
-        lifecycle_write(d, cfg, &key_id, delete_id, LifecycleOp::Delete, Some(rec)).await;
-    out.push(LifecycleRecord {
-        key: key_id.clone(),
-        op_id: delete_id,
-        op: LifecycleOp::Delete,
-        result: delete_result,
-        base: delete_base,
-    });
+    out.push(lifecycle_write(d, cfg, &key_id, delete_id, LifecycleOp::Delete, Some(rec)).await);
 
     out
 }
@@ -554,12 +575,15 @@ async fn collect_unique(
     for (key_id, value) in acked {
         let key = RecordKey::new(&cfg.namespace, &cfg.collection, key_id);
         let readable_with_value = matches!(
-            d.get(&key).await,
+            read_settled(|| d.get(&key)).await,
             Ok(Some(rec)) if rec.body.bytes() == value.as_slice()
         );
         let was_deleted = deleted.contains(key_id);
-        let raw_tombstone =
-            was_deleted && matches!(d.get_raw(&key).await, Ok(Some(rec)) if rec.is_tombstone());
+        let raw_tombstone = was_deleted
+            && matches!(
+                read_settled(|| d.get_raw(&key)).await,
+                Ok(Some(rec)) if rec.is_tombstone()
+            );
         out.push(FinalUnique {
             key: key_id.clone(),
             acked: true,
@@ -679,7 +703,7 @@ mod tests {
     }
 
     /// `read_settled` retries only on error, up to three attempts 200 ms apart,
-    /// and returns the last outcome either way (R1).
+    /// and returns the last outcome either way.
     #[tokio::test]
     async fn read_settled_retries_errors_then_returns_the_last() {
         // Errors twice, then Ok: returns Ok after exactly 3 calls.
@@ -739,7 +763,7 @@ mod tests {
             lifecycle_keys: 2,
             // 40, not 80: `seed_delete_conflict` (default true) already
             // guarantees a delete conflict, so the random stream no longer
-            // needs to be inflated to make one likely (Task 3 review I1).
+            // needs to be inflated to make one likely.
             lifecycle_ops_per_writer: 40,
             unique_deletes_per_writer: 1,
             ..Default::default()
@@ -766,7 +790,82 @@ mod tests {
         assert!(stats.lifecycle.iter().all(|fl| fl.replicas.len() == 3));
     }
 
-    /// I1: with the random lifecycle stream disabled, `seed_delete_conflict`
+    /// Scripted against in-process `FsStore` replicas, each lifecycle write
+    /// maps the store's answer to a deterministic record: an edit over a
+    /// tombstone (`put` with `Some(expected)` returns `NotFound`) is a
+    /// `Conflict`; a delete that writes is `Committed` with
+    /// `delete_wrote: Some(true)`; a stale delete over a later tombstone is
+    /// `Committed` with `delete_wrote: Some(false)`. The resulting W1/W2/W3
+    /// records must not trip `StaleBaseCommitted`.
+    #[tokio::test]
+    async fn lifecycle_write_maps_results_and_delete_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas: Vec<Arc<dyn Store>> = (0..3)
+            .map(|_| Arc::new(FsStore::new(dir.path())) as Arc<dyn Store>)
+            .collect();
+        let d = Dispatcher::new(replicas);
+        let cfg = WorkloadConfig::default();
+        let key_id = "life-0";
+        let key = RecordKey::new(&cfg.namespace, &cfg.collection, key_id);
+
+        // Live revision r.
+        let created = lifecycle_write(&d, &cfg, key_id, 0, LifecycleOp::Recreate, None).await;
+        assert_eq!(created.result, LifecycleResult::Committed);
+        assert_eq!(created.base, None);
+        assert_eq!(created.delete_wrote, None);
+        let r = d.get(&key).await.unwrap().expect("live after create");
+        let r_str = rev_string(&r.revision);
+
+        // W2: edit r → r1 commits.
+        let w2 = lifecycle_write(&d, &cfg, key_id, 1, LifecycleOp::Edit, Some(r.clone())).await;
+        assert_eq!(w2.result, LifecycleResult::Committed);
+        assert_eq!(w2.base.as_deref(), Some(r_str.as_str()));
+        assert_eq!(w2.delete_wrote, None);
+        let r1 = d.get(&key).await.unwrap().expect("live after edit");
+        let r1_str = rev_string(&r1.revision);
+        assert_ne!(r1_str, r_str);
+
+        // W3: delete on r1 genuinely writes the tombstone.
+        let w3 = lifecycle_write(&d, &cfg, key_id, 2, LifecycleOp::Delete, Some(r1.clone())).await;
+        assert_eq!(w3.result, LifecycleResult::Committed);
+        assert_eq!(w3.base.as_deref(), Some(r1_str.as_str()));
+        assert_eq!(w3.delete_wrote, Some(true));
+
+        // W1: the stale delete on r reaches the tombstone and writes nothing.
+        let w1 = lifecycle_write(&d, &cfg, key_id, 3, LifecycleOp::Delete, Some(r.clone())).await;
+        assert_eq!(w1.result, LifecycleResult::Committed);
+        assert_eq!(w1.base.as_deref(), Some(r_str.as_str()));
+        assert_eq!(w1.delete_wrote, Some(false));
+
+        // An edit over the tombstone: `put(Some(r1))` returns `NotFound`.
+        let key_rec = build_record(&key, b"probe", Some(r1.revision.clone()));
+        assert!(matches!(
+            d.put(key_rec, Some(r1.revision.clone())).await,
+            Err(CoreError::NotFound(_))
+        ));
+        let stale_edit = lifecycle_write(&d, &cfg, key_id, 4, LifecycleOp::Edit, Some(r1)).await;
+        assert_eq!(
+            stale_edit.result,
+            lifecycle_put_result(Err(CoreError::NotFound(key.clone())))
+        );
+        assert_eq!(stale_edit.result, LifecycleResult::Conflict);
+        assert_eq!(stale_edit.base.as_deref(), Some(r1_str.as_str()));
+        assert_eq!(stale_edit.delete_wrote, None);
+
+        let stats = SoakStats {
+            lifecycle_ops: vec![created, w2, w3, w1, stale_edit],
+            ..Default::default()
+        };
+        let violations = crate::oracle::check(&stats);
+        assert!(
+            !violations
+                .iter()
+                .any(|v| matches!(v, crate::oracle::Violation::StaleBaseCommitted { .. })),
+            "a stale no-op delete over a later tombstone is legal: {violations:?}"
+        );
+    }
+
+    /// With the random lifecycle stream disabled, `seed_delete_conflict`
     /// alone must produce exactly one committed Edit and one Conflict Delete
     /// sharing a base, and the oracle must see a real store-arbitrated delete
     /// conflict (not a flake) plus no false `StaleBaseCommitted`.
