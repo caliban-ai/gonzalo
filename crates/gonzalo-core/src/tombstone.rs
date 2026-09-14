@@ -4,7 +4,8 @@
 //! every substrate reaches identical decisions by construction.
 
 use crate::{
-    Body, ContentHash, CoreError, Identity, Record, RecordKind, Result, Revision, store::Conflict,
+    Body, ContentHash, CoreError, Identity, Meta, Record, RecordKind, Result, Revision,
+    store::Conflict,
 };
 
 /// Ancestor list length used when a store is not configured otherwise.
@@ -644,5 +645,246 @@ mod tests {
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
+    }
+}
+
+/// Ancestors for a record that reconciles two diverged records `a` and `b`: a
+/// sync or pull merge result, or a tombstone winner. Both revisions and both
+/// ancestor lists are folded (spec §3.4), minus `stored`, sorted by
+/// `(counter desc, hash desc)` and truncated to `cap`.
+///
+/// Sync passes a lossless cap (`a.ancestors.len() + b.ancestors.len() + 2`)
+/// and lets each destination store's `plan_put_raw` truncate to its own cap on
+/// write. Git pull writes the index directly and passes the store's cap.
+pub fn reconciled_ancestors(
+    stored: &Revision,
+    a: &Record,
+    b: &Record,
+    cap: usize,
+) -> Vec<Revision> {
+    let mut incoming = Vec::with_capacity(a.ancestors.len() + b.ancestors.len() + 2);
+    incoming.push(a.revision.clone());
+    incoming.extend(a.ancestors.iter().cloned());
+    incoming.push(b.revision.clone());
+    incoming.extend(b.ancestors.iter().cloned());
+    fold_ancestors(stored, &incoming, None, cap)
+}
+
+/// Resolve two diverged tombstones for one key (spec §3.4, §3.5): the one with
+/// the higher `(counter, hash)` wins and carries ancestors reconciled from both.
+///
+/// Symmetric whenever `a.revision != b.revision`. Callers skip equal revisions
+/// before reaching this, because independent deletes of the same revision are
+/// already in sync. Both arguments must be tombstones.
+pub fn tombstone_winner(a: &Record, b: &Record, cap: usize) -> Record {
+    debug_assert!(
+        a.is_tombstone() && b.is_tombstone(),
+        "tombstone_winner needs two tombstones"
+    );
+    let a_wins = (a.revision.counter, &a.revision.hash) >= (b.revision.counter, &b.revision.hash);
+    let mut winner = if a_wins { a.clone() } else { b.clone() };
+    winner.ancestors = reconciled_ancestors(&winner.revision, a, b, cap);
+    winner
+}
+
+/// The record reconciling two diverged live records `a` and `b` into merged
+/// `body` (spec §3.4, §3.5): revision `max(counter) + 1` over `body`, parent =
+/// the higher-counter side, labels and links unioned, both chains folded. On a
+/// label-key collision `b` wins, and on a counter tie the parent is `a`. Sync
+/// calls this with `(a, b)`; pull calls it with `(local, remote)`.
+pub fn reconciled_record(
+    a: &Record,
+    b: &Record,
+    body: Body,
+    author: Identity,
+    origin_system: &str,
+    cap: usize,
+) -> Record {
+    let revision = Revision {
+        counter: a.revision.counter.max(b.revision.counter) + 1,
+        hash: ContentHash::of(body.bytes()),
+    };
+    let ancestors = reconciled_ancestors(&revision, a, b, cap);
+    let mut labels = a.meta.labels.clone();
+    labels.extend(b.meta.labels.clone());
+    let mut links = a.links.clone();
+    for l in &b.links {
+        if !links.contains(l) {
+            links.push(l.clone());
+        }
+    }
+    let parent = if a.revision.counter >= b.revision.counter {
+        a.revision.clone()
+    } else {
+        b.revision.clone()
+    };
+    Record {
+        key: a.key.clone(),
+        kind: a.kind,
+        revision,
+        parent: Some(parent),
+        body,
+        meta: Meta {
+            author,
+            origin_system: origin_system.into(),
+            created: a.meta.created.min(b.meta.created),
+            updated: a.meta.updated.max(b.meta.updated),
+            labels,
+        },
+        links,
+        ancestors,
+        deleted_at: None,
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use crate::RecordKey;
+    use std::collections::BTreeMap;
+
+    fn rev(counter: u64, tag: &str) -> Revision {
+        Revision {
+            counter,
+            hash: ContentHash::of(tag.as_bytes()),
+        }
+    }
+
+    fn record(kind: RecordKind, revision: Revision, ancestors: Vec<Revision>) -> Record {
+        Record {
+            key: RecordKey::new("ns", "col", "k"),
+            kind,
+            revision,
+            parent: None,
+            body: Body::Inline(Vec::new()),
+            meta: Meta {
+                author: Identity::new("t"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors,
+            deleted_at: None,
+        }
+    }
+
+    fn tomb(counter: u64, ancestors: Vec<Revision>) -> Record {
+        let mut r = record(
+            RecordKind::Tombstone,
+            Revision {
+                counter,
+                hash: tombstone_hash(),
+            },
+            ancestors,
+        );
+        r.deleted_at = Some(1_000);
+        r
+    }
+
+    #[test]
+    fn reconciled_ancestors_unions_both_revisions_and_both_chains() {
+        let base = rev(0, "base");
+        let ra = rev(1, "a");
+        let rb = rev(1, "b");
+        let a = record(RecordKind::Topic, ra.clone(), vec![base.clone()]);
+        let b = record(RecordKind::Topic, rb.clone(), vec![base.clone()]);
+        let merged = rev(2, "merged");
+
+        let got = reconciled_ancestors(&merged, &a, &b, DEFAULT_ANCESTOR_CAP);
+
+        // Same result as folding the four inputs by hand: same order rule.
+        let expected = fold_ancestors(
+            &merged,
+            &[ra.clone(), base.clone(), rb.clone(), base.clone()],
+            None,
+            DEFAULT_ANCESTOR_CAP,
+        );
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), 3, "base is deduplicated");
+        assert!(got.contains(&ra) && got.contains(&rb) && got.contains(&base));
+    }
+
+    #[test]
+    fn reconciled_ancestors_excludes_stored_and_truncates_to_cap() {
+        let a = record(
+            RecordKind::Topic,
+            rev(3, "a3"),
+            vec![rev(2, "a2"), rev(1, "a1")],
+        );
+        let b = record(RecordKind::Topic, rev(3, "b3"), vec![rev(2, "b2")]);
+
+        // Stored revision == a's revision (a sync writing a's winner back onto a).
+        let got = reconciled_ancestors(&a.revision, &a, &b, 2);
+
+        assert_eq!(got.len(), 2);
+        assert!(
+            !got.contains(&a.revision),
+            "own revision is never an ancestor"
+        );
+        assert_eq!(got[0], b.revision, "newest remaining entry comes first");
+    }
+
+    #[test]
+    fn tombstone_winner_takes_higher_counter_and_folds_both_chains() {
+        let base = rev(0, "base");
+        let r1 = rev(1, "r1");
+        let low = tomb(1, vec![base.clone()]);
+        let high = tomb(2, vec![r1.clone(), base.clone()]);
+
+        let w = tombstone_winner(&low, &high, DEFAULT_ANCESTOR_CAP);
+
+        assert!(w.is_tombstone());
+        assert_eq!(w.revision, high.revision);
+        assert_eq!(w.deleted_at, high.deleted_at);
+        assert_eq!(w.ancestors.len(), 3);
+        assert!(w.ancestors.contains(&low.revision));
+        assert!(w.ancestors.contains(&r1));
+        assert!(w.ancestors.contains(&base));
+    }
+
+    #[test]
+    fn tombstone_winner_is_symmetric() {
+        let base = rev(0, "base");
+        let low = tomb(1, vec![base.clone()]);
+        let high = tomb(2, vec![rev(1, "r1"), base]);
+        assert_eq!(
+            tombstone_winner(&low, &high, DEFAULT_ANCESTOR_CAP),
+            tombstone_winner(&high, &low, DEFAULT_ANCESTOR_CAP)
+        );
+    }
+
+    #[test]
+    fn reconciled_record_folds_both_chains_and_picks_parent() {
+        let mut a = record(RecordKind::Topic, rev(3, "a3"), vec![rev(2, "a2")]);
+        a.meta.labels.insert("color".into(), "red".into());
+        let mut b = record(RecordKind::Topic, rev(5, "b5"), vec![rev(4, "b4")]);
+        b.meta.labels.insert("size".into(), "large".into());
+
+        let merged = reconciled_record(
+            &a,
+            &b,
+            Body::Inline(b"merged-body".to_vec()),
+            Identity::new("merger"),
+            "test-origin",
+            DEFAULT_ANCESTOR_CAP,
+        );
+
+        // Revision counter is max(3, 5) + 1.
+        assert_eq!(merged.revision.counter, 6);
+        // b has the higher counter, so b's revision is the parent.
+        assert_eq!(merged.parent, Some(b.revision.clone()));
+        // Both chains are folded: a's and b's revisions and ancestors all appear.
+        assert!(merged.ancestors.contains(&a.revision));
+        assert!(merged.ancestors.contains(&rev(2, "a2")));
+        assert!(merged.ancestors.contains(&b.revision));
+        assert!(merged.ancestors.contains(&rev(4, "b4")));
+        // Labels from both sides are unioned.
+        assert_eq!(merged.meta.labels.get("color"), Some(&"red".to_string()));
+        assert_eq!(merged.meta.labels.get("size"), Some(&"large".to_string()));
+        assert_eq!(merged.meta.author, Identity::new("merger"));
+        assert_eq!(merged.meta.origin_system, "test-origin");
+        assert_eq!(merged.deleted_at, None);
     }
 }

@@ -10,10 +10,10 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    Body, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
-    KeyPrefix, MergeOutcome, Meta, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result,
-    Revision, decode_segment, merge, now_ms, plan_delete, plan_purge, plan_put, plan_put_raw,
-    record_components, validate_ancestor_cap,
+    Body, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity, KeyPrefix,
+    MergeOutcome, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision,
+    decode_segment, merge, now_ms, plan_delete, plan_purge, plan_put, plan_put_raw,
+    reconciled_record, record_components, tombstone_winner, validate_ancestor_cap,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::cell::RefCell;
@@ -243,13 +243,15 @@ impl GitStore {
 
     /// Pull `branch` from `remote` (typically "origin"). A fast-forward advances
     /// the branch; a divergence is reconciled by a content-aware 3-way merge
-    /// (gonzalo `merge()` per record, ADR 0017), with unresolved records kept
-    /// local and reported in the [`PullReport`].
+    /// (gonzalo `merge()` per record, ADR 0017), with tombstones decided by
+    /// kind and revision first (spec §3.5), and unresolved records kept local
+    /// and reported in the [`PullReport`].
     pub async fn pull(&self, remote: &str, branch: &str) -> Result<PullReport> {
         let root = self.root.clone();
         let remote = remote.to_string();
         let branch = branch.to_string();
-        run_blocking(move || git_pull(&root, &remote, &branch)).await
+        let cap = self.cap;
+        run_blocking(move || git_pull(&root, &remote, &branch, cap)).await
     }
 
     /// Push `branch` to `remote`.
@@ -272,7 +274,7 @@ fn be<E: std::fmt::Display>(e: E) -> CoreError {
 }
 
 /// Acquire the repo-level exclusive lock guarding the OCC critical section of
-/// `put`, `delete` and `purge`.
+/// `put`, `delete`, `purge` and `pull`.
 ///
 /// Unlike `FsStore`, whose per-record lock suffices, every `GitStore` write
 /// mutates the *shared* on-disk index and HEAD (via `commit_file` /
@@ -294,7 +296,11 @@ fn lock_repo(root: &Path) -> Result<std::fs::File> {
     Ok(lock)
 }
 
-fn git_pull(root: &Path, remote: &str, branch: &str) -> Result<PullReport> {
+fn git_pull(root: &Path, remote: &str, branch: &str, cap: usize) -> Result<PullReport> {
+    // Hold the repo lock that `put`, `delete` and `purge` take, so a concurrent
+    // local write can't commit mid-pull and then be overwritten by the forced
+    // checkout below (spec §3.5). Nothing below re-takes it.
+    let _lock = lock_repo(root)?;
     let repo = git2::Repository::open(root).map_err(be)?;
     let mut rem = repo.find_remote(remote).map_err(be)?;
     rem.fetch(&[branch], None, None).map_err(be)?;
@@ -322,18 +328,28 @@ fn git_pull(root: &Path, remote: &str, branch: &str) -> Result<PullReport> {
         });
     }
 
-    merge_non_ff(&repo, remote, branch, fetch_commit.id())
+    merge_non_ff(&repo, remote, branch, fetch_commit.id(), cap)
 }
 
 /// Reconcile a diverged local branch with `remote_oid` by a content-aware 3-way
-/// merge: each record changed on both sides is merged with gonzalo's
-/// class-aware `merge()`, and the result is recorded in a two-parent merge
-/// commit (ADR 0017).
+/// merge, recorded in a two-parent merge commit (ADR 0017).
+///
+/// A path changed only on the remote takes the remote side verbatim. That
+/// includes a remote tombstone (a modified file) and a remote purge (a git
+/// deletion). A record changed on both sides is decided by kind before any body
+/// merge (spec §3.5): equal revisions are a no-op; two tombstones converge on
+/// the higher `(counter, hash)`; exactly one tombstone is a `PullConflict` that
+/// keeps local; two live records take gonzalo's class-aware `merge()`; a local
+/// purge against a remote edit takes the remote record. Records written into
+/// the index bypass `put_raw`, so the tombstone winner and merged record are
+/// truncated here to `cap`; records taken verbatim from the remote keep the
+/// remote's list.
 fn merge_non_ff(
     repo: &git2::Repository,
     remote: &str,
     branch: &str,
     remote_oid: git2::Oid,
+    cap: usize,
 ) -> Result<PullReport> {
     let local_oid = repo
         .head()
@@ -372,7 +388,8 @@ fn merge_non_ff(
         };
 
         if !local_changed.contains(&path) {
-            // Changed only on the remote — apply the remote side verbatim.
+            // Changed only on the remote: apply the remote side verbatim. A
+            // remote tombstone is a modified file; a remote purge is a deletion.
             if delta.status() == git2::Delta::Deleted {
                 index.remove_path(&path).map_err(be)?;
             } else if let Some(bytes) = tree_blob(repo, &remote_tree, &path)? {
@@ -383,13 +400,33 @@ fn merge_non_ff(
             continue;
         }
 
-        // Changed on both sides — reconcile with gonzalo's class-aware merge.
+        // Changed on both sides.
         let Some(key) = key_from_path(&path) else {
             continue; // non-record file (should not occur in a record store)
         };
         let local_rec = record_at(repo, Some(&local_tree), &path)?;
         let remote_rec = record_at(repo, Some(&remote_tree), &path)?;
         match (local_rec, remote_rec) {
+            // Same revision, e.g. two independent deletes of one revision whose
+            // files differ only in `deleted_at`: already in sync, keep local.
+            (Some(local), Some(remote)) if local.revision == remote.revision => {}
+            // Two diverged tombstones: the higher (counter, hash) wins, carrying
+            // both chains. Checked by kind, because two tombstones always have
+            // equal (empty) bodies and the body guard below would skip them.
+            (Some(local), Some(remote)) if local.is_tombstone() && remote.is_tombstone() => {
+                let winner = tombstone_winner(&local, &remote, cap);
+                stage_record(&mut index, &path, &winner)?;
+                report.merged.push(key);
+            }
+            // Delete vs edit: keep local (already staged) and surface both,
+            // the same policy as an unmergeable body.
+            (Some(local), Some(remote)) if local.is_tombstone() || remote.is_tombstone() => {
+                report.conflicts.push(PullConflict {
+                    key,
+                    local: Box::new(local),
+                    remote: Box::new(remote),
+                });
+            }
             (Some(local), Some(remote)) if local.body != remote.body => {
                 let base_body = record_at(repo, base_tree.as_ref(), &path)?
                     .map(|r| r.body)
@@ -401,12 +438,8 @@ fn merge_non_ff(
                     &remote.body,
                 ) {
                     MergeOutcome::Merged(body) => {
-                        let merged = merged_record(&key, &local, &remote, body);
-                        let bytes = serde_json::to_vec_pretty(&merged)
-                            .map_err(|e| CoreError::Serde(e.to_string()))?;
-                        index
-                            .add_frombuffer(&blob_entry(&path), &bytes)
-                            .map_err(be)?;
+                        let merged = merged_record(&local, &remote, body, cap);
+                        stage_record(&mut index, &path, &merged)?;
                         report.merged.push(key);
                     }
                     MergeOutcome::NeedsResolution => {
@@ -419,8 +452,16 @@ fn merge_non_ff(
                     }
                 }
             }
-            // One-sided presence (modify/delete, or identical edits): keep the
-            // local side, which is already staged from `local_tree`.
+            // Local present, remote purged: keep local, which is already
+            // staged from `local_tree` (sync's `(Some, None)` copy row).
+            (Some(_local), None) => {}
+            // Local purged, remote edited: take the remote record, so pull
+            // never silently drops a concurrent remote edit (sync's
+            // `(None, Some)` copy row).
+            (None, Some(remote)) => {
+                stage_record(&mut index, &path, &remote)?;
+            }
+            // Equal bodies, or absent on both sides: keep local.
             _ => {}
         }
     }
@@ -428,6 +469,17 @@ fn merge_non_ff(
     // Commit the reconciled tree with both parents, then advance the branch.
     let tree_oid = index.write_tree_to(repo).map_err(be)?;
     let tree = repo.find_tree(tree_oid).map_err(be)?;
+    // Check out the merged tree while HEAD still names the local commit, so
+    // libgit2's baseline is the local tree and a path the merge removed (a
+    // remote purge) is deleted from the worktree. Checking out after `set_head`
+    // would see baseline == target and leave the file behind as untracked.
+    // This also writes the merged index to disk. The untracked
+    // `.gonzalo-git.lock` is neither in the baseline nor the target, so it stays.
+    repo.checkout_tree(
+        tree.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .map_err(be)?;
     let sig = git2::Signature::now("gonzalo", "gonzalo@localhost").map_err(be)?;
     let refname = format!("refs/heads/{branch}");
     repo.commit(
@@ -440,10 +492,16 @@ fn merge_non_ff(
     )
     .map_err(be)?;
     repo.set_head(&refname).map_err(be)?;
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-        .map_err(be)?;
+    // No trailing `checkout_head`: the worktree and index already match the
+    // committed tree, so it would be a no-op.
 
     Ok(report)
+}
+
+/// Serialize `record` as the store does on `put` and stage it at `path`.
+fn stage_record(index: &mut git2::Index, path: &Path, record: &Record) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(|e| CoreError::Serde(e.to_string()))?;
+    index.add_frombuffer(&blob_entry(path), &bytes).map_err(be)
 }
 
 /// Paths that differ between `base` (an empty tree if `None`) and `tree`.
@@ -533,43 +591,18 @@ fn blob_entry(path: &Path) -> git2::IndexEntry {
     }
 }
 
-/// The merged record from an auto-resolved divergence: a fresh revision over the
-/// merged `body`, mirroring `sync`'s merged-record construction.
-fn merged_record(key: &RecordKey, local: &Record, remote: &Record, body: Body) -> Record {
-    let counter = local.revision.counter.max(remote.revision.counter) + 1;
-    let mut labels = local.meta.labels.clone();
-    labels.extend(remote.meta.labels.clone());
-    let mut links = local.links.clone();
-    for l in &remote.links {
-        if !links.contains(l) {
-            links.push(l.clone());
-        }
-    }
-    let parent = if local.revision.counter >= remote.revision.counter {
-        local.revision.clone()
-    } else {
-        remote.revision.clone()
-    };
-    Record {
-        key: key.clone(),
-        kind: local.kind,
-        revision: Revision {
-            counter,
-            hash: ContentHash::of(body.bytes()),
-        },
-        parent: Some(parent),
+/// The merged record from an auto-resolved divergence: the shared core
+/// reconciliation (the same construction as `sync`), authored as
+/// `gonzalo-merge` from `git-pull`, with ancestors truncated to `cap`.
+fn merged_record(local: &Record, remote: &Record, body: Body, cap: usize) -> Record {
+    reconciled_record(
+        local,
+        remote,
         body,
-        meta: Meta {
-            author: Identity::new("gonzalo-merge"),
-            origin_system: "git-pull".into(),
-            created: local.meta.created.min(remote.meta.created),
-            updated: local.meta.updated.max(remote.meta.updated),
-            labels,
-        },
-        links,
-        ancestors: Vec::new(),
-        deleted_at: None,
-    }
+        Identity::new("gonzalo-merge"),
+        "git-pull",
+        cap,
+    )
 }
 
 fn git_push(root: &Path, remote: &str, branch: &str) -> Result<()> {

@@ -394,9 +394,23 @@ real merge base. Changes:
   - exactly one tombstone → `PullConflict`, keep local (the same policy as an
     unmergeable body today)
   - both live → today's path; `merged_record` folds both sides' ancestors
+  - local present, remote purged → keep local. This matches sync's
+    `(Some, None)` copy row.
+  - local purged, remote edited → take the remote record. This matches sync's
+    `(None, Some)` copy row, so pull never silently drops a concurrent remote
+    edit. (Amended during slice 5.)
 - The existing `(Some, Some) if local.body != remote.body` guard compares
   revisions for tombstones, because two tombstones always have equal (empty)
   bodies.
+- **The worktree must follow the merged tree.** The merge checks out the merged
+  tree *before* it moves the branch, so libgit2 compares against the local tree
+  and removes files the merge deleted. Checking out only after `set_head` would
+  leave a remotely purged file behind as untracked, and `get_raw` would still
+  read it. (Amended during slice 5.)
+- **Pull takes the repository lock** that `put`, `delete` and `purge` hold, so a
+  local delete can't commit mid-pull and then be overwritten by the pull's
+  forced checkout. A crash between writing a tombstone and committing it is a
+  separate gap, the same one `put` already has, tracked in gonzalo#283.
 
 Git `delete` now commits a tombstone instead of `commit_removal`, and `purge`
 takes over `commit_removal`.
