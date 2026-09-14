@@ -12,10 +12,10 @@ service Gonzalo {
   rpc List(ListRequest) returns (ListResponse);
   // Replication surface (gonzalo#203). Raw reads include tombstones; PutRaw
   // stores a record verbatim (revision never re-stamped; the author is kept
-  // only for an admin principal, per ADR 0015); Purge is the only
-  // physical removal and requires an admin. GetRaw/ListRaw/PutRaw reuse the
-  // Get/List/Put messages: the shapes are identical, only the store call
-  // differs.
+  // only for an admin principal (including open mode's implicit admin), per
+  // ADR 0015); Purge is the only physical removal and requires an admin.
+  // GetRaw/ListRaw/PutRaw reuse the Get/List/Put messages: the shapes are
+  // identical, only the store call differs.
   rpc GetRaw(GetRequest) returns (GetResponse);
   rpc ListRaw(ListRequest) returns (ListResponse);
   rpc PutRaw(PutRequest) returns (PutResponse);

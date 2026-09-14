@@ -1292,7 +1292,7 @@ mod tests {
     #[tokio::test]
     async fn grpc_purge_stale_expected_is_conflict() {
         let adapter = fs_adapter(tomb_auth());
-        seed_tombstone(&adapter, "wtok").await;
+        let tomb = seed_tombstone(&adapter, "wtok").await;
         let resp = adapter
             .purge(with_token(
                 purge_req("memory", &Revision::initial(b"not the tombstone")),
@@ -1302,7 +1302,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(resp.outcome, "conflict");
-        let _: gonzalo_core::Conflict = serde_json::from_slice(&resp.payload_json).unwrap();
+        let conflict: gonzalo_core::Conflict = serde_json::from_slice(&resp.payload_json).unwrap();
+        assert_eq!(conflict.current.revision, tomb.revision);
     }
 
     #[tokio::test]
@@ -1332,6 +1333,31 @@ mod tests {
         let adapter = GrpcAdapter::new(Service::new(Arc::new(DownStore), fs));
         let err = adapter
             .get_raw(Request::new(get_req("any")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+
+        // The same opaque mapping applies to every other replication RPC
+        // that reaches the store: `put_raw` (via `put_error`'s fallback),
+        // `list_raw` and `purge`. Open mode's implicit principal is an admin,
+        // so each request clears authorization and reaches `DownStore`.
+        let err = adapter
+            .put_raw(Request::new(put_req_with("origin", b"{}", None)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+
+        let err = adapter
+            .list_raw(Request::new(memory_list()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "internal error");
+
+        let err = adapter
+            .purge(Request::new(purge_req("memory", &Revision::initial(b"x"))))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
@@ -1416,5 +1442,14 @@ mod tests {
         req.author_json = b"not json".to_vec();
         let err = adapter.delete(with_token(req, "atok")).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // The malformed author aborted the delete before the store call: the
+        // record is still live.
+        let got = adapter
+            .get(with_token(get_req("memory"), "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.found);
     }
 }
