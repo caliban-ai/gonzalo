@@ -434,6 +434,9 @@ async fn list_keeps_an_unreadable_json_entry_listed() {
     let listed = store.list(&KeyPrefix::default()).await.unwrap();
     assert!(listed.contains(&good));
     assert!(listed.contains(&stray));
+    // The rationale for keeping it listed depends on `get` actually
+    // surfacing the read error rather than silently treating it as absent.
+    assert!(store.get(&stray).await.is_err());
 }
 
 /// Consumer `put` treats a tombstoned key as absent: a conditional write

@@ -148,17 +148,15 @@ impl GitStore {
 
     /// Whether consumer `list` reports `key`. A tombstone is hidden. A file
     /// that vanished since the directory walk (a concurrent `purge`) is
-    /// dropped. A file that doesn't parse as a `Record` stays listed, exactly
-    /// as before tombstones, so `get` keeps surfacing the `Serde` error.
-    fn is_listed(&self, key: &RecordKey) -> Result<bool> {
-        match std::fs::read(self.path_for(key)) {
-            Ok(bytes) => Ok(serde_json::from_slice::<Record>(&bytes)
-                .map(|rec| !rec.is_tombstone())
-                .unwrap_or(true)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            // Unreadable (e.g. a stray directory named `*.json`): keep it listed as
-            // before tombstones, so `get` surfaces the error instead of `list` failing.
-            Err(_) => Ok(true),
+    /// dropped. A file that fails to read for any other reason (fails to
+    /// deserialize, or an unreadable entry such as a stray directory named
+    /// `*.json`) stays listed, exactly as before tombstones, so `get` keeps
+    /// surfacing the error instead of the key silently disappearing.
+    fn is_listed(&self, key: &RecordKey) -> bool {
+        match self.read(key) {
+            Ok(Some(rec)) => !rec.is_tombstone(),
+            Ok(None) => false,
+            Err(_) => true,
         }
     }
 
@@ -652,7 +650,7 @@ impl gonzalo_core::Store for GitStore {
             collect_keys(&store.root, &prefix, &mut keys)?;
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
-                if store.is_listed(&key)? {
+                if store.is_listed(&key) {
                     out.push(key);
                 }
             }

@@ -57,6 +57,20 @@ impl FsStore {
             Err(e) => Err(CoreError::Backend(e.to_string())),
         }
     }
+
+    /// Whether consumer `list` reports `key`. A tombstone is hidden. A file
+    /// that vanished since the directory walk (a concurrent `purge`) is
+    /// dropped. A file that fails to read for any other reason (fails to
+    /// deserialize, or an unreadable entry such as a stray directory named
+    /// `*.json`) stays listed, exactly as before tombstones, so `get` keeps
+    /// surfacing the error instead of the key silently disappearing.
+    async fn listed_live(&self, key: &RecordKey) -> bool {
+        match self.read_record(key).await {
+            Ok(Some(rec)) => !rec.is_tombstone(),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
 }
 
 #[async_trait]
@@ -102,7 +116,7 @@ impl Store for FsStore {
         collect_keys(&self.root, prefix, &mut keys).await?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            if listed_live(&self.root, &key).await? {
+            if self.listed_live(&key).await {
                 out.push(key);
             }
         }
@@ -450,24 +464,6 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-/// Whether consumer `list` reports `key`. A tombstone is hidden. A file that
-/// vanished since the directory walk (a concurrent `purge`) is dropped. A file
-/// that doesn't parse as a `Record` stays listed, exactly as before tombstones,
-/// so `get` keeps surfacing the `Serde` error instead of the key silently
-/// disappearing.
-async fn listed_live(root: &Path, key: &RecordKey) -> Result<bool> {
-    match tokio::fs::read(layout::record_path(root, key)).await {
-        Ok(bytes) => Ok(serde_json::from_slice::<Record>(&bytes)
-            .map(|rec| !rec.is_tombstone())
-            .unwrap_or(true)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        // Unreadable (e.g. a stray directory named `*.json`): keep it listed as
-        // before tombstones, so `get` surfaces the error instead of `list`
-        // failing.
-        Err(_) => Ok(true),
     }
 }
 

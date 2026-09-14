@@ -214,6 +214,46 @@ async fn delete_writes_a_tombstone_at_the_record_path() {
     assert!(!path.with_extension("json.tmp").exists());
 }
 
+/// A no-op delete (over an existing tombstone) must leave the stored
+/// tombstone byte-identical, not just revision-equal: a store that rewrote
+/// `deleted_at` at the same revision would still pass a revision-only check.
+#[tokio::test]
+async fn second_delete_leaves_the_tombstone_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = RecordKey::new("ns", "col", "twice-doomed");
+    committed(
+        store
+            .put(rec(&key, b"x", Revision::initial(b"x")), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let path = dir.path().join("ns").join("col").join("twice-doomed.json");
+    let bytes_before = std::fs::read(&path).unwrap();
+    let raw_before = store.get_raw(&key).await.unwrap().unwrap();
+
+    // Long enough that a rewritten `deleted_at` (wall-clock ms) would differ.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes_after, bytes_before,
+        "a no-op delete must not rewrite the stored tombstone"
+    );
+    let raw_after = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(raw_after, raw_before);
+}
+
 #[tokio::test]
 async fn consumer_reads_hide_a_tombstone_and_raw_reads_show_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -326,6 +366,9 @@ async fn list_keeps_an_unreadable_json_entry_listed() {
     let listed = store.list(&KeyPrefix::default()).await.unwrap();
     assert!(listed.contains(&good));
     assert!(listed.contains(&stray));
+    // The rationale for keeping it listed depends on `get` actually
+    // surfacing the read error rather than silently treating it as absent.
+    assert!(store.get(&stray).await.is_err());
 }
 
 /// Deletes go through the per-record lock: N racing deletes of one revision
