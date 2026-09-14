@@ -96,14 +96,20 @@ What each operation needs:
 | put or delete a record | `write` on its namespace |
 | list keys in a namespace | `read` on that namespace |
 | list keys with no namespace filter | `read` on `"*"` |
+| raw get / raw put a record | `read` / `write` on its namespace |
+| raw key listing | as list keys |
+| purge a record | admin (`"*"` in both lists) |
 | code-graph queries | `read` on the view's `repo` |
 | blobs | `read` / `write` on the reserved `_blobs` namespace |
 | ticket sync | `write` on `tickets` |
 | `/healthz`, `/readyz` | nothing: probes bypass auth |
 
 When auth is on, a write's `meta.author` is overwritten with the authenticated
-principal's name, so authorship cannot be forged. With auth off, the author the client
-sent is kept.
+principal's name, so authorship cannot be forged — except `put_raw` and `delete`
+from an admin, which keep the replicated author or the named deleter. With auth
+off, the author the client sent is kept. See
+[Deletion, reset & collection § Over the daemon](./deletion.md#over-the-daemon)
+for the full authorship rules.
 
 ## HTTP API
 
@@ -113,8 +119,12 @@ sent is kept.
 | `GET /readyz` | readiness: `200` when the backing store is reachable, else `503` |
 | `GET /v1/records/{ns}/{col}/{id}` | the record as JSON, or `404` |
 | `PUT /v1/records/{ns}/{col}/{id}` | body `{"record": …, "expected": <revision or null>}` |
-| `DELETE /v1/records/{ns}/{col}/{id}` | optional body `{"expected": <revision>}` |
+| `DELETE /v1/records/{ns}/{col}/{id}` | optional body `{"expected": <revision>, "author": <identity>}`, both fields optional |
 | `GET /v1/keys?namespace=&collection=` | list keys, both filters optional |
+| `GET /v1/raw/records/{ns}/{col}/{id}` | the record as JSON including tombstones; always `200`, absence is `{"record": null}` |
+| `PUT /v1/raw/records/{ns}/{col}/{id}` | replication write; body `{"record": …, "expected": <revision or null>}`, stored verbatim |
+| `GET /v1/raw/keys?namespace=&collection=` | list keys including tombstoned ones, both filters optional |
+| `POST /v1/purge/{ns}/{col}/{id}` | body `{"expected": <revision>}`; physically removes the record |
 | `GET`, `PUT`, `DELETE /v1/blobs/{hash}` | content-addressed blob bytes |
 | `GET /v1/blobs` | list blob hashes |
 | `POST /v1/tickets/sync` | sync one ticket connection; the body is one `[[connection]]` entry from `tickets.toml`, as JSON |
@@ -126,14 +136,18 @@ carrying the live record. A successful put returns
 `{"outcome":"committed","revision":…}`. Conflicts are normal results, not errors
 ([ADR 0005](./adr/0005-optimistic-concurrency-and-conflict-surfacing.md)).
 
-Internal failures return an opaque `500`; the detail goes to the daemon's stderr.
+A put rejected as not found — a conditional write (normal or raw) whose expected
+revision the store no longer holds, the common case being a write over a deleted
+key — returns `412`. Other internal failures return an opaque `500`; the detail
+goes to the daemon's stderr.
 
 ## gRPC API
 
 The `gonzalo` service in `gonzalo-proto` carries the same operations: `Get`, `Put`,
-`Delete`, `List`, `PutBlob`, `GetBlob`, `ListBlobs`, `DeleteBlob`, `TicketSync`, and
-`GraphDefinitions`, `GraphReferencesTo`, `GraphCallersOf`, `GraphCallees`,
-`GraphImpact`. Authorization is identical to HTTP.
+`Delete`, `List`, `GetRaw`, `PutRaw`, `ListRaw`, `Purge`, `PutBlob`, `GetBlob`,
+`ListBlobs`, `DeleteBlob`, `TicketSync`, and `GraphDefinitions`, `GraphReferencesTo`,
+`GraphCallersOf`, `GraphCallees`, `GraphImpact`. Authorization is identical to
+HTTP.
 
 ## From Rust
 

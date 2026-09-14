@@ -29,7 +29,7 @@ alongside them. `gonzalo-mcp` reads the same root through `GONZALO_ROOT`.
 | `gonzalo get --root R <namespace> <collection> <id>` | print one record as JSON |
 | `gonzalo migrate --root R --namespace N --collection C [--kind K] <src>` | recursively import files from `<src>` as records |
 | `gonzalo sync <root-a> <root-b>` | two-way sync of two filesystem stores |
-| `gonzalo delete --root R --namespace N --collection C --id I [--expected REV]` | write a tombstone for one record (replicates on sync); `--expected` is the revision JSON `get` prints |
+| `gonzalo delete --root R --namespace N --collection C --id I [--expected REV]` | write a tombstone for one record (replicates on sync); `--expected` is the `revision` object from `gonzalo get`'s JSON output (e.g. `{"counter":3,"hash":"…"}`) |
 | `gonzalo reset --root R --namespace N [--collection C]` | tombstone every live record in a namespace or collection; idempotent, re-run to finish |
 | `gonzalo collect --root R --older-than 30d [--namespace N [--collection C]]` | physically purge tombstones at least that old; choose a horizon longer than any peer's longest gap between syncs |
 
