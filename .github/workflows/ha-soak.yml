@@ -56,10 +56,12 @@ jobs:
         run: bash scripts/rustfs-up.sh | sed 's/^export //' >> "$GITHUB_ENV"
 
       # S3 store conformance (incl. tombstone conformance, gonzalo#203) against
-      # the qualified backend (ADR 0019). Conformance cases and the delete races
-      # create their own buckets. The blob test and the update race use the
-      # shared `soak` bucket under the `blobs/` and `race` prefixes, which the
-      # soak workload (namespace `soak`) never touches.
+      # the RustFS pinned in docker-compose.rustfs.yml (>= 1.0.0-rc.6, whose
+      # atomic conditional DeleteObject purge relies on; to be recorded in ADR
+      # 0021). Conformance cases and the delete races create their own buckets.
+      # The blob test and the update race use the shared `soak` bucket under
+      # the `blobs/` and `race` prefixes, which the soak workload (namespace
+      # `soak`) never touches.
       - name: S3 store conformance over RustFS
         run: cargo test -p gonzalo-store-s3 --all-features --test integration -- --nocapture
 

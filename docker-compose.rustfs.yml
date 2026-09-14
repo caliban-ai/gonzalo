@@ -5,8 +5,8 @@
 # If-Match atomically (see docs/superpowers/specs/2026-07-11-gonzalo-ha-soak-design.md)
 # and is retained only as a reproducer of that finding.
 #
-# NOTE: RustFS is pre-1.0 (beta) — pinned for reproducibility. A Postgres substrate
-# is tracked as the mature long-term HA backend (k8s epic #274).
+# NOTE: RustFS is pre-1.0 (release candidate) — pinned for reproducibility. A
+# Postgres substrate is tracked as the mature long-term HA backend (k8s epic #274).
 #
 # Brought up on demand by scripts/rustfs-up.sh.
 services:
@@ -15,7 +15,8 @@ services:
     # conditional DeleteObject (If-Match); 1.0.0-beta.8 is not atomic (it checks
     # If-Match on arrival but deletes whatever object is current when the removal
     # lands: 197/200 violations under concurrent create vs purge, 0/200 on rc.6).
-    # Recorded in ADR 0021 (replicated deletion). Do not downgrade.
+    # To be recorded in ADR 0021 (replicated deletion, gonzalo#203 slice 7).
+    # Do not downgrade.
     image: rustfs/rustfs:1.0.0-rc.6
     container_name: gonzalo-soak-rustfs
     restart: "no"

@@ -22,7 +22,7 @@
 - Commit messages end with `Claude-Session: https://claude.ai/code/session_019C89EVJgoefhAmPcrbP4eu`. PR bodies end with `https://claude.ai/code/session_019C89EVJgoefhAmPcrbP4eu`.
 - The PR body says `Part of #203` (slice 6 closed #203).
 - Contract names are used exactly as the overview defines them: `Record::is_tombstone`, `tombstone_of`, `DEFAULT_ANCESTOR_CAP`, `Store::get_raw`, `Store::list_raw`, `Store::put_raw`, `Store::purge`, `Store::delete_as` (required), `Store::delete` (provided, `delete_as(key, expected, None)`), `gonzalo_core::reset::{reset, ResetReport}`, `gonzalo_core::collect::{collect, CollectReport}`.
-- Reconciled contract (wins over any older text in slices 1–6): `put_raw` is the replication write and never re-stamps the **revision**. The author rule is separate: through the daemon, `put_raw` from a non-admin principal restamps `meta.author` to that principal, like consumer `put`, while an admin principal (or open mode) keeps the replicated record's author. A consumer `put` or `put_raw` that the store rejects with `NotFound` returns HTTP 412 / gRPC `FailedPrecondition`, which `ServerStore` maps back to `CoreError::NotFound`. 404 is not used, because on raw routes 404 means "old daemon". A consumer `put` over a tombstone is a recreation with `expected = None` and `NotFound` with any `Some`. `delete_as` takes an optional author, which the daemon stamps from the authenticated principal. On a lost conditional write (412), s3 re-reads and re-plans, up to 8 attempts, then returns a `Backend` error. `gonzalod`'s cap is only the env var `GONZALO_ANCESTOR_CAP`.
+- Reconciled contract (wins over any older text in slices 1–6): `put_raw` is the replication write and never re-stamps the **revision**. The author rule is separate: through the daemon, `put_raw` from a non-admin principal restamps `meta.author` to that principal, like consumer `put`, while an admin principal (or open mode) keeps the replicated record's author. A consumer `put` or `put_raw` that the store rejects with `NotFound` returns HTTP 412 / gRPC `FailedPrecondition`, which `ServerStore` maps back to `CoreError::NotFound`. 404 is not used, because on raw routes 404 means "old daemon". A consumer `put` over a tombstone is a recreation with `expected = None` and `NotFound` with any `Some`. `delete_as` takes an optional author, which the daemon stamps from the authenticated principal. On a lost conditional write — `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey` (the object vanished to a concurrent purge) — s3 re-reads and re-plans, up to 8 attempts, then returns a `Backend` error. `gonzalod`'s cap is only the env var `GONZALO_ANCESTOR_CAP`.
 - CLI synopsis is copied from slice 6's plan: every command takes `--root`; `--expected` is revision JSON as `gonzalo get` prints it; `--older-than` accepts `Nd`/`Nh`/`Nm`/`Ns` and rejects 0; `--ancestor-cap` is per command on `delete`/`reset`/`collect`/`sync`; the CLI opens only a local `FsStore`. Exit codes: **0 success, 1 error, 2 usage, 3 conflict** (`delete`, `reset`). `collect` exits 0 even with conflicts. `gonzalo delete` attributes tombstones to `gonzalo-cli`, and `reset` tombstones carry no author. The exact synopsis and outputs are the table in Task 6's Interfaces.
 - Soak test doubles implement `delete_as` and `put_raw`, never `delete`, which is a provided method.
 - Tombstone hash domain string, verbatim: `gonzalo:tombstone:v1`. Default ancestor cap: `32`. `deleted_at` is ms since the Unix epoch.
@@ -2118,10 +2118,12 @@ Every substrate makes these decisions through the same pure planner functions in
 core, so they behave identically by construction. The conformance suite
 (`crates/gonzalo-core/src/conformance.rs`) proves it on each substrate. The lock-based
 stores (fs, git) plan inside their lock. s3 has no lock: its writes are
-conditional on the ETag it read. When a conditional write loses a race (HTTP 412),
-s3 re-reads, re-plans and retries, up to 8 attempts, then returns a backend error.
-It therefore reaches the same outcome a lock-based store would, instead of
-guessing from a single re-read.
+conditional on the ETag it read. When a conditional write loses a race —
+`PreconditionFailed` (HTTP 412), `ConditionalRequestConflict` (HTTP 409), or
+`NoSuchKey` (the object vanished to a concurrent purge) — s3 re-reads, re-plans
+and retries, up to 8 attempts, then returns a backend error. It therefore
+reaches the same outcome a lock-based store would, instead of guessing from a
+single re-read.
 
 **Ordering by bounded ancestry.** Every record carries `ancestors`, its most recent
 prior revisions sorted newest first and capped per store. The cap defaults to 32,
@@ -2768,10 +2770,11 @@ back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
   destination between sync's read and its copy now conflicts and is resolved on
   the next pass. Before, the copy became a recreation and brought the deleted
   record back. (#203)
-- **s3 retries lost conditional writes.** A write that loses an `If-Match` race
-  (HTTP 412) re-reads, re-plans and retries up to 8 times before returning a
-  backend error, so s3 reaches the same outcomes as the lock-based fs and git
-  stores. (#203)
+- **s3 retries lost conditional writes.** A write that loses an `If-Match` race —
+  `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey`
+  (the object vanished to a concurrent purge) — re-reads, re-plans and retries
+  up to 8 times before returning a backend error, so s3 reaches the same
+  outcomes as the lock-based fs and git stores. (#203)
 - **`Store::delete` writes a tombstone instead of removing the record.** `get`
   and `list` hide tombstones, so applications see no difference. Deleting an
   already-deleted or absent key is still an idempotent `Deleted`. ADR 0018's
@@ -3041,7 +3044,7 @@ If `ha-soak` fails, fetch the logs with `gh run view --log-failed` and fix the u
 - §7 follow-up tickets (§8.3, `Meta` times, §8.4): Task 8.
 - §8.2 horizon guidance: Task 6. §8.5 recreation re-stamp: guide and CHANGELOG.
 
-**Reconciled contract coverage:** `put_raw` and the resurrection window (ADR 0021 Decision, guide daemon table, CHANGELOG); `NotFound` for a consumer put with `Some` over a tombstone (ADR, guide, CHANGELOG, soak lost-race mapping); `delete_as` and authorship (ADR, guide, CHANGELOG, soak test doubles); the `put_raw` author rule, non-admin restamped and admin/open kept (ADR, guide daemon section, CHANGELOG); daemon `NotFound` as 412 / `FailedPrecondition` (ADR, guide daemon section, CHANGELOG Changed); s3's 8-attempt 412 loop (ADR, CHANGELOG); `GONZALO_ANCESTOR_CAP` as env var only (ADR, guide, CHANGELOG); the CLI synopsis and exit codes 0/1/2/3 copied from slice 6's Task 4 table (guide, CHANGELOG, ADR exit-code paragraph). The soak has no replication writes, so it uses no `put_raw`.
+**Reconciled contract coverage:** `put_raw` and the resurrection window (ADR 0021 Decision, guide daemon table, CHANGELOG); `NotFound` for a consumer put with `Some` over a tombstone (ADR, guide, CHANGELOG, soak lost-race mapping); `delete_as` and authorship (ADR, guide, CHANGELOG, soak test doubles); the `put_raw` author rule, non-admin restamped and admin/open kept (ADR, guide daemon section, CHANGELOG); daemon `NotFound` as 412 / `FailedPrecondition` (ADR, guide daemon section, CHANGELOG Changed); s3's 8-attempt lost-race loop, 412/409/NoSuchKey (ADR, CHANGELOG); `GONZALO_ANCESTOR_CAP` as env var only (ADR, guide, CHANGELOG); the CLI synopsis and exit codes 0/1/2/3 copied from slice 6's Task 4 table (guide, CHANGELOG, ADR exit-code paragraph). The soak has no replication writes, so it uses no `put_raw`.
 
 **Placeholder scan:** no TBD/TODO. The only conditional edit is Task 7 Step 1 (earlier-slice CHANGELOG entries). Task 6 Step 1 compares `--help` output with the fixed synopsis and treats any difference as a slice 6 bug.
 
