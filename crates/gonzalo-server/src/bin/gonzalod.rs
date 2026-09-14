@@ -6,6 +6,9 @@
 //! - `GONZALO_S3_BUCKET` — s3 bucket (required when `GONZALO_STORE=s3`)
 //! - `GONZALO_S3_ENDPOINT` — s3 endpoint for MinIO/Garage (optional)
 //! - `GONZALO_S3_REGION` — s3 region override (optional)
+//! - `GONZALO_ANCESTOR_CAP` — revisions kept in each record's `ancestors` list
+//!   (default 32, at least 1). A smaller cap turns some sync fast-forwards
+//!   into merges or conflicts; it never produces a wrong winner (gonzalo#203).
 //! - `GONZALO_HTTP_ADDR` — HTTP/JSON bind address (default `127.0.0.1:8080`)
 //! - `GONZALO_GRPC_ADDR` — gRPC bind address (default `127.0.0.1:50051`)
 //! - `GONZALO_MAX_BLOB_SIZE` — max bytes per blob over the transports (default 64 MiB).
@@ -22,7 +25,7 @@
 //! Credentials for s3 come from the standard `AWS_*` environment.
 
 use gonzalo_core::{BlobStore, Store};
-use gonzalo_server::{Auth, Service, StoreConfig, serve_grpc, serve_http};
+use gonzalo_server::{Auth, Service, StoreConfig, ancestor_cap_from_env, serve_grpc, serve_http};
 use gonzalo_store_fs::FsStore;
 use gonzalo_store_s3::S3Store;
 use std::sync::Arc;
@@ -43,6 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the record store and the content-addressed blob store (each backend
     // implements both traits).
     let config = StoreConfig::from_env(|k| std::env::var(k).ok())?;
+    // Applied to the backing store, which folds ancestors inside its own OCC
+    // critical section (gonzalo#203).
+    let ancestor_cap = ancestor_cap_from_env(|k| std::env::var(k).ok())?;
     let (store, blobs, graph_root): (
         Arc<dyn Store>,
         Arc<dyn BlobStore>,
@@ -51,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StoreConfig::Fs { root } => {
             // Per-view SQLite graphs written by `gonzalo index` live under
             // `<root>/graphs` and are queried directly.
-            let fs = Arc::new(FsStore::new(root));
+            let fs = Arc::new(FsStore::new(root).with_ancestor_cap(ancestor_cap)?);
             let graphs = std::path::Path::new(root).join("graphs");
             (fs.clone(), fs, Some(graphs))
         }
@@ -62,8 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // No local SQLite graph cache under S3: views assemble from the
             // manifest + content-addressed slices (blobs) on demand.
-            let s3 =
-                Arc::new(S3Store::connect(bucket.clone(), endpoint.clone(), region.clone()).await);
+            let s3 = Arc::new(
+                S3Store::connect(bucket.clone(), endpoint.clone(), region.clone())
+                    .await
+                    .with_ancestor_cap(ancestor_cap)?,
+            );
             (s3.clone(), s3, None)
         }
     };
@@ -88,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
     let grpc_listener = tokio::net::TcpListener::bind(&grpc_addr).await?;
     eprintln!(
-        "gonzalod: store {substrate}, HTTP on {http_addr}, gRPC on {grpc_addr}, auth {}",
+        "gonzalod: store {substrate}, ancestor cap {ancestor_cap}, HTTP on {http_addr}, gRPC on {grpc_addr}, auth {}",
         if auth_on { "on" } else { "off" }
     );
 

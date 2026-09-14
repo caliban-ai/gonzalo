@@ -9,7 +9,7 @@ mod http;
 mod service;
 
 pub use auth::{Access, Auth, Principal};
-pub use config::StoreConfig;
+pub use config::{StoreConfig, ancestor_cap_from_env};
 pub use grpc::{GrpcAdapter, serve_grpc};
 pub use http::{router, serve_http};
 pub use service::{Service, ViewSummary};
