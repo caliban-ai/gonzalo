@@ -157,8 +157,9 @@ enum Commands {
         /// ID of the record.
         #[arg(long)]
         id: String,
-        /// Only delete if the current revision is this one, as JSON exactly as
-        /// `gonzalo get` prints it: '{"counter":1,"hash":"…"}'.
+        /// Only delete if the current revision is this one: the `revision`
+        /// object from `gonzalo get`'s JSON output, e.g.
+        /// '{"counter":1,"hash":"…"}'.
         #[arg(long, value_parser = parse_revision)]
         expected: Option<Revision>,
         /// Most recent revisions a record remembers in `ancestors` (at least 1).

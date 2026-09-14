@@ -292,6 +292,8 @@ that same critical section.
 | **fs** | atomic tombstone write under the per-key flock (temp + fsync + rename, the `put_locked` path) | read and filter by kind | today's `get` / `list` | today's `delete_locked` with `expected` required |
 | **git** | commit the tombstone file | read and filter | today's reads | today's `commit_removal` |
 | **s3** | conditional `PutObject` with `If-Match` on the read ETag (`If-None-Match: *` when nothing was read) | `GetObject` per key and filter (see §8.4) | today's reads | conditional `DeleteObject` with `If-Match` |
+| **daemon client** (`ServerStore`) | existing endpoint | existing endpoints | new endpoints (§3.6) | new endpoint |
+| **`AncestryStore`** | passes through | passes through | passes through | passes through |
 
 **s3 lost races.** fs and git decide under a lock, but s3 decides from an
 unlocked read and then writes conditionally. A conditional write that loses the
@@ -303,8 +305,6 @@ it returns `CoreError::Backend`. Re-planning rather than mapping a 412 straight
 to `Conflict` gives s3 exactly the lock-based stores' outcomes. For example,
 `delete(key, None)` never reports a conflict just because a concurrent edit
 landed first; it deletes the newer revision, as fs would.
-| **daemon client** (`ServerStore`) | existing endpoint | existing endpoints | new endpoints (§3.6) | new endpoint |
-| **`AncestryStore`** | passes through | passes through | passes through | passes through |
 
 Every in-workspace `Store` implementation, including test doubles, gets the new
 methods. At the time of writing that is 14: the 4 real stores (fs, git, s3,
@@ -493,8 +493,9 @@ pub async fn reset(store: &dyn Store, prefix: &KeyPrefix) -> Result<ResetReport>
 **Reset is not atomic.** No substrate offers multi-key transactions (s3 in
 particular), and pretending otherwise would mean a lock, which the local-first
 tier can't rely on. Instead it's **idempotent**: running it again tombstones
-what the first run missed and skips what's already gone. Reset needs only
-`write` on the namespace, because it is built entirely from `delete` calls.
+what the first run missed and skips what's already gone. Reset needs `read`
+and `write` on the namespace (it is built from `list`, `get` and `delete`
+calls), and never admin.
 
 `pub async fn reset_as(store: &dyn Store, prefix: &KeyPrefix, author: Option<Identity>) -> Result<ResetReport>`
 is the same loop using `delete_as(key, Some(rev), author)`; `reset` is

@@ -50,7 +50,8 @@ ContentHash::of(b"gonzalo:tombstone:v1") }`. The domain-separated hash means a
 tombstone's revision can never equal a live edit's revision. If tombstones used
 the empty-body hash, a live edit to an empty body at the same counter would look
 "already in sync" with a concurrent delete. The same construction makes two peers
-that independently delete the same revision produce identical tombstones, which
+that independently delete the same revision produce tombstones with identical
+revisions (only `deleted_at`, and possibly the named deleter, differ), which
 sync treats as already in sync. The shared helpers live in
 `crates/gonzalo-core/src/tombstone.rs`.
 
@@ -116,8 +117,10 @@ authorship can't be forged, and stamps `Principal::delete_author(claimed)`:
 - a daemon running without auth keeps the claim, or stamps none when there is
   none, so the tombstone keeps the record's last author.
 
-ADR 0015 has no admin role of its own: an admin is a principal with `"*"` in both
-its read and write lists, and a daemon without auth counts as admin.
+ADR 0015 defines no separate admin role. The daemon treats a principal as admin
+when it has `"*"` in both its read and write lists (`Principal::is_admin`), as
+the single `GONZALO_TOKEN` principal does, and a daemon without auth counts as
+admin.
 
 Replication writes follow the same author rule. `put_raw` never re-stamps a
 record's *revision*, but the daemon does protect its author. A `put_raw` from a
@@ -179,8 +182,9 @@ applies the same kind rules to paths changed on both sides of its real merge bas
 namespace, using ordinary conditional deletes. It is not atomic, because no
 substrate offers multi-key transactions. It is idempotent: a re-run tombstones what
 the first run missed and reports keys edited concurrently as conflicts. It needs
-only `write` on the namespace. It stops at the first store error, and a re-run
-after fixing the cause is safe.
+`read` and `write` on the namespace, because it lists and reads the live records
+before deleting each one, and nothing more: no admin. It stops at the first store
+error, and a re-run after fixing the cause is safe.
 
 **CLI.** The CLI works on a local fs store only (`--root <DIR>`, default `.`).
 There are three commands:
@@ -249,8 +253,8 @@ Rejected alternatives for the mechanism:
 
 - **Positive:** a delete sticks across `sync` and `pull` on every substrate, so
   namespace reset means the same thing locally and replicated. Sync fast-forwards
-  exactly when one side is behind: before this, an `Opaque` kind such as
-  `Checkpoint` reported a conflict even though nothing had diverged. Concurrent
+  when one side is behind within the ancestor cap: before this, an `Opaque` kind
+  such as `Checkpoint` reported a conflict even though nothing had diverged. Concurrent
   deletes converge without coordination, and delete-versus-edit is surfaced rather
   than silently decided. The HA soak (`crates/gonzalo-soak/`) races deletes against
   edits and recreations across daemon replicas under replica-kill chaos. It checks
@@ -268,10 +272,11 @@ Rejected alternatives for the mechanism:
   reclaim its blob, because blobs are content-addressed and may be shared, so purge
   can't remove them. **Mixed versions are unsafe:** a pre-0.7 binary that reads a
   store holding a tombstone fails on that key with a serialization error (loud, no
-  data loss), and a pre-0.7 binary that runs sync can't see tombstones and copies
-  deleted records back (silent). Every binary that reads a store or runs sync must
-  be upgraded together. The store can't tell that from a genuine recreation, so it
-  can't block it. A collection horizon shorter than a peer's offline window
+  data loss), and a pre-0.7 binary that runs sync against a 0.7 daemon can't see
+  tombstones and copies deleted records back as recreations (silent); the store
+  can't tell such a copy from a genuine recreation, so it can't block it. Every
+  binary that reads a store or runs sync must be upgraded together. A collection
+  horizon shorter than a peer's offline window
   resurrects records on that peer's next sync. Recreation re-stamps the caller's
   revision, so a caller that ignores the returned revision and reuses its own gets a
   conflict on its next conditional write. Blob garbage collection, `list`
@@ -280,10 +285,12 @@ Rejected alternatives for the mechanism:
 
   **git.** Don't push a git store while `PullReport.conflicts` is non-empty. A
   delete-versus-edit conflict keeps the local side in the merge commit, so a push
-  would publish the live record over the remote's tombstone. A crash between
+  would publish the local side over the remote's: a live record over its
+  tombstone, or a tombstone over its edit. A crash between
   writing a tombstone to the working tree and committing it leaves the tombstone
   uncommitted, and a later pull's forced checkout discards it. `put` already has
-  the same window; it is tracked in gonzalo#283. Non-fast-forward pull does not yet
+  the same window; it is noted in gonzalo#283 (atomic git writes).
+  Non-fast-forward pull does not yet
   use ancestor ordering the way sync does (gonzalo#289), and `SyncReport` does not
   signal when sync stops without converging (gonzalo#290). Independent deletes of
   the same revision converge, but each peer stamps its own `deleted_at`, so peers

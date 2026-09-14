@@ -140,8 +140,9 @@ over namespaces if that's really what you want.
 Reset is **not atomic**. It deletes records one at a time, and a record someone
 edits during the reset is reported as a conflict and left alone. Reset is
 **safe to re-run**: a second run deletes what the first missed and skips what's
-already gone. Because reset is made of ordinary deletes, it replicates like them,
-and needs only write access to the namespace.
+already gone. Because reset is made of ordinary deletes, it replicates like them. Over a
+daemon it needs both `read` and `write` on the namespace: `reset_as` lists
+and reads each record (`read`) before deleting it (`write`).
 
 On a git store every tombstone is its own commit, so resetting N records makes N
 commits (and collecting N tombstones makes N more). `reset` and `collect` stop at

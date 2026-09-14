@@ -144,7 +144,7 @@ goes to the daemon's stderr.
 ## gRPC API
 
 The `gonzalo` service in `gonzalo-proto` carries the same operations: `Get`, `Put`,
-`Delete`, `List`, `GetRaw`, `PutRaw`, `ListRaw`, `Purge`, `PutBlob`, `GetBlob`,
+`Delete`, `List`, `GetRaw`, `ListRaw`, `PutRaw`, `Purge`, `PutBlob`, `GetBlob`,
 `ListBlobs`, `DeleteBlob`, `TicketSync`, and `GraphDefinitions`, `GraphReferencesTo`,
 `GraphCallersOf`, `GraphCallees`, `GraphImpact`. Authorization is identical to
 HTTP.
