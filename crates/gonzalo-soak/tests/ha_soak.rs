@@ -1,11 +1,13 @@
 //! The bounded per-PR HA soak gate.
 //!
 //! Spawns 3 real `gonzalod` replicas over a shared S3 backend, runs a
-//! contended + unique-key workload while killing and recovering one replica, and
-//! asserts gonzalo's invariants (no lost update, conflicts surface, durability,
-//! liveness). **Skips** (does not fail) unless a S3 target is configured via
-//! `GONZALO_S3_TEST_ENDPOINT` / `GONZALO_S3_TEST_BUCKET` / `AWS_*` — mirroring the
-//! existing S3 integration test. See `scripts/rustfs-up.sh` and the `ha-soak` CI
+//! contended + lifecycle (edit/delete/recreate) + unique-key workload while
+//! killing and recovering one replica, and asserts gonzalo's invariants (no lost
+//! update, conflicts surface for writes and deletes, durability of writes and
+//! deletes, replicas agree on deletion, liveness). **Skips** (does not fail)
+//! unless a S3 target is configured via `GONZALO_S3_TEST_ENDPOINT` /
+//! `GONZALO_S3_TEST_BUCKET` / `AWS_*` — mirroring the existing S3 integration
+//! test. See `scripts/rustfs-up.sh` and the `ha-soak` CI
 //! job for provisioning; requires the `gonzalod` binary to be built.
 
 use gonzalo_soak::harness::run_rounds;
@@ -37,6 +39,10 @@ async fn ha_soak_bounded() {
         ops_per_writer: 25,
         unique_per_writer: 3,
         max_conflict_retries: 50,
+        lifecycle_keys: 2,
+        lifecycle_ops_per_writer: 25,
+        unique_deletes_per_writer: 1,
+        seed_delete_conflict: true,
         ..Default::default()
     };
 
@@ -54,9 +60,10 @@ async fn ha_soak_bounded() {
     assert!(
         outcome.passed(),
         "HA soak invariant violations: {:?}\n\
-         committed={committed} conflicts={} writers={}/{}",
+         committed={committed} conflicts={} delete_conflicts={} writers={}/{}",
         outcome.violations,
         outcome.stats.conflicts_observed,
+        gonzalo_soak::oracle::delete_conflicts(&outcome.stats),
         outcome.stats.writers_completed,
         outcome.stats.writers_total,
     );

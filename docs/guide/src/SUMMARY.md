@@ -12,6 +12,7 @@
 - [The MCP server](./mcp.md)
 - [Running gonzalod](./daemon.md)
 - [Storage backends](./storage.md)
+- [Deletion, reset & collection](./deletion.md)
 
 # Changelog
 
@@ -41,3 +42,4 @@
   - [ADR 0018 · Record deletion and its sync semantics](./adr/0018-record-deletion-and-sync.md)
   - [ADR 0019 · Qualified S3 backend for HA: RustFS](./adr/0019-s3-backend-qualification-rustfs.md)
   - [ADR 0020 · Rust-native deliverables; the daemon is the non-Rust boundary](./adr/0020-rust-native-deliverables.md)
+  - [ADR 0021 · Replicated deletion with tombstones](./adr/0021-replicated-deletion-with-tombstones.md)

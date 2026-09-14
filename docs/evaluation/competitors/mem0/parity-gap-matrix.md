@@ -29,9 +29,9 @@ out of scope for gonzalo's substrate layer, not a backlog item.
 | Retrieve relevant items (`search`) | ✅ | Vector capability layer (`Embedder` + `VectorIndex`) and knowledge store resolve queries back to whole records (ADR 0008, 0011, 0014) |
 | Fetch by id (`get` / `get_all`) | ✅ | `Store::get` / list over the record store (ADR 0002) |
 | Update an item (`update`) | ✅ | A `put` against the current revision; stale parent yields `Conflict` (ADR 0005) |
-| Delete (`delete`) | ✅ | `Store::delete`, OCC-aware, propagated by `Sync` (ADR 0018) |
+| Delete (`delete`) | ✅ | `Store::delete`, OCC-aware, replicated by `sync` and git `pull` as a tombstone; namespace `reset` and explicit tombstone `collect` (ADR 0018, ADR 0021) |
 | Change history (`history`) | ✅ | Revision lineage (`revision`, `parent`) per record; git substrate gives commit-per-write history (ADR 0002, 0016) |
-| `reset` whole namespace | 🟡 | Achievable by clearing a store root / namespace; no single first-class "reset" call |
+| `reset` whole namespace | ✅ | `gonzalo_core::reset` / `reset_as` and `gonzalo reset --namespace N [--collection C]`: conditional tombstones, idempotent, replicated by `sync` and git `pull` (ADR 0021) |
 | Scope filters (`user`/`agent`/`run`) | 🟡 | Records carry `Meta` + `links`; namespace scoping exists (ADR 0015), but no built-in user/session/run memory scoping model |
 
 ## B. Memory model

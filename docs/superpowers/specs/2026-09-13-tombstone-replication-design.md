@@ -3,7 +3,7 @@
 - **Ticket:** gonzalo#203 (namespace reset), which pulls in the deferred half of
   ADR 0018 (replicated deletion)
 - **Date:** 2026-09-13
-- **Status:** Proposed
+- **Status:** Implemented (ADR 0021)
 - **Refs:** `crates/gonzalo-core/src/{store,record,revision,sync,conformance}.rs`,
   `crates/gonzalo-store-{fs,git,s3,server}/src/lib.rs`,
   `crates/gonzalo-server/src/{http,grpc,service}.rs`,
@@ -292,17 +292,19 @@ that same critical section.
 | **fs** | atomic tombstone write under the per-key flock (temp + fsync + rename, the `put_locked` path) | read and filter by kind | today's `get` / `list` | today's `delete_locked` with `expected` required |
 | **git** | commit the tombstone file | read and filter | today's reads | today's `commit_removal` |
 | **s3** | conditional `PutObject` with `If-Match` on the read ETag (`If-None-Match: *` when nothing was read) | `GetObject` per key and filter (see §8.4) | today's reads | conditional `DeleteObject` with `If-Match` |
+| **daemon client** (`ServerStore`) | existing endpoint | existing endpoints | new endpoints (§3.6) | new endpoint |
+| **`AncestryStore`** | passes through | passes through | passes through | passes through |
 
 **s3 lost races.** fs and git decide under a lock, but s3 decides from an
-unlocked read and then writes conditionally. A conditional write that fails
-(HTTP 412) means someone wrote in between. s3 then re-reads the object and its
+unlocked read and then writes conditionally. A conditional write that loses the
+race — `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or
+`NoSuchKey` (the object vanished to a concurrent purge) — means someone wrote in
+between. s3 then re-reads the object and its
 ETag, **re-runs the same planner**, and retries. After 8 consecutive lost races
 it returns `CoreError::Backend`. Re-planning rather than mapping a 412 straight
 to `Conflict` gives s3 exactly the lock-based stores' outcomes. For example,
 `delete(key, None)` never reports a conflict just because a concurrent edit
 landed first; it deletes the newer revision, as fs would.
-| **daemon client** (`ServerStore`) | existing endpoint | existing endpoints | new endpoints (§3.6) | new endpoint |
-| **`AncestryStore`** | passes through | passes through | passes through | passes through |
 
 Every in-workspace `Store` implementation, including test doubles, gets the new
 methods. At the time of writing that is 14: the 4 real stores (fs, git, s3,
@@ -425,7 +427,7 @@ paths and gain the hide-tombstones meaning through the backing store.
 | `GET /v1/raw/records/{ns}/{col}/{id}` | `GetRaw` | `get_raw` | `read` on `ns` |
 | `GET /v1/raw/keys?namespace=&collection=` | `ListRaw` | `list_raw` | `read` on `ns`; read on `*` when unscoped, like `/v1/keys` today |
 | `PUT /v1/raw/records/{ns}/{col}/{id}` (body as consumer put) | `PutRaw` | `put_raw` | `write` on `ns` |
-| `POST /v1/purge/{ns}/{col}/{id}` (body: expected revision JSON) | `Purge` | `purge` | **admin** |
+| `POST /v1/purge/{ns}/{col}/{id}` (body: `{"expected": <revision>}`) | `Purge` | `purge` | **admin** |
 
 - **Delete.** Existing `DELETE /v1/records/...` keeps requiring `write` on the
   namespace and now calls `delete_as`. The request may name a deleter
@@ -491,8 +493,15 @@ pub async fn reset(store: &dyn Store, prefix: &KeyPrefix) -> Result<ResetReport>
 **Reset is not atomic.** No substrate offers multi-key transactions (s3 in
 particular), and pretending otherwise would mean a lock, which the local-first
 tier can't rely on. Instead it's **idempotent**: running it again tombstones
-what the first run missed and skips what's already gone. Reset needs only
-`write` on the namespace, because it is built entirely from `delete` calls.
+what the first run missed and skips what's already gone. Reset needs `read`
+and `write` on the namespace (it is built from `list`, `get` and `delete`
+calls), and never admin.
+
+`pub async fn reset_as(store: &dyn Store, prefix: &KeyPrefix, author: Option<Identity>) -> Result<ResetReport>`
+is the same loop using `delete_as(key, Some(rev), author)`; `reset` is
+`reset_as(store, prefix, None)` and keeps each record's author. The CLI uses
+`reset_as` with `gonzalo-cli`. Over a daemon the deleter follows §3.6. Both stop
+at the first store error; a re-run is safe. (Amended during slice 6.)
 
 ### 3.8 Collection
 
@@ -535,8 +544,10 @@ Stores have no configuration mechanism today (`FsStore::new(root)` is the only
 constructor).
 
 - `pub const DEFAULT_ANCESTOR_CAP: usize = 32;` in `gonzalo-core`.
-- Each store gets a builder method, `.with_ancestor_cap(n: usize) -> Self`, so
-  existing constructors keep compiling. `n == 0` is rejected at construction.
+- Each store gets a builder method,
+  `.with_ancestor_cap(self, n: usize) -> gonzalo_core::Result<Self>`, so
+  existing constructors keep compiling. `n == 0` returns
+  `CoreError::Backend("ancestor cap must be at least 1")`.
 - The CLI gets `--ancestor-cap <n>` on `delete`, `reset`, `collect` and
   `sync`, the commands that open a store for these operations.
 - `gonzalod` has no command-line flags; it is configured only through
@@ -551,7 +562,8 @@ constructor).
 ### 3.10 CLI
 
 The CLI opens only a local `FsStore` (`--root`, default `.`), so the daemon's
-admin scope doesn't apply to these commands. `--ancestor-cap <K>` (default 32)
+admin scope doesn't apply to these commands (if the CLI ever opens a
+`ServerStore`, §3.6's claimed-deleter rule applies). `--ancestor-cap <K>` (default 32)
 is accepted by all three and by `sync`.
 
 **Exit codes:** 0 success, 1 error, 2 usage error (clap), **3 conflict**. A
@@ -561,12 +573,14 @@ from an I/O failure.
 | Command | Output | Exit |
 |---|---|---|
 | `gonzalo delete --namespace N --collection C --id I [--expected REVISION_JSON]` | `deleted: N/C/I`, or `conflict: N/C/I` plus `current:  <revision JSON>` | 0 deleted (including absent or already deleted); 3 conflict |
-| `gonzalo reset --namespace N [--collection C]` | stdout `X deleted, M conflicts`; stderr one `conflict: <key>` per conflict | 0 if M == 0; 3 if M > 0 (re-run to finish) |
+| `gonzalo reset --namespace N [--collection C]` | stdout `X deleted, M conflicts`; stderr one `conflict: <key>` per conflict, plus a stderr re-run hint ``re-run `gonzalo reset` to delete the M conflicted record(s)`` when M > 0 | 0 if M == 0; 3 if M > 0 (re-run to finish) |
 | `gonzalo collect --older-than DURATION [--namespace N [--collection C]]` | four lines: `horizon: <as typed> (<seconds>s)`, `purged: P`, `unstamped: U`, `conflicts: Q` | 0 even with conflicts (nothing to retry) |
 
-- **`--expected`** is a revision as JSON, exactly as `gonzalo get` prints one.
-- **`delete` authorship:** the tombstone is attributed to `gonzalo-cli`, the
-  identity the CLI already stamps on its writes.
+- **`--expected`** is the `revision` object from `gonzalo get`'s JSON output
+  (e.g. `{"counter":3,"hash":"…"}`).
+- **`delete` and `reset` authorship:** tombstones are attributed to
+  `gonzalo-cli` (`reset` via `reset_as`), the identity the CLI already stamps on
+  its writes.
 - **`--older-than`** is a positive integer plus one unit (`d`, `h`, `m`, `s`),
   parsed without new dependencies. Zero is rejected.
 - **Usage errors (exit 2):** `reset` without `--namespace`, and
@@ -710,8 +724,10 @@ The four existing delete cases are rewritten for the new meaning (for example,
 
 - raw reads need `read`, `put_raw` needs `write`, purge needs admin, and
   unscoped `list_raw` needs read on `*`
-- an authenticated delete stamps the principal as the tombstone's
-  `meta.author`, and `put_raw` keeps the replicated record's author
+- a delete stamps `Principal::delete_author(claimed)` (§3.6) as the
+  tombstone's `meta.author`: a non-admin as itself, an admin or open mode
+  keeping a named deleter; `put_raw` from an admin or open mode keeps the
+  replicated record's author
 - `delete` over the wire returns a tombstone on a later `get_raw`
 - `ServerStore` maps 404 / `Unimplemented` on raw routes to the upgrade error,
   and never calls consumer `get` as a fallback (asserted with a wiremock that
@@ -751,11 +767,11 @@ can merge to `main` one by one, but no release is tagged until slice 5 lands.
 3. **s3 store:** §3.3, passing conformance (RustFS-qualified per ADR 0019).
 4. **Daemon and client:** routes, RPCs, auth, the upgrade error (§3.6, §6.5).
 5. **Replication:** sync (§3.4) and git pull (§3.5), with their tests.
-6. **Reset, collect and CLI:** §3.7–§3.10, §6.4, §6.6. Closes #203.
+6. **Reset, collect and CLI:** §3.7–§3.10, §6.4, §6.6.
 7. **Soak:** §6.7.
 8. **Docs:** ADR 0021, ADR 0018 index back-reference, guide pages for the
    three commands with a prominent "choosing a horizon" section, CHANGELOG
-   with the upgrade-together warning.
+   with the upgrade-together warning. Closes #203 (with the Mem0 `reset` row).
 
 Follow-up tickets filed alongside:
 

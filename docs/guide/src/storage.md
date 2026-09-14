@@ -81,14 +81,13 @@ it deletes only if `rev` is still current, and otherwise returns
 `DeleteResult::Conflict` with the live record. Deleting an absent key is an idempotent
 success.
 
-In released versions a delete is **local only**
-([ADR 0018](./adr/0018-record-deletion-and-sync.md)): it does not propagate through
-sync or git pull, so syncing with a peer that still holds the record brings it back.
-Delete on every side, or do not rely on sync to carry deletes.
-
-Replicated deletion through tombstones is under way in
-[#203](https://github.com/caliban-ai/gonzalo/issues/203) and not yet released. Until
-the release notes say otherwise, ADR 0018 describes the behaviour you can rely on.
+A delete writes a **tombstone** that `sync` and git `pull` replicate, so a delete
+made on one store takes effect on its peers. Consumer reads (`get`, `list`) hide
+tombstones; `gonzalo collect` removes old ones. See
+[Deleting records, resetting namespaces, and collecting tombstones](./deletion.md)
+and [ADR 0021](./adr/0021-replicated-deletion-with-tombstones.md), which supersedes
+ADR 0018's local-only deletion. Deletion replicates only once every binary that
+reads the store or runs sync is on 0.7.
 
 ## Blobs
 

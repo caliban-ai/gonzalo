@@ -157,8 +157,9 @@ enum Commands {
         /// ID of the record.
         #[arg(long)]
         id: String,
-        /// Only delete if the current revision is this one, as JSON exactly as
-        /// `gonzalo get` prints it: '{"counter":1,"hash":"…"}'.
+        /// Only delete if the current revision is this one: the `revision`
+        /// object from `gonzalo get`'s JSON output, e.g.
+        /// '{"counter":1,"hash":"…"}'.
         #[arg(long, value_parser = parse_revision)]
         expected: Option<Revision>,
         /// Most recent revisions a record remembers in `ancestors` (at least 1).
@@ -435,11 +436,11 @@ async fn main() -> Result<ExitCode> {
 
         Commands::Sync { a, b, ancestor_cap } => {
             let summary = sync_stores_with_cap(&a, &b, ancestor_cap).await?;
-            println!("copied_to_a: {}", summary.copied_to_a);
-            println!("copied_to_b: {}", summary.copied_to_b);
+            println!("copied_to_a:    {}", summary.copied_to_a);
+            println!("copied_to_b:    {}", summary.copied_to_b);
             println!("fast_forwarded: {}", summary.fast_forwarded);
-            println!("merged:      {}", summary.merged);
-            println!("conflicts:   {}", summary.conflicts);
+            println!("merged:         {}", summary.merged);
+            println!("conflicts:      {}", summary.conflicts);
         }
 
         Commands::Delete {

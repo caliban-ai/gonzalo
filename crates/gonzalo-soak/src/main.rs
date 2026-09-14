@@ -12,6 +12,8 @@
 //! Usage:
 //!   gonzalo-soak [--replicas N] [--rounds N] [--writers N] [--shared-keys N]
 //!                [--ops-per-writer N] [--unique-per-writer N] [--retries N]
+//!                [--lifecycle-keys N] [--lifecycle-ops-per-writer N]
+//!                [--unique-deletes-per-writer N]
 
 use gonzalo_soak::harness::run_rounds;
 use gonzalo_soak::target::S3Target;
@@ -32,6 +34,10 @@ fn parse_args() -> Result<Args, String> {
         ops_per_writer: 50,
         unique_per_writer: 4,
         max_conflict_retries: 100,
+        lifecycle_keys: 3,
+        lifecycle_ops_per_writer: 50,
+        unique_deletes_per_writer: 2,
+        seed_delete_conflict: true,
         ..Default::default()
     };
 
@@ -51,6 +57,9 @@ fn parse_args() -> Result<Args, String> {
             "--ops-per-writer" => cfg.ops_per_writer = val()?,
             "--unique-per-writer" => cfg.unique_per_writer = val()?,
             "--retries" => cfg.max_conflict_retries = val()?,
+            "--lifecycle-keys" => cfg.lifecycle_keys = val()?,
+            "--lifecycle-ops-per-writer" => cfg.lifecycle_ops_per_writer = val()?,
+            "--unique-deletes-per-writer" => cfg.unique_deletes_per_writer = val()?,
             "-h" | "--help" => return Err("help".into()),
             other => return Err(format!("unknown flag: {other}")),
         }
@@ -82,8 +91,8 @@ async fn main() {
     };
 
     eprintln!(
-        "gonzalo-soak: {} replicas, {} rounds, {} writers, {} shared keys",
-        args.replicas, args.rounds, args.cfg.writers, args.cfg.shared_keys
+        "gonzalo-soak: {} replicas, {} rounds, {} writers, {} shared keys, {} lifecycle keys",
+        args.replicas, args.rounds, args.cfg.writers, args.cfg.shared_keys, args.cfg.lifecycle_keys
     );
 
     let outcomes = match run_rounds(&target, args.cfg, args.replicas, args.rounds).await {
@@ -104,8 +113,11 @@ async fn main() {
             .count();
         if o.passed() {
             eprintln!(
-                "round {r}: PASS  committed={committed} conflicts={} writers={}/{}",
-                o.stats.conflicts_observed, o.stats.writers_completed, o.stats.writers_total
+                "round {r}: PASS  committed={committed} conflicts={} delete_conflicts={} writers={}/{}",
+                o.stats.conflicts_observed,
+                gonzalo_soak::oracle::delete_conflicts(&o.stats),
+                o.stats.writers_completed,
+                o.stats.writers_total
             );
         } else {
             failed += 1;
@@ -123,5 +135,6 @@ async fn main() {
 
 fn usage() -> &'static str {
     "usage: gonzalo-soak [--replicas N] [--rounds N] [--writers N] \
-     [--shared-keys N] [--ops-per-writer N] [--unique-per-writer N] [--retries N]"
+     [--shared-keys N] [--ops-per-writer N] [--unique-per-writer N] [--retries N] \
+     [--lifecycle-keys N] [--lifecycle-ops-per-writer N] [--unique-deletes-per-writer N]"
 }

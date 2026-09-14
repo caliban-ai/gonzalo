@@ -3,6 +3,10 @@
 //! chaos, and check the [`oracle`]. Used by the bounded gate (`tests/ha_soak.rs`)
 //! and, with a longer chaos loop, by the `gonzalo-soak` binary.
 //!
+//! After each round the harness reads every lifecycle key from **every** replica
+//! (`workload::collect_lifecycle`), so the oracle can check that the replicas agree
+//! on which keys are deleted (#203).
+//!
 //! [`workload`]: crate::workload
 //! [`oracle`]: crate::oracle
 
@@ -57,6 +61,7 @@ pub async fn run_rounds(
     for r in 0..rounds {
         let mut cfg = base_cfg.clone();
         cfg.collection = format!("{}-r{r}", base_cfg.collection);
+        let round_cfg = cfg.clone();
 
         let workload_task = {
             let d = dispatcher.clone();
@@ -73,9 +78,13 @@ pub async fn run_rounds(
             set.respawn(victim).await?;
         }
 
-        let stats = workload_task
+        let mut stats = workload_task
             .await
             .map_err(|e| format!("workload task panicked: {e}"))?;
+        // Settled: the writers have stopped and the victim answered /readyz again,
+        // so every replica is live. The replicas front one shared bucket, so there
+        // is no replication lag to wait out. Read every replica directly.
+        stats.lifecycle = workload::collect_lifecycle(dispatcher.replicas(), &round_cfg).await;
         let violations = oracle::check(&stats);
         outcomes.push(SoakOutcome { stats, violations });
     }
