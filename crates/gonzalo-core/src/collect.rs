@@ -14,7 +14,8 @@ use std::time::Duration;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[must_use = "a CollectReport may list conflicts (keys recreated during collection)"]
 pub struct CollectReport {
-    /// Tombstones physically removed, in `list_raw` order.
+    /// Tombstones purged by this run, including any found already gone when
+    /// purged.
     pub purged: Vec<RecordKey>,
     /// Tombstones kept because they have no `deleted_at`.
     pub unstamped: usize,
