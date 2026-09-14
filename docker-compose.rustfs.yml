@@ -11,6 +11,11 @@
 # Brought up on demand by scripts/rustfs-up.sh.
 services:
   rustfs:
+    # Minimum rustfs/rustfs:1.0.0-rc.6. gonzalo#203's purge relies on an atomic
+    # conditional DeleteObject (If-Match); 1.0.0-beta.8 is not atomic (it checks
+    # If-Match on arrival but deletes whatever object is current when the removal
+    # lands: 197/200 violations under concurrent create vs purge, 0/200 on rc.6).
+    # Recorded in ADR 0021 (replicated deletion). Do not downgrade.
     image: rustfs/rustfs:1.0.0-rc.6
     container_name: gonzalo-soak-rustfs
     restart: "no"
