@@ -119,8 +119,8 @@ impl Service {
     }
 
     /// Delete `key` by writing a tombstone. `author`, when set, becomes the
-    /// tombstone's `meta.author`: transports pass the authenticated principal
-    /// and open mode passes `None` (ADR 0015).
+    /// tombstone's `meta.author`; transports compute it with
+    /// `Principal::delete_author` (ADR 0015, gonzalo#203).
     pub async fn delete_as(
         &self,
         key: &RecordKey,
@@ -142,7 +142,9 @@ impl Service {
         self.store.list_raw(prefix).await
     }
 
-    /// Replication write: stores `record` verbatim (never re-stamped).
+    /// Replication write: stores `record` verbatim (the revision is never
+    /// re-stamped). Authorship policy belongs to the transport (see
+    /// `put_raw_record`).
     pub async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
         self.store.put_raw(record, expected).await
     }

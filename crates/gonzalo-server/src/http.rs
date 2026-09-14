@@ -1240,9 +1240,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_open_mode_delete_keeps_a_claimed_author() {
+        // Open mode's implicit principal is an admin (`delete_author` returns
+        // the claim), so a claimed deleter is honoured, unlike the prior
+        // author kept when there is no claim at all.
+        let (svc, _d) = fs_service();
+        let auth = open();
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            None,
+            Some(put_body("memory", "client")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "DELETE",
+            LIVE,
+            None,
+            Some(delete_body_claiming("origin")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, tomb) = raw_get(&svc, &auth, RAW, None).await;
+        assert_eq!(
+            tomb.expect("tombstone").meta.author,
+            gonzalo_core::Identity::new("origin")
+        );
+    }
+
+    #[tokio::test]
     async fn http_delete_by_non_admin_ignores_a_claimed_author() {
         // A non-admin cannot forge the deleter's identity through the wire
         // field either (R1, mirrors `Principal::delete_author`).
+        //
+        // The live record is seeded by `atok` (admin), so the prior author is
+        // "admin" — distinct from both "forged" (the claim) and "writer" (the
+        // deleter). Asserting "writer" then fails if the claim is honoured
+        // ("forged") and fails if the author is left untouched ("admin"): the
+        // only way to pass is for the handler to stamp the non-admin deleter's
+        // own identity, exactly as `delete_stamps_the_deleter_on_the_tombstone`
+        // discriminates the admin branch.
         let (svc, _d) = fs_service();
         let auth = tomb_auth();
         let (s, _) = call(
@@ -1250,7 +1292,7 @@ mod tests {
             auth.clone(),
             "PUT",
             LIVE,
-            Some("wtok"),
+            Some("atok"),
             Some(put_body("memory", "client")),
         )
         .await;
