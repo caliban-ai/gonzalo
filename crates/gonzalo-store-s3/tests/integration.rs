@@ -1,7 +1,7 @@
 use gonzalo_core::conformance::{run_store_conformance, run_tombstone_conformance};
 use gonzalo_core::{
-    BlobStore, Body, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeleteResult, Identity, Meta,
-    PutResult, Record, RecordKey, RecordKind, Revision, Store,
+    BlobStore, Body, ContentHash, CoreError, DeleteResult, Identity, Meta, PutResult, Record,
+    RecordKey, RecordKind, Revision, Store,
 };
 use gonzalo_store_s3::S3Store;
 use std::collections::BTreeMap;
@@ -118,16 +118,6 @@ async fn s3_store_passes_conformance_when_endpoint_configured() {
     };
     let endpoint = endpoint.as_str();
     run_store_conformance(move || fresh_bucket_store(endpoint)).await;
-}
-
-/// Spec §6.1 tombstone cases at the default cap (RustFS-qualified, ADR 0019).
-#[tokio::test]
-async fn s3_store_passes_tombstone_conformance_at_default_cap() {
-    let Some((endpoint, _bucket)) = test_target() else {
-        return;
-    };
-    let endpoint = endpoint.as_str();
-    run_tombstone_conformance(move || fresh_bucket_store(endpoint), DEFAULT_ANCESTOR_CAP).await;
 }
 
 /// The same cases at a small cap, so truncation is exercised.

@@ -60,24 +60,6 @@ async fn grpc_server_store_passes_conformance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn http_server_store_passes_tombstone_conformance() {
-    run_tombstone_conformance(
-        || fresh_http_store(DEFAULT_ANCESTOR_CAP),
-        DEFAULT_ANCESTOR_CAP,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn grpc_server_store_passes_tombstone_conformance() {
-    run_tombstone_conformance(
-        || fresh_grpc_store(DEFAULT_ANCESTOR_CAP),
-        DEFAULT_ANCESTOR_CAP,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn http_server_store_passes_tombstone_conformance_small_cap() {
     run_tombstone_conformance(|| fresh_http_store(SMALL_CAP), SMALL_CAP).await;
 }

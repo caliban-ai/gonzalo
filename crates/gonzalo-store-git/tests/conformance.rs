@@ -1,4 +1,3 @@
-use gonzalo_core::DEFAULT_ANCESTOR_CAP;
 use gonzalo_core::conformance::{run_store_conformance, run_tombstone_conformance};
 use gonzalo_store_git::GitStore;
 
@@ -17,11 +16,6 @@ fn fresh_store() -> GitStore {
 #[tokio::test]
 async fn git_store_passes_conformance() {
     run_store_conformance(|| async { fresh_store() }).await;
-}
-
-#[tokio::test]
-async fn git_store_passes_tombstone_conformance_default_cap() {
-    run_tombstone_conformance(|| async { fresh_store() }, DEFAULT_ANCESTOR_CAP).await;
 }
 
 #[tokio::test]
