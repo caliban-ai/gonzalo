@@ -435,11 +435,11 @@ async fn main() -> Result<ExitCode> {
 
         Commands::Sync { a, b, ancestor_cap } => {
             let summary = sync_stores_with_cap(&a, &b, ancestor_cap).await?;
-            println!("copied_to_a: {}", summary.copied_to_a);
-            println!("copied_to_b: {}", summary.copied_to_b);
+            println!("copied_to_a:    {}", summary.copied_to_a);
+            println!("copied_to_b:    {}", summary.copied_to_b);
             println!("fast_forwarded: {}", summary.fast_forwarded);
-            println!("merged:      {}", summary.merged);
-            println!("conflicts:   {}", summary.conflicts);
+            println!("merged:         {}", summary.merged);
+            println!("conflicts:      {}", summary.conflicts);
         }
 
         Commands::Delete {

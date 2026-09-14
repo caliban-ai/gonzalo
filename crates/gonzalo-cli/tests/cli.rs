@@ -103,7 +103,7 @@ fn get_present_record_exits_zero_and_prints_to_stdout() {
 /// `gonzalo sync` takes its two store roots as positional arguments, and those
 /// were the one place #211's expansion did not reach. The failure was silent:
 /// syncing `~/a` and `~/b` operated on two directories that did not exist and
-/// reported `copied_to_b: 0`, which reads as "already in sync".
+/// reported `copied_to_b:    0`, which reads as "already in sync".
 ///
 /// `Command::env` sets the variable on the **child**, so this needs no
 /// `std::env::set_var` — which is `unsafe` under edition 2024 and forbidden here.
@@ -144,7 +144,7 @@ fn sync_expands_a_leading_tilde_in_both_store_roots() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("copied_to_b: 1"),
+        stdout.contains("copied_to_b:    1"),
         "sync must see store A's record through the tilde, got {stdout:?}"
     );
     assert!(

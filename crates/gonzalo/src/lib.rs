@@ -4,9 +4,9 @@
 //! selects storage substrates via Cargo features (`fs` is on by default).
 
 pub use gonzalo_core::{
-    Body, Conflict, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, MergeClass,
-    MergeOutcome, Meta, PutResult, Record, RecordKey, RecordKind, Result, Revision, Store,
-    SyncConflict, SyncReport, merge, sync,
+    Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix,
+    MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey, RecordKind, ResetReport, Result,
+    Revision, Store, SyncConflict, SyncReport, collect, merge, reset, reset_as, sync,
 };
 
 pub use gonzalo_domain::{
@@ -59,6 +59,28 @@ pub use gonzalo_ticket_asana::AsanaSource;
 
 #[cfg(feature = "knowledge")]
 pub use gonzalo_knowledge::{Hit, KnowledgeStore, knowledge_text};
+
+/// Compile-checked: the facade crate has no doctests, and no other test
+/// touches replicated deletion, so a re-export dropped from the `pub use
+/// gonzalo_core::{...}` block above (`ResetReport`, `CollectReport`,
+/// `reset`, `reset_as`, `collect`) would otherwise go unnoticed until a
+/// downstream consumer's build broke.
+#[cfg(test)]
+mod facade_reexports {
+    use super::*;
+
+    #[test]
+    fn reset_and_collect_are_re_exported() {
+        let reset_report = ResetReport::default();
+        let collect_report = CollectReport::default();
+        assert!(reset_report.deleted.is_empty());
+        assert!(collect_report.purged.is_empty());
+
+        let _reset_fn = reset;
+        let _reset_as_fn = reset_as;
+        let _collect_fn = collect;
+    }
+}
 
 #[cfg(all(test, feature = "fs"))]
 mod tests {
