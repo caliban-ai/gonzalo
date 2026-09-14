@@ -16,6 +16,14 @@ use gonzalo_soak::workload::WorkloadConfig;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ha_soak_bounded() {
     let Some(target) = S3Target::from_process_env() else {
+        // The `ha-soak` CI job sets this: there a missing target means RustFS
+        // failed to start, and skipping would be a false pass.
+        if std::env::var("GONZALO_S3_TEST_REQUIRED").as_deref() == Ok("1") {
+            panic!(
+                "GONZALO_S3_TEST_REQUIRED=1 but GONZALO_S3_TEST_ENDPOINT, GONZALO_S3_TEST_BUCKET, \
+                 AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY is unset (did scripts/rustfs-up.sh fail?)"
+            );
+        }
         eprintln!(
             "skipping ha_soak_bounded: set GONZALO_S3_TEST_ENDPOINT, GONZALO_S3_TEST_BUCKET, \
              AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (see scripts/rustfs-up.sh) to run"

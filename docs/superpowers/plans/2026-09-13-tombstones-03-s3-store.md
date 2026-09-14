@@ -11,7 +11,7 @@
 
 On a 412 (a concurrent writer won), the loop re-reads, re-plans and retries. After `MAX_WRITE_ATTEMPTS = 8` attempts it gives up with a `Backend` error. s3 then behaves exactly like the lock-based fs and git stores: the planner always decides against the true current record. The retry loop (`retry_on_lost_race`) and the plan-to-S3-action mapping (`put_step` / `delete_step` / `purge_step`) are pure, so they are unit-tested without an endpoint.
 
-**Tech Stack:** Rust 2024 (MSRV 1.95), aws-sdk-s3 1.x (`rt-tokio`, `rustls`), aws-config, tokio, async-trait, serde_json. RustFS `1.0.0-beta.8` (ADR 0019) for live tests.
+**Tech Stack:** Rust 2024 (MSRV 1.95), aws-sdk-s3 1.x (`rt-tokio`, `rustls`), aws-config, tokio, async-trait, serde_json. RustFS `1.0.0-rc.6` (ADR 0019) for live tests.
 
 **Spec:** `docs/superpowers/specs/2026-09-13-tombstone-replication-design.md` (§3.2, §3.3, §3.9, §6.1, §8.4). Shared contract: `docs/superpowers/plans/2026-09-13-tombstones-00-overview.md`, with names taken from `docs/superpowers/plans/2026-09-13-tombstones-01-core-model-and-trait.md` plus the reconciled contract changes (`put_raw`, `plan_put_raw`, `delete_as`, `author` on `tombstone_of`/`plan_delete`). ADR: `docs/adr/0019-s3-backend-qualification-rustfs.md`.
 
