@@ -135,3 +135,61 @@ async fn http_purge_by_non_admin_is_forbidden_end_to_end() {
     assert!(msg.contains("403"), "{msg}");
     assert!(!msg.contains(DAEMON_PREDATES_REPLICATION), "{msg}");
 }
+
+/// Sync against a daemon peer replicates a deletion: the tombstone crosses the
+/// wire through the raw routes (`list_raw`, `get_raw`, `put_raw`), the peer hides
+/// the key, and the pair is then in sync (gonzalo#203 §3.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_replicates_a_tombstone_to_a_daemon_peer() {
+    use gonzalo_core::{
+        Body, DeleteResult, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Revision,
+        Store, SyncReport, sync,
+    };
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = FsStore::new(dir.path());
+    let b = fresh_http_store(DEFAULT_ANCESTOR_CAP).await;
+
+    let key = RecordKey::new("testns", "testcol", "d");
+    let body = Body::Inline(b"v0\n".to_vec());
+    let record = Record {
+        revision: Revision::initial(body.bytes()),
+        parent: None,
+        body,
+        kind: RecordKind::Topic,
+        meta: Meta {
+            author: Identity::new("tester"),
+            origin_system: "test".into(),
+            created: 0,
+            updated: 0,
+            labels: BTreeMap::new(),
+        },
+        links: Vec::new(),
+        key: key.clone(),
+        ancestors: Vec::new(),
+        deleted_at: None,
+    };
+    assert!(matches!(
+        a.put(record, None).await.unwrap(),
+        PutResult::Committed(_)
+    ));
+
+    let _ = sync(&a, &b).await.unwrap();
+    assert!(b.get(&key).await.unwrap().is_some());
+
+    assert!(matches!(
+        a.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    ));
+
+    let report = sync(&a, &b).await.unwrap();
+    assert_eq!(report.fast_forwarded_to_b, vec![key.clone()]);
+    assert!(b.get(&key).await.unwrap().is_none());
+    let ta = a.get_raw(&key).await.unwrap().unwrap();
+    let tb = b.get_raw(&key).await.unwrap().unwrap();
+    assert!(tb.is_tombstone());
+    assert_eq!(tb.revision, ta.revision);
+
+    assert_eq!(sync(&a, &b).await.unwrap(), SyncReport::default());
+}
