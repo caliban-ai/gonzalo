@@ -45,6 +45,9 @@ pub(crate) enum Hook {
     /// Delete and purge the key just before its `get`, so `get` returns
     /// `None`.
     VanishBeforeGet(RecordKey),
+    /// Recreate the key as a fresh live record just before its `purge`
+    /// (collect race).
+    RecreateBeforePurge(RecordKey),
 }
 
 /// A `MemStore` that fires its [`Hook`] once, then delegates everything.
@@ -129,6 +132,16 @@ impl Store for HookedStore {
     }
 
     async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        if let Hook::RecreateBeforePurge(target) = &self.hook
+            && key == target
+            && !self.fired.swap(true, Ordering::SeqCst)
+        {
+            let fresh = rec(&key.namespace, &key.collection, &key.id, "recreated");
+            assert!(matches!(
+                self.inner.put(fresh, None).await?,
+                PutResult::Committed(_)
+            ));
+        }
         self.inner.purge(key, expected).await
     }
 }
