@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, Record,
-    RecordKey, Result, Revision, decode_segment, object_key, store::Conflict,
+    BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
+    KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, decode_segment,
+    object_key, store::Conflict, validate_ancestor_cap,
 };
 
 /// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
@@ -16,6 +17,9 @@ const BLOB_PREFIX: &str = "blobs/";
 pub struct S3Store {
     client: Client,
     bucket: String,
+    /// Maximum `Record::ancestors` length kept on every committed write
+    /// (spec §3.9). Defaults to [`DEFAULT_ANCESTOR_CAP`].
+    cap: usize,
 }
 
 impl S3Store {
@@ -25,7 +29,14 @@ impl S3Store {
         Self {
             client,
             bucket: bucket.into(),
+            cap: DEFAULT_ANCESTOR_CAP,
         }
+    }
+
+    /// Override the ancestor cap (spec §3.9). A cap of `0` is rejected.
+    pub fn with_ancestor_cap(mut self, cap: usize) -> Result<Self> {
+        self.cap = validate_ancestor_cap(cap)?;
+        Ok(self)
     }
 
     /// Connect using the ambient AWS config (env, profile, IRSA, etc.). If
@@ -100,15 +111,16 @@ enum Precondition {
     IfMatch(String),
 }
 
-/// Map `(expected, etag)` to the write precondition. A create (`expected =
-/// None`) requires the object to still be absent; an update (`expected =
-/// Some`, so the object was read with an `etag`) requires that exact ETag. The
-/// business-level OCC check runs first, so the `Some`-without-etag case can't
-/// reach here; `IfAbsent` is a safe total default for it.
-fn precondition(expected: &Option<Revision>, etag: Option<&str>) -> Precondition {
-    match (expected, etag) {
-        (Some(_), Some(tag)) => Precondition::IfMatch(tag.to_string()),
-        _ => Precondition::IfAbsent,
+/// Map the ETag read for the object to the write precondition. If an object
+/// was read (a live record *or a tombstone*), the write must replace exactly
+/// that version (`If-Match`). If none was read, it must still be absent
+/// (`If-None-Match: *`). This depends on what's stored, not on the caller's
+/// `expected`: recreation is `put(_, None)` over an existing tombstone object,
+/// so keying off `expected` would pick `IfAbsent` and fail with 412 every time.
+fn precondition(etag: Option<&str>) -> Precondition {
+    match etag {
+        Some(tag) => Precondition::IfMatch(tag.to_string()),
+        None => Precondition::IfAbsent,
     }
 }
 
@@ -116,6 +128,136 @@ fn precondition(expected: &Option<Revision>, etag: Option<&str>) -> Precondition
 /// i.e. a concurrent writer won the race, which OCC surfaces as a `Conflict`.
 fn is_precondition_failed(code: Option<&str>) -> bool {
     matches!(code, Some("PreconditionFailed"))
+}
+
+/// Whether a conditional record write lost to a change made after our read:
+/// a failed precondition (412), a conflicting in-flight conditional write
+/// (409), or the object vanishing (a concurrent purge). Each re-reads and
+/// re-plans in `write_planned`.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_lost_race(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("PreconditionFailed" | "ConditionalRequestConflict" | "NoSuchKey")
+    )
+}
+
+/// Consumer view of a raw read: a tombstone reads as absent (spec §3.2).
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn visible(record: Option<Record>) -> Option<Record> {
+    record.filter(|r| !r.is_tombstone())
+}
+
+/// Whether consumer `list` includes a key, given the raw read of its object.
+/// Tombstones and keys purged since the listing (NotFound) are excluded. An
+/// object that fails to decode stays listed, so `get` on that key surfaces the
+/// error. Any other read error (network, 5xx, permission) fails the whole
+/// `list`: on s3 it may be transient, and listing a key that may be a
+/// tombstone would be wrong. fs and git differ: they keep every unreadable
+/// entry listed.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn listed_as_live(read: Result<Option<Record>>) -> Result<bool> {
+    match read {
+        Ok(record) => Ok(visible(record).is_some()),
+        Err(CoreError::Serde(_)) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// One planner decision, translated into the S3 action that carries it out
+/// and the answer to return once that action lands.
+// `Record` is the natural payload for a write step; boxing it would ripple
+// through every `*_step` signature for no benefit at this call volume.
+#[allow(clippy::large_enum_variant)]
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum Planned<T> {
+    /// No write needed; return this answer.
+    Finish(T),
+    /// `PutObject` this record under [`precondition`], then return the answer.
+    Put(Record, T),
+    /// `DeleteObject` with `If-Match` on the read ETag, then return the answer.
+    Remove(T),
+}
+
+/// Translate a [`PutPlan`] (from `plan_put` or `plan_put_raw`).
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn put_step(key: &RecordKey, plan: PutPlan) -> Result<Planned<PutResult>> {
+    match plan {
+        PutPlan::Write(record) => {
+            let committed = PutResult::Committed(record.revision.clone());
+            Ok(Planned::Put(record, committed))
+        }
+        PutPlan::Conflict(conflict) => Ok(Planned::Finish(PutResult::Conflict(conflict))),
+        PutPlan::NotFound => Err(CoreError::NotFound(key.clone())),
+        // Only consumer `plan_put` produces this, for a `RecordKind::Tombstone`
+        // record: deletes go through `delete_as`, replication through `put_raw`.
+        PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
+    }
+}
+
+/// Translate a [`DeletePlan`]: a tombstone is written with `PutObject`.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn delete_step(plan: DeletePlan) -> Planned<DeleteResult> {
+    match plan {
+        DeletePlan::Write(tombstone) => Planned::Put(tombstone, DeleteResult::Deleted),
+        DeletePlan::Noop => Planned::Finish(DeleteResult::Deleted),
+        DeletePlan::Conflict(conflict) => Planned::Finish(DeleteResult::Conflict(conflict)),
+    }
+}
+
+/// Translate a [`PurgePlan`]: the only plan that physically removes an object.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+fn purge_step(plan: PurgePlan) -> Planned<DeleteResult> {
+    match plan {
+        PurgePlan::Remove => Planned::Remove(DeleteResult::Deleted),
+        PurgePlan::Noop => Planned::Finish(DeleteResult::Deleted),
+        PurgePlan::Conflict(conflict) => Planned::Finish(DeleteResult::Conflict(conflict)),
+    }
+}
+
+/// Most read → plan → conditional-write attempts one call makes before giving
+/// up on a key that other writers keep changing underneath it.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_WRITE_ATTEMPTS: usize = 8;
+
+/// Result of one attempt: finished with an answer, or lost the race (412) and
+/// must re-read and re-plan.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum Step<T> {
+    Done(T),
+    Retry,
+}
+
+/// Run `attempt` until it finishes, at most [`MAX_WRITE_ATTEMPTS`] times. An
+/// error from an attempt ends the loop immediately. Each retry re-reads and
+/// re-plans, so the planner always decides against the true current record,
+/// just as it does under the fs and git stores' locks.
+// Wired into the conditional record writes in the next change (gonzalo#203 slice 3 Task 3).
+#[cfg_attr(not(test), allow(dead_code))]
+async fn retry_on_lost_race<T, F, Fut>(key: &RecordKey, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Step<T>>>,
+{
+    for _ in 0..MAX_WRITE_ATTEMPTS {
+        if let Step::Done(value) = attempt().await? {
+            return Ok(value);
+        }
+    }
+    Err(CoreError::Backend(format!(
+        "s3: conditional write for {key} lost {MAX_WRITE_ATTEMPTS} consecutive races"
+    )))
 }
 
 /// Decide the continuation token for the next `list_objects_v2` page, driving
@@ -163,7 +305,7 @@ impl gonzalo_core::Store for S3Store {
             .bucket(&self.bucket)
             .key(object_key(&record.key))
             .body(bytes.into());
-        req = match precondition(&expected, current.as_ref().map(|(_, tag)| tag.as_str())) {
+        req = match precondition(current.as_ref().map(|(_, tag)| tag.as_str())) {
             Precondition::IfAbsent => req.if_none_match("*"),
             Precondition::IfMatch(tag) => req.if_match(tag),
         };
@@ -488,26 +630,286 @@ mod tests {
         assert_eq!(parse_object_key("a/b/c/d.json"), None);
     }
 
-    fn rev() -> Revision {
-        Revision::initial(b"x")
+    use gonzalo_core::store::Conflict;
+    use gonzalo_core::{Body, Identity, Meta, RecordKind, plan_put, tombstone_of};
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+
+    fn live(key: &RecordKey, payload: &[u8]) -> Record {
+        Record {
+            key: key.clone(),
+            kind: RecordKind::Topic,
+            revision: Revision::initial(payload),
+            parent: None,
+            body: Body::Inline(payload.to_vec()),
+            meta: Meta {
+                author: Identity::new("tester"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+        }
     }
+
+    fn tomb(key: &RecordKey, payload: &[u8]) -> Record {
+        tombstone_of(&live(key, payload), 1_000, DEFAULT_ANCESTOR_CAP, None)
+    }
+
+    fn conflict(key: &RecordKey) -> Box<Conflict> {
+        Box::new(Conflict {
+            key: key.clone(),
+            expected: Some(Revision::initial(b"stale")),
+            current: live(key, b"current"),
+        })
+    }
+
+    /// An `S3Store` that never touches the network: building a client does no
+    /// I/O, so the builder can be unit-tested without an endpoint.
+    fn offline_store() -> S3Store {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        S3Store::new(Client::from_conf(conf), "offline")
+    }
+
+    // ---- preconditions ----
 
     #[test]
     fn create_uses_if_absent() {
-        // expected = None → create-only, regardless of any etag.
-        assert_eq!(precondition(&None, None), Precondition::IfAbsent);
-        assert_eq!(
-            precondition(&None, Some("\"etag\"")),
-            Precondition::IfAbsent
-        );
+        // No object was read → create-only.
+        assert_eq!(precondition(None), Precondition::IfAbsent);
     }
 
     #[test]
     fn update_uses_if_match_on_the_read_etag() {
         assert_eq!(
-            precondition(&Some(rev()), Some("\"abc123\"")),
+            precondition(Some("\"abc123\"")),
             Precondition::IfMatch("\"abc123\"".to_string())
         );
+    }
+
+    #[test]
+    fn recreation_over_tombstone_uses_if_match() {
+        // `put(record, None)` over a tombstone is a recreation the planner
+        // writes. The tombstone object exists, so the write must be `If-Match`
+        // on its ETag. `If-None-Match: *` would 412 on every attempt.
+        let k = RecordKey::new("ns", "col", "recreate");
+        let plan = plan_put(
+            Some(&tomb(&k, b"old")),
+            live(&k, b"new"),
+            None,
+            DEFAULT_ANCESTOR_CAP,
+        );
+        assert!(matches!(plan, PutPlan::Write(_)));
+        assert_eq!(
+            precondition(Some("\"tomb-etag\"")),
+            Precondition::IfMatch("\"tomb-etag\"".to_string())
+        );
+    }
+
+    // ---- consumer read filtering ----
+
+    #[test]
+    fn visible_hides_tombstones_and_keeps_live() {
+        let k = RecordKey::new("ns", "col", "vis");
+        assert_eq!(visible(None), None);
+        assert_eq!(visible(Some(tomb(&k, b"x"))), None);
+        let rec = live(&k, b"x");
+        assert_eq!(visible(Some(rec.clone())), Some(rec));
+    }
+
+    #[test]
+    fn list_filter_excludes_tombstones_and_vanished_keys() {
+        let k = RecordKey::new("ns", "col", "listed");
+        assert!(listed_as_live(Ok(Some(live(&k, b"x")))).unwrap());
+        assert!(!listed_as_live(Ok(Some(tomb(&k, b"x")))).unwrap());
+        // Purged between the listing and the read.
+        assert!(!listed_as_live(Ok(None)).unwrap());
+    }
+
+    #[test]
+    fn list_filter_keeps_undecodable_objects_and_propagates_backend_errors() {
+        // An object that fails to decode stays listed; `get` surfaces the error.
+        // Any other read error fails the list (s3 rule; fs and git keep such
+        // entries listed).
+        assert!(listed_as_live(Err(CoreError::Serde("bad json".into()))).unwrap());
+        assert!(matches!(
+            listed_as_live(Err(CoreError::Backend("503".into()))),
+            Err(CoreError::Backend(_))
+        ));
+    }
+
+    // ---- plan → S3 action ----
+
+    #[test]
+    fn put_step_writes_and_commits_the_planned_revision() {
+        let k = RecordKey::new("ns", "col", "put-write");
+        let rec = live(&k, b"v");
+        match put_step(&k, PutPlan::Write(rec.clone())) {
+            Ok(Planned::Put(stored, answer)) => {
+                assert_eq!(answer, PutResult::Committed(rec.revision.clone()));
+                assert_eq!(stored, rec);
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_step_finishes_on_conflict() {
+        let k = RecordKey::new("ns", "col", "put-conflict");
+        match put_step(&k, PutPlan::Conflict(conflict(&k))) {
+            Ok(Planned::Finish(PutResult::Conflict(c))) => assert_eq!(c, conflict(&k)),
+            other => panic!("expected Finish(Conflict), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_step_maps_not_found_to_error() {
+        let k = RecordKey::new("ns", "col", "put-missing");
+        match put_step(&k, PutPlan::NotFound) {
+            Err(CoreError::NotFound(got)) => assert_eq!(got, k),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_step_maps_rejected_to_backend_error() {
+        let k = RecordKey::new("ns", "col", "put-rejected");
+        let reason = gonzalo_core::CONSUMER_TOMBSTONE_REJECTED;
+        match put_step(&k, PutPlan::Rejected(reason)) {
+            Err(CoreError::Backend(msg)) => assert_eq!(msg, reason),
+            other => panic!("expected Backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_step_maps_each_plan() {
+        let k = RecordKey::new("ns", "col", "del");
+        let t = tomb(&k, b"x");
+        assert_eq!(
+            delete_step(DeletePlan::Write(t.clone())),
+            Planned::Put(t, DeleteResult::Deleted)
+        );
+        assert_eq!(
+            delete_step(DeletePlan::Noop),
+            Planned::Finish(DeleteResult::Deleted)
+        );
+        assert_eq!(
+            delete_step(DeletePlan::Conflict(conflict(&k))),
+            Planned::Finish(DeleteResult::Conflict(conflict(&k)))
+        );
+    }
+
+    #[test]
+    fn purge_step_maps_each_plan() {
+        let k = RecordKey::new("ns", "col", "purge");
+        assert_eq!(
+            purge_step(PurgePlan::Remove),
+            Planned::Remove(DeleteResult::Deleted)
+        );
+        assert_eq!(
+            purge_step(PurgePlan::Noop),
+            Planned::Finish(DeleteResult::Deleted)
+        );
+        assert_eq!(
+            purge_step(PurgePlan::Conflict(conflict(&k))),
+            Planned::Finish(DeleteResult::Conflict(conflict(&k)))
+        );
+    }
+
+    // ---- lost-race classification ----
+
+    #[test]
+    fn lost_race_covers_412_409_and_vanished_objects() {
+        assert!(is_lost_race(Some("PreconditionFailed")));
+        assert!(is_lost_race(Some("ConditionalRequestConflict")));
+        assert!(is_lost_race(Some("NoSuchKey")));
+        assert!(!is_lost_race(Some("AccessDenied")));
+        assert!(!is_lost_race(None));
+    }
+
+    // ---- lost-race retry loop ----
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        let k = RecordKey::new("ns", "col", "hot");
+        let calls = Cell::new(0usize);
+        let calls_ref = &calls;
+        let out: Result<()> = retry_on_lost_race(&k, move || async move {
+            calls_ref.set(calls_ref.get() + 1);
+            Ok(Step::Retry)
+        })
+        .await;
+        assert_eq!(calls.get(), MAX_WRITE_ATTEMPTS);
+        assert_eq!(MAX_WRITE_ATTEMPTS, 8);
+        match out {
+            Err(CoreError::Backend(msg)) => assert_eq!(
+                msg,
+                format!("s3: conditional write for {k} lost 8 consecutive races")
+            ),
+            other => panic!("expected Backend error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_returns_as_soon_as_an_attempt_lands() {
+        // Losing every attempt but the last still succeeds, with no extra call.
+        let k = RecordKey::new("ns", "col", "warm");
+        let calls = Cell::new(0usize);
+        let calls_ref = &calls;
+        let out = retry_on_lost_race(&k, move || async move {
+            calls_ref.set(calls_ref.get() + 1);
+            if calls_ref.get() < MAX_WRITE_ATTEMPTS {
+                Ok(Step::Retry)
+            } else {
+                Ok(Step::Done("landed"))
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), "landed");
+        assert_eq!(calls.get(), MAX_WRITE_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn retry_propagates_errors_without_retrying() {
+        let k = RecordKey::new("ns", "col", "broken");
+        let calls = Cell::new(0usize);
+        let calls_ref = &calls;
+        let out: Result<()> = retry_on_lost_race(&k, move || async move {
+            calls_ref.set(calls_ref.get() + 1);
+            Err(CoreError::Backend("access denied".into()))
+        })
+        .await;
+        assert!(matches!(out, Err(CoreError::Backend(m)) if m == "access denied"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    // ---- ancestor cap ----
+
+    #[tokio::test]
+    async fn new_store_uses_default_ancestor_cap() {
+        assert_eq!(offline_store().cap, DEFAULT_ANCESTOR_CAP);
+    }
+
+    #[tokio::test]
+    async fn with_ancestor_cap_sets_cap() {
+        match offline_store().with_ancestor_cap(3) {
+            Ok(store) => assert_eq!(store.cap, 3),
+            Err(e) => panic!("cap 3 must be accepted: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_ancestor_cap_rejects_zero() {
+        assert!(matches!(
+            offline_store().with_ancestor_cap(0),
+            Err(CoreError::Backend(_))
+        ));
     }
 
     #[test]
