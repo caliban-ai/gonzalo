@@ -112,6 +112,10 @@ If any are missing, stop: an earlier slice has not merged.
 3. **gRPC `GetRaw`/`ListRaw`/`PutRaw` reuse `GetRequest`/`GetResponse`, `ListRequest`/`ListResponse` and `PutRequest`/`PutResponse`.** The shapes are identical, and the graph RPCs already share `GraphQueryRequest`. Only `Purge` gets new messages, because its `expected_json` is a required `Revision`. HTTP `PUT /v1/raw/records/...` reuses `PutBody`/`PutOutcome`.
 4. **Purge authorizes before it parses.** HTTP takes the body as `Bytes` and deserializes after the admin check. gRPC calls `authorize_admin` before `serde_json::from_slice`. This is the #146 rule already applied at `grpc.rs:128-138`.
 5. **Delete stamps the deleter.** Both delete handlers call `Service::delete_as(key, expected, author)`, where `author = principal.is_authenticated().then(|| Identity::new(principal.name()))`. Open mode passes `None`, and the tombstone keeps the prior author, just as open-mode `put` leaves the author untouched (`http.rs:161-165`). `ServerStore::delete_as` ignores its `author` argument, because the daemon stamps from the bearer token, which a client cannot forge.
+   - **Superseded by pre-flight Ruling Q1(a)** (spec §3.6 as amended in 4355f4d). The delete wire carries a claimed deleter: HTTP `DeleteBody.author`, and gRPC `DeleteRequest.author_json`, where empty means none. `ServerStore::delete_as` sends it. Both handlers stamp `Principal::delete_author(claimed)`, which follows these rules:
+     - A non-admin is always stamped as itself.
+     - An admin keeps the claim; with no claim, it is stamped as itself.
+     - Open mode keeps the claim; with no claim, it stamps `None`.
 6. **`put_raw` keeps authorship unforgeable (ADR 0015).** Authorization is `Access::Write` on the record's namespace, with the same URL-path/body-key agreement check as consumer `put` (#158). The author rule is:
    - Principal is **not** an admin (`!principal.is_admin()`): `record.meta.author` is restamped to the principal's identity, exactly as consumer `put` does. A namespace writer cannot forge authorship through the raw route.
    - Principal **is** an admin: the replicated record's author is kept. **An admin token is the replication credential**: daemon-to-daemon and operator replication run with one, and replication must carry the original writer.
@@ -2026,7 +2030,7 @@ Claude-Session: https://claude.ai/code/session_019C89EVJgoefhAmPcrbP4eu"
 - Produces:
   - `pub const gonzalo_store_server::DAEMON_PREDATES_REPLICATION: &str = "daemon predates replication reads (gonzalo#203); upgrade gonzalod";`
   - `impl Store for ServerStore`: real `get_raw`, `list_raw`, `put_raw` and `purge` on both transports. HTTP `404` or gRPC `Code::Unimplemented` → `CoreError::Backend(DAEMON_PREDATES_REPLICATION.into())`.
-  - `delete_as` sends the delete and **ignores `author`**, because the daemon stamps from the bearer token.
+  - `delete_as` sends the delete and **ignores `author`**, because the daemon stamps from the bearer token. *Superseded by Ruling Q1(a) (spec §3.6 as amended in 4355f4d): `delete_as` sends its author, and the daemon applies `Principal::delete_author`.*
   - `put`/`put_raw`: HTTP `412` or gRPC `FailedPrecondition` → `CoreError::NotFound(record.key)`.
 
 - [ ] **Step 1: Add dev-dependencies**
@@ -3267,7 +3271,7 @@ Slice 4 of the tombstones plan (`docs/superpowers/plans/2026-09-13-tombstones-04
   - Raw reads need `read` on the namespace; unscoped `list_raw` needs `read` on `*`, like `/v1/keys`.
   - `put_raw` needs `write`. It **keeps the incoming author only for an admin** (the replication credential; open mode counts as admin) and restamps any other principal, like `put`, so authorship stays unforgeable.
   - Purge needs a full admin via the new `Principal::is_admin`, and authorizes before it parses its body (#146).
-- **Deletes are stamped:** both transports call `Service::delete_as` with the authenticated principal; open mode passes `None`.
+- **Deletes are stamped:** both transports call `Service::delete_as` with `Principal::delete_author(claimed)`. A non-admin is always stamped as itself. An admin or open mode may name the deleter (HTTP `DeleteBody.author`, gRPC `DeleteRequest.author_json`). With no name, an admin is stamped as itself and open mode stamps `None`. `ServerStore::delete_as` sends its author. (Ruling Q1(a), which supersedes the original "open mode passes `None`" wording.)
 - **Put `NotFound`** now crosses the wire as `412` / `FailedPrecondition` and returns to the client as `CoreError::NotFound`, instead of an opaque `500`.
 - **`ServerStore`:** real `get_raw`/`list_raw`/`put_raw`/`purge` on both transports. HTTP 404 or gRPC `Unimplemented` returns `daemon predates replication reads (gonzalo#203); upgrade gonzalod`, with **no fallback** to consumer routes (a wiremock test fails on any consumer hit).
 - **`gonzalod`:** `GONZALO_ANCESTOR_CAP`, applied to the fs and s3 backing stores.
@@ -3297,7 +3301,7 @@ Expected: PR URL printed. Wait for CI green, then merge (never push to `main`).
    - `gonzalo_server::ancestor_cap_from_env(get) -> Result<usize, String>`
 2. **Wire mapping for `CoreError::NotFound` on put** (decision 7): HTTP `412` / gRPC `FailedPrecondition`, both put routes. Without it, slice 1's `put_some_over_tombstone_is_not_found` fails over the daemon. Consumer `PUT /v1/records` previously answered `500` for this error.
 3. **`put_raw` authorship (coordinator decision):** ADR 0015's unforgeable-authorship invariant holds. Non-admin raw writes are restamped with the principal. Admin raw writes, including open mode, keep the incoming author, because an admin token is the replication credential. ADR 0021 (slice 7) should state that replication between daemons requires an admin token to preserve authors.
-4. **`ServerStore::delete_as` ignores `author`:** attribution over the daemon always comes from the bearer token.
+4. **`ServerStore::delete_as` sends its author** (Ruling Q1(a), which supersedes the original "ignores `author`"). It goes in HTTP `DeleteBody.author` and gRPC `DeleteRequest.author_json`, where an empty value means none. The daemon stamps `Principal::delete_author(claimed)`. A non-admin is always stamped as itself. An admin, or any open-mode caller, may name the deleter; with no name, an admin is stamped as itself and open mode stamps `None`. ADR 0021 should state this next to note 3, so operators know an admin token can attribute tombstones.
 
 ## Self-Review
 
