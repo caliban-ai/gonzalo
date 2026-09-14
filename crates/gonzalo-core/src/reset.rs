@@ -13,7 +13,8 @@ use crate::{CoreError, DeleteResult, Identity, KeyPrefix, RecordKey, Result, Sto
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[must_use = "a ResetReport may list conflicted keys that were not deleted"]
 pub struct ResetReport {
-    /// Keys tombstoned by this run, in `list` order.
+    /// Keys tombstoned by this run, including any found already deleted at
+    /// delete time, in `list` order.
     pub deleted: Vec<RecordKey>,
     /// Keys edited between this run's `get` and its `delete`. Left live, not
     /// retried. Run reset again to delete them.

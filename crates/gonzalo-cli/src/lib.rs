@@ -119,7 +119,7 @@ pub async fn migrate(
             parent: None,
             body,
             meta: Meta {
-                author: Identity::new("gonzalo-cli"),
+                author: Identity::new(CLI_AUTHOR),
                 origin_system: "migrate".into(),
                 created: 0,
                 updated: 0,
@@ -1007,11 +1007,10 @@ pub enum DeleteOutcome {
     Conflict { current: Revision },
 }
 
-/// The identity the CLI stamps on records it writes. Matches `migrate`
-/// (`Identity::new("gonzalo-cli")` above) and the `ticket sync --author`
-/// default. The CLI opens only `FsStore`, which honours a named deleter; over
-/// a daemon, spec §3.6 applies instead and a non-admin token is stamped as
-/// itself.
+/// The identity the CLI stamps on records it writes. Matches `migrate` above
+/// (which uses this constant) and the `ticket sync --author` default. The CLI
+/// opens only `FsStore`, which honours a named deleter; over a daemon, spec
+/// §3.6 applies instead and a non-admin token is stamped as itself.
 pub const CLI_AUTHOR: &str = "gonzalo-cli";
 
 /// Delete one record by writing a tombstone attributed to [`CLI_AUTHOR`]
