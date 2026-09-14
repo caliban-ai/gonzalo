@@ -58,8 +58,9 @@ pub struct SyncReport {
 /// pass's best-effort report.
 const MAX_SYNC_PASSES: usize = 16;
 
-/// Reconcile stores `a` and `b`. After a clean run (no `conflicts`), both
-/// stores hold the same record (live or tombstone) for every key.
+/// Reconcile stores `a` and `b`. After a run with no `conflicts` that did not
+/// exhaust [`MAX_SYNC_PASSES`], both stores hold the same record (live or
+/// tombstone) for every key.
 ///
 /// Stores need not be quiescent. A single pass can lose a write that lands in
 /// the read→merge→write window (the OCC `put_raw` returns `Conflict`, or
@@ -305,7 +306,8 @@ mod tests {
     enum Race {
         /// One spurious `Conflict` on the first conditional write per key.
         FlakyOnce(Mutex<HashSet<RecordKey>>),
-        /// Every write conflicts, except a create into a raw-absent key.
+        /// Every write conflicts, except a create into a raw-absent key. A
+        /// conditional write to a raw-absent key returns `Err(NotFound)`.
         Always,
         /// The first unconditional `put_raw` for this tombstone's key commits
         /// the tombstone first (a third peer's delete arriving mid-copy). Raw
@@ -825,6 +827,10 @@ mod tests {
             tomb.revision
         );
         assert!(a.get(&k("d")).await.unwrap().is_none(), "never copied back");
+        assert_eq!(
+            a.get_raw(&k("d")).await.unwrap().unwrap().revision,
+            tomb.revision
+        );
     }
 
     #[tokio::test]
@@ -876,6 +882,34 @@ mod tests {
             tomb.revision
         );
         assert_eq!(b.get(&k("d")).await.unwrap().unwrap().revision, edited);
+    }
+
+    #[tokio::test]
+    async fn edit_vs_concurrent_delete_on_b_is_a_conflict_and_writes_nothing() {
+        // Mirror of `delete_vs_concurrent_edit_is_a_conflict_and_writes_nothing`
+        // with the sides swapped: the edit is on A, the delete is on B. Topic is
+        // AppendOnly: if this reached the body merge it would "merge".
+        let a = MemStore::new();
+        let b = MemStore::new();
+        let r0 = commit(&a, rec("d", RecordKind::Topic, "v0\n"), None).await;
+        let _ = sync(&a, &b).await.unwrap();
+        let edited = edit(&a, "d", RecordKind::Topic, "v0\nedit\n").await;
+        let tomb = delete(&b, "d", r0).await;
+
+        let report = sync(&a, &b).await.unwrap();
+
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].key, k("d"));
+        assert!(!report.conflicts[0].a.is_tombstone());
+        assert!(report.conflicts[0].b.is_tombstone());
+        assert!(report.merged.is_empty());
+        assert!(report.fast_forwarded_to_a.is_empty() && report.fast_forwarded_to_b.is_empty());
+        // Neither store was written.
+        assert_eq!(a.get(&k("d")).await.unwrap().unwrap().revision, edited);
+        assert_eq!(
+            b.get_raw(&k("d")).await.unwrap().unwrap().revision,
+            tomb.revision
+        );
     }
 
     #[tokio::test]
@@ -1108,7 +1142,7 @@ mod tests {
         let b = RacyStore::always();
         let r0 = commit(&a, rec("d", RecordKind::Topic, "v0\n"), None).await;
         let _ = commit(&b, rec("d", RecordKind::Topic, "v0\n"), None).await;
-        let _ = delete(&a, "d", r0.clone()).await;
+        let tomb = delete(&a, "d", r0.clone()).await;
 
         // Every overwrite of B races; sync must still return.
         let report = sync(&a, &b).await.unwrap();
@@ -1116,6 +1150,10 @@ mod tests {
         assert!(report.fast_forwarded_to_b.is_empty());
         assert!(report.conflicts.is_empty());
         assert_eq!(b.get(&k("d")).await.unwrap().unwrap().revision, r0);
+        assert_eq!(
+            a.get_raw(&k("d")).await.unwrap().unwrap().revision,
+            tomb.revision
+        );
     }
 
     // ---- write helpers treat store movement as a race ----

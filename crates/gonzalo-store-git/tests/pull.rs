@@ -392,6 +392,67 @@ async fn nonff_pull_surfaces_delete_vs_edit_conflict() {
 }
 
 #[tokio::test]
+async fn pull_fast_forwards_purge() {
+    let (_r, _l, remote, local, local_path, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let t = tombstone(&remote, "m", base_rev).await;
+    assert!(matches!(
+        remote.purge(&key("m"), t.revision).await.unwrap(),
+        DeleteResult::Deleted
+    ));
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.fast_forwarded);
+    assert!(
+        local.get_raw(&key("m")).await.unwrap().is_none(),
+        "ff pull left the purged file in the worktree"
+    );
+    assert!(
+        !local
+            .list_raw(&KeyPrefix::default())
+            .await
+            .unwrap()
+            .contains(&key("m"))
+    );
+    assert!(!local_path.join("ns/col/m.json").exists());
+}
+
+#[tokio::test]
+async fn nonff_pull_surfaces_edit_vs_local_delete_conflict() {
+    // Mirror of `nonff_pull_surfaces_delete_vs_edit_conflict`: the tombstone is
+    // local and the edit is remote. Topic is AppendOnly, so without the
+    // tombstone check this would reach the body merge and resurrect the record.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+    let remote_rev = base_rev.next(b"base\nremote\n");
+    commit(
+        &remote,
+        record(
+            "m",
+            RecordKind::Topic,
+            "base\nremote\n",
+            remote_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+    let tl = tombstone(&local, "m", base_rev).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(!report.fast_forwarded);
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(report.conflicts[0].local.is_tombstone());
+    assert!(!report.conflicts[0].remote.is_tombstone());
+    assert!(report.merged.is_empty());
+    let got = local.get_raw(&key("m")).await.unwrap().unwrap();
+    assert!(got.is_tombstone(), "local tombstone kept, not resurrected");
+    assert_eq!(got.revision, tl.revision);
+}
+
+#[tokio::test]
 async fn nonff_pull_converges_concurrent_tombstones() {
     let (_r, _l, remote, local, _p, branch, base_rev) =
         cloned_base(RecordKind::Topic, "base\n").await;

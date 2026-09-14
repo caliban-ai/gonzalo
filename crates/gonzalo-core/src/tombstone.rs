@@ -689,7 +689,9 @@ pub fn tombstone_winner(a: &Record, b: &Record, cap: usize) -> Record {
 
 /// The record reconciling two diverged live records `a` and `b` into merged
 /// `body` (spec §3.4, §3.5): revision `max(counter) + 1` over `body`, parent =
-/// the higher-counter side, labels and links unioned, both chains folded.
+/// the higher-counter side, labels and links unioned, both chains folded. On a
+/// label-key collision `b` wins, and on a counter tie the parent is `a`. Sync
+/// calls this with `(a, b)`; pull calls it with `(local, remote)`.
 pub fn reconciled_record(
     a: &Record,
     b: &Record,

@@ -1997,13 +1997,13 @@ Claude-Session: https://claude.ai/code/session_019C89EVJgoefhAmPcrbP4eu"
 **Files:** none changed.
 
 **Interfaces:**
-- Consumes: Tasks 1–4 committed on branch `feat/203-tombstones-05-sync-and-pull`.
+- Consumes: Tasks 1–4 committed on branch `feat/203-tombstones-05-sync-pull`.
 - Produces: an open PR against `main`, with CI green before merge.
 
 - [ ] **Step 1: Confirm branch**
 
 Run: `git rev-parse --abbrev-ref HEAD`
-Expected: `feat/203-tombstones-05-sync-and-pull`. If this prints `main`, stop: create the branch with `git switch -c feat/203-tombstones-05-sync-and-pull` before continuing. The commits move with it.
+Expected: `feat/203-tombstones-05-sync-pull`. If this prints `main`, stop: create the branch with `git switch -c feat/203-tombstones-05-sync-pull` before continuing. The commits move with it.
 
 - [ ] **Step 2: Format check**
 
@@ -2027,13 +2027,13 @@ Expected: every `test result:` line reports `0 failed`.
 
 - [ ] **Step 6: Push**
 
-Run: `git push -u origin feat/203-tombstones-05-sync-and-pull`
-Expected: `branch 'feat/203-tombstones-05-sync-and-pull' set up to track 'origin/feat/203-tombstones-05-sync-and-pull'`.
+Run: `git push -u origin feat/203-tombstones-05-sync-pull`
+Expected: `branch 'feat/203-tombstones-05-sync-pull' set up to track 'origin/feat/203-tombstones-05-sync-pull'`.
 
 - [ ] **Step 7: Open the PR**
 
 ```bash
-gh pr create --base main --head feat/203-tombstones-05-sync-and-pull \
+gh pr create --base main --head feat/203-tombstones-05-sync-pull \
   --title "feat: tombstone-aware sync and git pull (#203, slice 5)" \
   --body "$(cat <<'EOF'
 Part of #203

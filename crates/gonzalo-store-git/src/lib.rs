@@ -274,7 +274,7 @@ fn be<E: std::fmt::Display>(e: E) -> CoreError {
 }
 
 /// Acquire the repo-level exclusive lock guarding the OCC critical section of
-/// `put`, `delete` and `purge`.
+/// `put`, `delete`, `purge` and `pull`.
 ///
 /// Unlike `FsStore`, whose per-record lock suffices, every `GitStore` write
 /// mutates the *shared* on-disk index and HEAD (via `commit_file` /
@@ -341,7 +341,9 @@ fn git_pull(root: &Path, remote: &str, branch: &str, cap: usize) -> Result<PullR
 /// the higher `(counter, hash)`; exactly one tombstone is a `PullConflict` that
 /// keeps local; two live records take gonzalo's class-aware `merge()`; a local
 /// purge against a remote edit takes the remote record. Records written into
-/// the index bypass `put_raw`, so ancestors are truncated here to `cap`.
+/// the index bypass `put_raw`, so the tombstone winner and merged record are
+/// truncated here to `cap`; records taken verbatim from the remote keep the
+/// remote's list.
 fn merge_non_ff(
     repo: &git2::Repository,
     remote: &str,
