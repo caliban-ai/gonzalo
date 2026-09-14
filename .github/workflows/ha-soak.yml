@@ -30,11 +30,24 @@ concurrency:
   group: ha-soak-${{ github.ref }}
   cancel-in-progress: true
 
+# An explicit `shell: bash` makes GitHub run every step as
+# `bash --noprofile --norc -eo pipefail {0}`. Without it the default is
+# `bash -e {0}` (no pipefail), so `rustfs-up.sh | sed >> $GITHUB_ENV` took sed's
+# exit 0 when RustFS failed to start and the job went green having tested nothing.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   ha-soak:
     name: HA soak — gonzalod replicas over RustFS
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Live-S3 tests FAIL instead of skipping when the RustFS target env is
+      # missing — this job exists to exercise RustFS, so a skip is a false pass.
+      # (Not set in ci.yml, which has no S3 and must keep skipping.)
+      GONZALO_S3_TEST_REQUIRED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
