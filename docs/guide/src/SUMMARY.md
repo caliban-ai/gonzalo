@@ -8,7 +8,10 @@
 
 # Guides
 
+- [The CLI](./cli.md)
 - [The MCP server](./mcp.md)
+- [Running gonzalod](./daemon.md)
+- [Storage backends](./storage.md)
 
 # Changelog
 
@@ -37,3 +40,4 @@
   - [ADR 0017 · Non-fast-forward git pull via content-aware merge](./adr/0017-nonff-pull-content-merge.md)
   - [ADR 0018 · Record deletion and its sync semantics](./adr/0018-record-deletion-and-sync.md)
   - [ADR 0019 · Qualified S3 backend for HA: RustFS](./adr/0019-s3-backend-qualification-rustfs.md)
+  - [ADR 0020 · Rust-native deliverables; the daemon is the non-Rust boundary](./adr/0020-rust-native-deliverables.md)
