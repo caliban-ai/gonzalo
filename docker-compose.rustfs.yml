@@ -11,7 +11,7 @@
 # Brought up on demand by scripts/rustfs-up.sh.
 services:
   rustfs:
-    image: rustfs/rustfs:1.0.0-beta.8
+    image: rustfs/rustfs:1.0.0-rc.6
     container_name: gonzalo-soak-rustfs
     restart: "no"
     environment:
