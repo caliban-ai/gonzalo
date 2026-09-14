@@ -993,6 +993,9 @@ impl Debouncer {
 pub struct SyncSummary {
     pub copied_to_a: usize,
     pub copied_to_b: usize,
+    /// Keys where one store was behind the other's revision chain and was
+    /// overwritten (both directions, tombstones included).
+    pub fast_forwarded: usize,
     pub merged: usize,
     pub conflicts: usize,
 }
@@ -1005,6 +1008,7 @@ pub async fn sync_stores(a: &Path, b: &Path) -> Result<SyncSummary> {
     Ok(SyncSummary {
         copied_to_a: report.copied_to_a.len(),
         copied_to_b: report.copied_to_b.len(),
+        fast_forwarded: report.fast_forwarded_to_a.len() + report.fast_forwarded_to_b.len(),
         merged: report.merged.len(),
         conflicts: report.conflicts.len(),
     })
@@ -1306,6 +1310,43 @@ mod tests {
         // Store B should now have the key.
         let keys = list(store_b.path(), None, None).await.unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_stores_fast_forwards_a_peer_that_is_behind() {
+        let store_a = TempDir::new().unwrap();
+        let store_b = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "note.md", "synced content");
+        migrate(
+            store_a.path(),
+            src.path(),
+            "testns",
+            "testcol",
+            RecordKind::Topic,
+        )
+        .await
+        .unwrap();
+        let _ = sync_stores(store_a.path(), store_b.path()).await.unwrap();
+
+        // A edits the record; B is now simply behind.
+        let fs_a = FsStore::new(store_a.path());
+        let key = fs_a.list(&KeyPrefix::default()).await.unwrap().remove(0);
+        let cur = fs_a.get(&key).await.unwrap().unwrap();
+        let mut next = cur.clone();
+        next.body = Body::Inline(b"synced content\nmore\n".to_vec());
+        next.revision = cur.revision.next(next.body.bytes());
+        next.parent = Some(cur.revision.clone());
+        next.ancestors = Vec::new();
+        assert!(matches!(
+            fs_a.put(next, Some(cur.revision)).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+
+        let summary = sync_stores(store_a.path(), store_b.path()).await.unwrap();
+        assert_eq!(summary.fast_forwarded, 1);
+        assert_eq!(summary.merged, 0);
+        assert_eq!(summary.conflicts, 0);
     }
 
     // ── ticket_sync: empty config → no reports ───────────────────────────────

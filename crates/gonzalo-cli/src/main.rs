@@ -362,6 +362,7 @@ async fn main() -> Result<()> {
             let summary = sync_stores(&a, &b).await?;
             println!("copied_to_a: {}", summary.copied_to_a);
             println!("copied_to_b: {}", summary.copied_to_b);
+            println!("fast_forwarded: {}", summary.fast_forwarded);
             println!("merged:      {}", summary.merged);
             println!("conflicts:   {}", summary.conflicts);
         }
