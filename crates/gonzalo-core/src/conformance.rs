@@ -676,9 +676,11 @@ async fn reset_tombstones_a_collection_and_leaves_siblings<S: Store>(store: &S) 
 
     let report = crate::reset(store, &prefix).await.unwrap();
 
-    // `list` order: MemStore's `list` walks a `BTreeMap`, so `col-a`'s ids
-    // come back sorted, and that's the order reset issues its deletes in.
-    assert_eq!(report.deleted, vec![a1.clone(), a2.clone()]);
+    // `reset` reports keys in `list` order, and `Store::list` promises no
+    // order (a filesystem walk differs by platform), so compare as sorted.
+    let mut deleted = report.deleted.clone();
+    deleted.sort();
+    assert_eq!(deleted, vec![a1.clone(), a2.clone()]);
     assert!(report.conflicts.is_empty());
 
     for k in [&a1, &a2] {
