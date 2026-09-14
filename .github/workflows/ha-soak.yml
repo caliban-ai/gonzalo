@@ -16,6 +16,9 @@ on:
       - "crates/gonzalo-soak/**"
       - "crates/gonzalo-store-s3/**"
       - "crates/gonzalo-server/**"
+      - "crates/gonzalo-core/src/tombstone.rs"
+      - "crates/gonzalo-core/src/store.rs"
+      - "crates/gonzalo-core/src/conformance.rs"
       - "docker-compose.rustfs.yml"
       - "scripts/rustfs-*.sh"
       - ".github/workflows/ha-soak.yml"
@@ -51,6 +54,14 @@ jobs:
 
       - name: Start RustFS + export the target
         run: bash scripts/rustfs-up.sh | sed 's/^export //' >> "$GITHUB_ENV"
+
+      # S3 store conformance (incl. tombstone conformance, gonzalo#203) against
+      # the qualified backend (ADR 0019). Conformance cases and the delete races
+      # create their own buckets. The blob test and the update race use the
+      # shared `soak` bucket under the `blobs/` and `race` prefixes, which the
+      # soak workload (namespace `soak`) never touches.
+      - name: S3 store conformance over RustFS
+        run: cargo test -p gonzalo-store-s3 --all-features --test integration -- --nocapture
 
       - name: Bounded HA soak gate
         run: cargo test -p gonzalo-soak --test ha_soak -- --nocapture
