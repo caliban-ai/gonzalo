@@ -4,13 +4,19 @@
 
 **Goal:** Make `sync` and non-fast-forward git `pull` replicate tombstones. They use raw reads and the in-record ancestor list to tell "behind" apart from "diverged" (spec §3.4, §3.5).
 
-**Architecture:** `sync_pass` reads through `list_raw`/`get_raw`. It classifies each two-sided key as in-sync, A-ahead, B-ahead or diverged, using `Record::ancestors`. Ahead keys are overwritten conditionally. For diverged keys: two tombstones converge on the higher `(counter, hash)`, one tombstone is a `SyncConflict`, and two live records take today's merge path with folded ancestors. `merge_non_ff` in `gonzalo-store-git` applies the same kind checks before its body comparison. Two new pure helpers in `gonzalo-core/src/tombstone.rs` (`reconciled_ancestors`, `tombstone_winner`) hold that shared logic, so sync and pull agree by construction.
+**Architecture:** `sync_pass` reads through `list_raw`/`get_raw`. It classifies each two-sided key as in-sync, A-ahead, B-ahead or diverged, using `Record::ancestors`. Ahead keys are overwritten conditionally. For diverged keys: two tombstones converge on the higher `(counter, hash)`, one tombstone is a `SyncConflict`, and two live records take today's merge path with folded ancestors. `merge_non_ff` in `gonzalo-store-git` applies the same kind checks before its body comparison. New pure helpers in `gonzalo-core/src/tombstone.rs` hold that shared logic, so sync and pull agree by construction:
+- `reconciled_ancestors`
+- `tombstone_winner`
+- `reconciled_record`, which builds the merged record for both sync's `build_merged` and git's `merged_record`. It was added by pre-flight Ruling D11.
 
 **Tech Stack:** Rust 2024 (MSRV 1.95), tokio, async-trait, serde_json, git2.
 
 **Spec:** `docs/superpowers/specs/2026-09-13-tombstone-replication-design.md` (§3.4 sync decision table, §3.5 git pull, §6.2, §6.3). The overview and shared contract are in `docs/superpowers/plans/2026-09-13-tombstones-00-overview.md`. Read both before starting.
 
 **Depends on:** slice 1 (core model, planners, `fold_ancestors`, `get_raw`/`list_raw`/`purge`, reference `MemStore`) and slice 2 (fs and git stores write tombstones and gain `cap: usize` + `with_ancestor_cap`). Both are assumed **merged to `main`**. Branch from an up-to-date `main`.
+- *As executed:* slices 1–4 were merged at `734f8cc`, and this slice runs on `feat/203-tombstones-05-sync-pull`.
+- `ServerStore`'s raw methods are real (slice 4), so sync against a daemon uses the replication routes.
+- A daemon older than slice 4 makes sync fail with `DAEMON_PREDATES_REPLICATION`, with no consumer fallback.
 
 ## Global Constraints
 
@@ -53,6 +59,10 @@
 6. **`copy` uses `put_raw(rec, None)`.** If the destination gains a record or a tombstone between sync's `get_raw` and the copy, `plan_put_raw` returns `Conflict` and nothing is written. That sets `raced` and the pass re-loops. Nothing is re-stamped, so a copy can't resurrect a record over a tombstone that arrived mid-pass. The window is closed by construction.
 7. **Race re-loop semantics are unchanged.** `MAX_SYNC_PASSES = 16`, and the report is still the *last* pass's report.
 8. **Git both-changed `(Some, None)` / `(None, Some)` (edit vs purge) keeps local, as today.** Spec §3.5 doesn't cover it, and `PullConflict` can't carry an absent side. The case is recorded under "Spec gaps" at the end and not changed here.
+   - **Superseded by pre-flight Ruling Q1(b).** Spec §3.5 was amended: `(Some, None)` keeps local; `(None, Some)` takes the remote record, with no report entry, matching sync's `(None, rb)` copy row. Before, pull silently dropped a concurrent remote edit that sync would copy back. The test is `nonff_pull_takes_remote_edit_over_local_purge`.
+   - **Also ruled at pre-flight.**
+     - Q2(a): `merge_non_ff` checks out the merged tree before moving the branch, so remote-only deletions leave the worktree.
+     - Q3(a): `git_pull` takes `lock_repo`.
 
 ## File Structure
 
@@ -2071,7 +2081,9 @@ If a check fails, fix it on the branch, re-run Steps 2–5, then push.
 
 ## Spec gaps found while planning
 
-- §3.5 doesn't cover both-sided `(Some, None)` / `(None, Some)`: edit vs purge, or purge vs edit. Current code keeps local silently, including when local purged and the remote edited. `PullConflict` can't represent an absent side. Left unchanged.
+- ~~§3.5 doesn't cover both-sided `(Some, None)` / `(None, Some)`: edit vs purge, or purge vs edit. Current code keeps local silently, including when local purged and the remote edited. `PullConflict` can't represent an absent side. Left unchanged.~~ **Resolved** by Ruling Q1(b): spec §3.5 now keeps local for `(Some, None)` and takes the remote side for `(None, Some)`.
+- §3.5 said nothing about checkout order. A non-fast-forward pull that moved HEAD before its forced checkout left remotely purged files behind as untracked. **Resolved** by Ruling Q2(a); see the §3.5 amendment.
+- A crash between `GitStore::delete_as` writing a tombstone and committing it leaves an uncommitted file that pull's forced checkout overwrites. `put` has the same gap, tracked in gonzalo#283. Pull now takes `lock_repo` (Ruling Q3(a)), which closes the in-process race but not the crash window.
 - §3.5 doesn't say that pull writes bypass `put_raw`, so the git merge path has to apply the store's cap itself (Decision 4).
 - §3.4 doesn't give a cap for `build_merged` or the tombstone winner (Decision 3).
 - §3.4 doesn't mention that a sync write can now hit `NotFound` (key purged mid-sync) or `Conflict` on a tombstone (Decision 5). It also predates `put_raw`: it describes overwrites as `put` with `expected`.
