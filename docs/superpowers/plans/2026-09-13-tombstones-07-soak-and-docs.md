@@ -23,7 +23,7 @@
 - The PR body says `Part of #203` (slice 6 closed #203).
 - Contract names are used exactly as the overview defines them: `Record::is_tombstone`, `tombstone_of`, `DEFAULT_ANCESTOR_CAP`, `Store::get_raw`, `Store::list_raw`, `Store::put_raw`, `Store::purge`, `Store::delete_as` (required), `Store::delete` (provided, `delete_as(key, expected, None)`), `gonzalo_core::reset::{reset, ResetReport}`, `gonzalo_core::collect::{collect, CollectReport}`.
 - Reconciled contract (wins over any older text in slices 1–6): `put_raw` is the replication write and never re-stamps the **revision**. The author rule is separate: through the daemon, `put_raw` from a non-admin principal restamps `meta.author` to that principal, like consumer `put`, while an admin principal (or open mode) keeps the replicated record's author. A consumer `put` or `put_raw` that the store rejects with `NotFound` returns HTTP 412 / gRPC `FailedPrecondition`, which `ServerStore` maps back to `CoreError::NotFound`. 404 is not used, because on raw routes 404 means "old daemon". A consumer `put` over a tombstone is a recreation with `expected = None` and `NotFound` with any `Some`. `delete_as` takes an optional author, which the daemon stamps from the authenticated principal. On a lost conditional write — `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey` (the object vanished to a concurrent purge) — s3 re-reads and re-plans, up to 8 attempts, then returns a `Backend` error. `gonzalod`'s cap is only the env var `GONZALO_ANCESTOR_CAP`.
-- CLI synopsis is copied from slice 6's plan: every command takes `--root`; `--expected` is revision JSON as `gonzalo get` prints it; `--older-than` accepts `Nd`/`Nh`/`Nm`/`Ns` and rejects 0; `--ancestor-cap` is per command on `delete`/`reset`/`collect`/`sync`; the CLI opens only a local `FsStore`. Exit codes: **0 success, 1 error, 2 usage, 3 conflict** (`delete`, `reset`). `collect` exits 0 even with conflicts. `gonzalo delete` attributes tombstones to `gonzalo-cli`, and `reset` tombstones carry no author. The exact synopsis and outputs are the table in Task 6's Interfaces.
+- CLI synopsis is copied from slice 6's plan: every command takes `--root`; `--expected` is revision JSON as `gonzalo get` prints it; `--older-than` accepts `Nd`/`Nh`/`Nm`/`Ns` and rejects 0; `--ancestor-cap` is per command on `delete`/`reset`/`collect`/`sync`; the CLI opens only a local `FsStore`. Exit codes: **0 success, 1 error, 2 usage, 3 conflict** (`delete`, `reset`). `collect` exits 0 even with conflicts. `gonzalo delete` and `gonzalo reset` both attribute tombstones to `gonzalo-cli`; library `reset` (and the provided `delete` it uses by default) keeps each record's own last author instead, `reset_as` names a deleter, and over a daemon spec §3.6's claimed-deleter rule applies. The exact synopsis and outputs are the table in Task 6's Interfaces.
 - Soak test doubles implement `delete_as` and `put_raw`, never `delete`, which is a provided method.
 - Tombstone hash domain string, verbatim: `gonzalo:tombstone:v1`. Default ancestor cap: `32`. `deleted_at` is ms since the Unix epoch.
 - Never give `get_raw` / `list_raw` / `purge` a default implementation, and never fall back from a raw read to a consumer read, not even in soak test doubles.
@@ -2095,8 +2095,11 @@ required delete method, and `delete` is a provided method that passes no author.
 tombstone carries the deleted record's metadata. When an author is given, it
 becomes the tombstone's author, so the record of a delete names who deleted it
 rather than who last edited it. The daemon passes the authenticated principal, as
-it already does for `put`, and `gonzalo delete` passes `gonzalo-cli`. `reset` goes
-through the provided `delete`, so its tombstones carry no author of their own.
+it already does for `put`, and `gonzalo delete` and `gonzalo reset` both pass
+`gonzalo-cli`. Library `reset` (and the provided `delete` it uses by default)
+passes no author, so it keeps each record's own last author instead; `reset_as`
+names a deleter, the same way `delete_as` does. Over a daemon, spec §3.6's
+claimed-deleter rule applies: a non-admin token is stamped as itself.
 
 Replication writes follow a separate author rule. `put_raw` never re-stamps a
 record's *revision*, but the daemon does apply ADR 0015's unforgeable authorship to
@@ -2307,7 +2310,7 @@ Claude-Session: https://claude.ai/code/session_019C89EVJgoefhAmPcrbP4eu"
 | collect: missing `--older-than`; zero, missing unit, compound or unknown unit, or overflow; `--collection` without `--namespace` | — | clap usage error | 2 |
 | any other error (I/O, store, `--ancestor-cap 0`) | — | error message | 1 |
 
-  - `delete` tombstones are attributed to author `gonzalo-cli`. `reset` tombstones carry no author, because reset goes through the provided `delete`.
+  - `delete` and `reset` tombstones are both attributed to author `gonzalo-cli` at the CLI. Library `reset` (and the provided `delete` it uses by default) keeps each record's own last author instead; `reset_as` names a deleter, and over a daemon spec §3.6's claimed-deleter rule applies: a non-admin token is stamped as itself.
   - `--older-than` is a positive integer plus exactly one unit of `d`, `h`, `m` or `s`, with no default. Without `--namespace`, collect covers the whole store.
   - `gonzalo sync <A> <B>` gains `[--ancestor-cap <K>]`.
   - `gonzalod` reads its cap only from `GONZALO_ANCESTOR_CAP`. The daemon adds `PUT /v1/raw/records/{ns}/{col}/{id}` / `PutRaw` (`write`) to the raw routes.
@@ -2741,9 +2744,12 @@ back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
   author, while admin and open mode keep the replicated author);
   `purge(key, expected)` is the only physical removal left. (#203)
 - **`Store::delete_as(key, expected, author)`** records who deleted a record as
-  the tombstone's author. The daemon passes the authenticated principal and
-  `gonzalo delete` passes `gonzalo-cli`. The provided `delete`, which `reset` uses,
-  passes none. (#203)
+  the tombstone's author. The daemon passes the authenticated principal, and
+  `gonzalo delete` and `gonzalo reset` both pass `gonzalo-cli`. The provided
+  `delete`, which library `reset` uses by default, passes no author and so keeps
+  each record's own last author instead; `reset_as` names a deleter, and over a
+  daemon spec §3.6's claimed-deleter rule applies: a non-admin token is stamped
+  as itself. (#203)
 - **Daemon routes**:
   - `GET /v1/raw/records/{ns}/{col}/{id}` and `GET /v1/raw/keys` (`read` on the namespace; admin when unscoped);
   - `PUT /v1/raw/records/{ns}/{col}/{id}` (`write` on the namespace);
