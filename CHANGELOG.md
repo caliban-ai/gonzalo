@@ -9,6 +9,172 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+**Upgrade every gonzalo binary together.** Deletion now replicates, and it does
+so with a record kind older binaries can't read. A 0.6 `gonzalo`, `gonzalod`, or
+any program built on `gonzalo-core` 0.6 that reads a store holding a tombstone
+fails on that key with a serialization error: loud, and no data is lost. The
+silent failure is worse: a 0.6 binary that runs **sync** against 0.7 data can't see
+tombstones and copies deleted records back, and nothing on the new side can tell
+that apart from a genuine recreation. Upgrade every binary that reads a store
+directly, and every binary that runs sync, at the same time. A 0.7 client
+against a 0.6 `gonzalod` keeps working for normal reads and writes, and fails
+replication reads with an explicit `upgrade gonzalod` error rather than falling
+back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
+
+### Added
+
+- **Replicated deletion.** A delete writes a tombstone (`RecordKind::Tombstone`)
+  at the record's own path, and `sync` and git `pull` propagate it, so a delete
+  on one store sticks everywhere instead of coming back on the next sync.
+  Tombstones carry `deleted_at` (ms since the Unix epoch), and records carry a
+  bounded `ancestors` list. Both are optional fields, so live records written by
+  0.7 still read on 0.6. See ADR 0021. (#203)
+- **`gonzalo delete --namespace <N> --collection <C> --id <I> [--expected <REVISION_JSON>] [--root <DIR>] [--ancestor-cap <K>]`**:
+  delete one record by writing a tombstone attributed to `gonzalo-cli`.
+  - `--expected` is the `revision` object from `gonzalo get`'s JSON output.
+  - On success, including an absent or already-deleted record, prints `deleted: N/C/I` and exits `0`.
+  - On a stale `--expected`, prints `conflict: N/C/I` and `current:  {…}` and exits `3`.
+  - Malformed `--expected` exits `2`.
+  
+  (#203)
+- **`gonzalo reset --namespace <N> [--collection <C>] [--root <DIR>] [--ancestor-cap <K>]`**:
+  tombstone every live record in a namespace or collection. It's not atomic but
+  it's safe to re-run. Prints `X deleted, M conflicts`, plus one
+  `conflict: <ns/col/id>` line per conflict on stderr. When there are conflicts,
+  it also prints a final `re-run \`gonzalo reset\` to delete the M conflicted
+  record(s)` line on stderr. Exits `0` with no conflicts and `3` with any
+  (re-run to finish). Omitting `--namespace` is a usage error (exit `2`). (#203)
+- **`gonzalo collect --older-than <DURATION> [--namespace <N> [--collection <C>]] [--root <DIR>] [--ancestor-cap <K>]`**:
+  physically purge tombstones older than a horizon **you** choose.
+  - `<DURATION>` is a positive integer plus exactly one unit of `d`, `h`, `m` or `s` (e.g. `30d`), with no default. Zero, a missing, compound or unknown unit, or overflow exits `2`, as does `--collection` without `--namespace`.
+  - It prints `horizon:`, `purged:`, `unstamped:` and `conflicts:` lines, and exits `0` even with conflicts.
+  - Purging a tombstone before every peer has synced lets the deleted record come back from that peer.
+  - Tombstones with no deletion time are never collected, and clock skew can only delay collection.
+  - The guide has a section on choosing a horizon.
+  
+  (#203)
+- **Common to `delete`, `reset` and `collect`:**
+  - `--root <DIR>` (default `.`, expands a leading `~`) and `--ancestor-cap <K>` (default 32). `0` exits `1` with `ancestor cap must be at least 1`.
+  - Exit codes: `0` success, `1` error, `2` usage error, `3` conflict (`delete` and `reset`). Each command's `--help` lists its codes.
+  - The CLI operates on a local fs store only.
+  
+  (#203)
+- **Replication surface on `Store`**: `get_raw` and `list_raw` show tombstones;
+  `put_raw(record, expected)` stores a record with its revision verbatim and never
+  re-stamps the revision (through the daemon, a non-admin caller still becomes the
+  author, while admin and open mode keep the replicated author);
+  `purge(key, expected)` is the only physical removal left. (#203)
+- **`Store::delete_as(key, expected, author)`** records who deleted a record as
+  the tombstone's author. The daemon stamps `Principal::delete_author(claimed)`:
+  a non-admin is always stamped as itself; an admin keeps a named deleter, or is
+  stamped as itself when there is none; a daemon without auth keeps a named
+  deleter, or stamps none when there is none. The HTTP `DELETE` body and the
+  gRPC `DeleteRequest` gain an optional `author` / `author_json` claim, which
+  `ServerStore::delete_as` sends. CLI `delete` and `reset` both stamp
+  `gonzalo-cli`. Library `reset`, and the provided `delete` it uses by default,
+  keep each record's own last author instead; `reset_as` names a deleter, the
+  same way `delete_as` does. (#203)
+- **Daemon routes**:
+  - `GET /v1/raw/records/{ns}/{col}/{id}` and `GET /v1/raw/keys` (`read` on the namespace; `read` on `*` when unscoped);
+  - `PUT /v1/raw/records/{ns}/{col}/{id}` (`write` on the namespace);
+  - `POST /v1/purge/{ns}/{col}/{id}` (admin);
+  - the matching `GetRaw`, `ListRaw`, `PutRaw` and `Purge` RPCs.
+  
+  (#203)
+- **Ancestor cap**: `--ancestor-cap <n>` on `gonzalo delete`, `reset`, `collect`
+  and `sync`, and the `GONZALO_ANCESTOR_CAP` environment variable on `gonzalod`,
+  set how many prior revisions a record remembers. The default is 32 and 0 is
+  rejected. Peers with different caps interoperate. (#203)
+- **`gonzalo_core::{reset, reset_as, collect, ResetReport, CollectReport}`**:
+  library reset (keeps each record's own author; `reset_as` names a deleter)
+  and explicit tombstone collection. Both stop at the first store error, and
+  re-running either afterward is safe. All five are also re-exported from the
+  `gonzalo` facade crate. (#203)
+- **`SyncReport.fast_forwarded_to_a` / `fast_forwarded_to_b`**: the keys
+  overwritten on each side because it was behind the other's ancestor chain.
+  (#203)
+
+### Changed
+
+- **Breaking: `gonzalo-core`'s `Store` trait gains required methods**
+  (`get_raw`, `list_raw`, `put_raw`, `purge`, `delete_as`), `delete` becomes a
+  provided method over `delete_as`, and `RecordKind` gains `Tombstone`, so this
+  release is 0.7.0 across the workspace. The replication methods have no default
+  implementation on purpose: `get_raw = get` would compile, pass every test that
+  doesn't delete, and resurrect records in production. Third-party `Store`
+  implementations get a compile error naming exactly what to add, and must
+  implement `delete_as` instead of `delete`. (#203)
+- **Sync copies one-sided records with `put_raw`.** A delete landing on the
+  destination between sync's read and its copy now conflicts and is resolved on
+  the next pass. Before, the copy became a recreation and brought the deleted
+  record back. (#203)
+- **s3 retries lost conditional writes.** A write that loses an `If-Match` race —
+  `PreconditionFailed` (412), `ConditionalRequestConflict` (409), or `NoSuchKey`
+  (the object vanished to a concurrent purge) — re-reads, re-plans and retries
+  up to 8 times before returning a backend error, so s3 reaches the same
+  outcomes as the lock-based fs and git stores. (#203)
+- **`Store::delete` writes a tombstone instead of removing the record.** `get`
+  and `list` hide tombstones, so applications see no difference. Deleting an
+  already-deleted or absent key is still an idempotent `Deleted`. ADR 0018's
+  local-only decision is superseded by ADR 0021, and its conflict semantics are
+  unchanged. (#203)
+- **Writing to a deleted key re-stamps the revision.** A `put` with no expected
+  revision over a tombstone stores the record with a revision one past the
+  delete, so the recreation wins over the delete when synced. `put` still returns
+  the stored revision; a caller that ignores it and reuses its own will get a
+  conflict on its next conditional write. A `put` with any expected revision over
+  a deleted key returns `NotFound`. (#203)
+- **The daemon returns 412 for a write rejected as not found.** A consumer
+  `PUT /v1/records/{ns}/{col}/{id}` (or raw `PUT`) whose expected revision the store
+  rejects with `NotFound`, such as a conditional write over a deleted key, now
+  returns HTTP 412 (gRPC `FailedPrecondition`) instead of an opaque 500
+  (`Internal`). `ServerStore` maps it back to `CoreError::NotFound`. 404 is
+  deliberately not used, because on the raw routes it signals a daemon too old to
+  serve them. (#203)
+- **Raw writes through the daemon keep ADR 0015's authorship rule.** A `put_raw`
+  from a non-admin principal has `meta.author` restamped to that principal, like a
+  consumer `put`. An admin principal, or a daemon without auth, keeps the replicated
+  record's author, so an admin token is the replication credential. The revision
+  is never re-stamped in either case. (#203)
+- **Sync fast-forwards when one side is simply behind.** Using each record's
+  ancestors, sync now overwrites the stale side instead of running a merge, and
+  reports the overwritten keys in `SyncReport.fast_forwarded_to_a` /
+  `fast_forwarded_to_b` instead of `merged`. Before, an `Opaque` kind such as
+  `Checkpoint` reported a conflict even though nothing had diverged. A delete
+  racing an edit of the same revision is reported as a `SyncConflict` with
+  neither side written. Records written before 0.7 have no ancestors and take
+  the old merge path unchanged. `gonzalo sync` now prints a `fast_forwarded: N`
+  line, and its output labels are re-aligned to the width of that line. (#203)
+- **git `pull` handles tombstones** on paths changed on both sides: concurrent
+  tombstones converge on the newer one, and delete-versus-edit is reported as a
+  `PullConflict` that keeps local. (#203)
+- **The HA soak and s3 conformance require RustFS ≥ 1.0.0-rc.6**, whose
+  conditional `DeleteObject` is atomic; earlier releases can let a purge remove
+  a concurrent recreation. `docker-compose.rustfs.yml` pins it. (#203)
+- **The HA soak adds replicated-deletion invariants.** It races deletes against
+  edits and recreations across `gonzalod` replicas under replica-kill chaos, and
+  checks that acknowledged deletes survive, that no two conditional writes
+  commit on the same base revision (`StaleBaseCommitted`), that every run
+  observes at least one delete conflict seeded deterministically so the check
+  doesn't depend on scheduling, and that every replica agrees on each
+  lifecycle key's deletion state. It now also triggers on changes to
+  `gonzalo-core` and `gonzalo-store-server`, and its timeout is 30 minutes.
+  (#203)
+
+Testing: the HA soak races deletes against edits and recreations across
+`gonzalod` replicas under replica-kill chaos, and checks that every replica
+agrees on each key's deletion state, that consumer reads match raw reads, and
+that acked deletes survive replica kills. The tombstone conformance cases run on
+fs, git, s3 and the daemon client. (#203)
+
+### Docs
+
+- ADR 0021, superseding ADR 0018's local-only deletion decision; the "Deletion,
+  reset & collection" guide page, with horizon guidance; the storage, daemon
+  and CLI guide pages updated for the replication surface and authorship
+  rules; the tombstone replication spec aligned with what shipped; the Mem0
+  parity matrix `Delete` and `reset` rows, both citing ADR 0021. (#203)
+
 ## [0.6.0] - 2026-09-10
 
 Resolution that uses what the syntax already says, and prebuilt binaries to run
