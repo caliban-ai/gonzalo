@@ -14,6 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SMALL_CAP: usize = 3;
 
 /// `(endpoint, bucket)` from the env, or `None` (skip) when unset.
+///
+/// When `GONZALO_S3_TEST_REQUIRED=1` (set by the `ha-soak` CI job) a missing
+/// target panics instead, so a RustFS that failed to start can't pass as a skip.
 fn test_target() -> Option<(String, String)> {
     match (
         std::env::var("GONZALO_S3_TEST_ENDPOINT"),
@@ -21,6 +24,12 @@ fn test_target() -> Option<(String, String)> {
     ) {
         (Ok(e), Ok(b)) => Some((e, b)),
         _ => {
+            if std::env::var("GONZALO_S3_TEST_REQUIRED").as_deref() == Ok("1") {
+                panic!(
+                    "GONZALO_S3_TEST_REQUIRED=1 but GONZALO_S3_TEST_ENDPOINT/BUCKET are unset \
+                     (did scripts/rustfs-up.sh fail?)"
+                );
+            }
             eprintln!("skipping: set GONZALO_S3_TEST_ENDPOINT and GONZALO_S3_TEST_BUCKET to run");
             None
         }
