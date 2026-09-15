@@ -70,13 +70,21 @@ audit entries needs no write access to grants.
 
 **Merge classes in sync terms.** `merge_class` is consulted only by `sync` and
 `pull`, and only after ADR 0021's ancestor check has ruled out a fast-forward;
-`put` is pure OCC for every kind.
+`put` is pure OCC for every kind. Field-level merging of a `Structured` body
+needs a real common base (git's merge base under `pull`, or a retained shared
+parent under `sync_with_ancestry`, ADR 0016); plain `sync` has no base, so
+under it every concurrent edit to one of these configuration kinds surfaces as
+a conflict rather than merging. Composite fields in the configuration kinds
+(an externally-tagged actor/origin enum, or a verified-email pair) are stored
+so they merge as a single unit rather than key by key, so a concurrent change
+to one never mixes enum variants or one side's field with the other's.
 
-- The four configuration kinds are `Structured`: separate field edits merge and
-  the same field edited two ways is a conflict. Binding one account to two
-  different people conflicts on `person`, so a wrong bind is surfaced. Two role
-  changes to one grant conflict on `role`. A `ChannelConfig`'s `repos` array
-  merges atomically, so concurrent follows conflict rather than drop one.
+- The four configuration kinds are `Structured`: with a common base, separate
+  field edits merge and the same field edited two ways is a conflict. Binding
+  one account to two different people conflicts on `person`, so a wrong bind is
+  surfaced. Two role changes to one grant conflict on `role`. A
+  `ChannelConfig`'s `repos` array merges atomically, so concurrent follows
+  conflict rather than drop one.
 - `LinkToken` is `Opaque`. A redemption descends from the revision it read, so
   sync fast-forwards a peer that still holds the unredeemed token, which stays
   consumed. Only two independent redemptions of one revision diverge, and those
@@ -144,7 +152,11 @@ new kinds.
   handle or an unverified email.
 - **Negative:** Core's closed enum now carries six kinds specific to one layer.
   Two offline peers redeeming the same token produce a conflict an operator must
-  resolve. Concurrent follows on one channel conflict instead of merging. gonzalo
+  resolve. Concurrent follows on one channel conflict instead of merging. Under
+  plain `sync` (no retained common base), every concurrent edit to a
+  configuration record — not just `repos` — is a conflict an operator or
+  consumer resolves; field-level merging only happens under `pull` or
+  `sync_with_ancestry`. gonzalo
   can't stop a writer with `fleet` write access from granting itself admin; that
   trust sits with whoever holds the token, as with any namespace. Emails and
   handles are personal data, and on the git substrate they survive in history

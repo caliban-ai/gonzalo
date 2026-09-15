@@ -7,6 +7,7 @@
 //! the two-key rule `effective = min(person_role, channel_ceiling)`. A person is
 //! never resolved by email or handle, so nothing here offers that lookup.
 
+mod atomic;
 mod audit;
 mod keys;
 mod link;

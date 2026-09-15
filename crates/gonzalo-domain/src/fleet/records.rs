@@ -55,6 +55,10 @@ pub enum BindingOrigin {
 /// Ties one external account to a person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityBinding {
+    /// Stored as a one-element array; merges atomically (ADR 0022 §"Merge
+    /// classes in sync terms") so a concurrent change doesn't mix variant
+    /// tags with `bound_by`'s other variant.
+    #[serde(with = "super::atomic")]
     pub authenticator: Authenticator,
     /// The platform's stable user id, or the OIDC `sub`. The only lookup key.
     pub subject: String,
@@ -62,8 +66,15 @@ pub struct IdentityBinding {
     pub person: String,
     /// A snapshot of the platform username, for display only.
     pub handle: Option<String>,
+    /// Stored as a one-element array; merges atomically so a concurrent
+    /// change can't pair one side's `address` with the other's `verified`.
+    #[serde(with = "super::atomic")]
     pub email: Option<VerifiedEmail>,
     pub bound_at: i64,
+    /// Stored as a one-element array; merges atomically, since this is an
+    /// externally-tagged enum and object-recursive merging of two different
+    /// variants would produce an undecodable body.
+    #[serde(with = "super::atomic")]
     pub bound_by: BindingOrigin,
 }
 impl RecordCodec for IdentityBinding {}
@@ -92,8 +103,15 @@ impl IdentityBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleGrant {
     pub person: String,
+    /// Stored as a one-element array; merges atomically, matching `role`'s
+    /// own conflict-on-divergence behaviour (ADR 0022).
+    #[serde(with = "super::atomic")]
     pub scope: GrantScope,
     pub role: FleetRole,
+    /// Stored as a one-element array; merges atomically, since this is an
+    /// externally-tagged enum and object-recursive merging of two different
+    /// variants would produce an undecodable body.
+    #[serde(with = "super::atomic")]
     pub granted_by: FleetActor,
     pub granted_at: i64,
 }
@@ -233,5 +251,204 @@ mod tests {
             c.key().unwrap(),
             RecordKey::new("fleet", "channels", "discord:42")
         );
+    }
+
+    // ---- atomic wrapper: shape and error handling (ADR 0022) ----
+
+    #[test]
+    fn atomic_wrapped_field_stores_as_one_element_array() {
+        let g = RoleGrant {
+            person: "p1".into(),
+            scope: GrantScope::Fleet,
+            role: FleetRole::Operator,
+            granted_by: FleetActor::Person("p0".into()),
+            granted_at: 1_700_000_000_000,
+        };
+        let body = g.to_body().unwrap();
+        let text = String::from_utf8(body.bytes().to_vec()).unwrap();
+        assert!(
+            text.contains(r#""granted_by":[{"#),
+            "granted_by must be stored as a one-element array, got: {text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(v["granted_by"].as_array().unwrap().len() == 1);
+        // Round-trips.
+        assert_eq!(RoleGrant::from_body(&body).unwrap(), g);
+    }
+
+    #[test]
+    fn atomic_wrapped_field_rejects_empty_and_multi_element_arrays() {
+        let g = RoleGrant {
+            person: "p1".into(),
+            scope: GrantScope::Fleet,
+            role: FleetRole::Operator,
+            granted_by: FleetActor::Person("p0".into()),
+            granted_at: 1_700_000_000_000,
+        };
+        let mut v: serde_json::Value =
+            serde_json::from_slice(g.to_body().unwrap().bytes()).unwrap();
+
+        v["granted_by"] = serde_json::json!([]);
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(
+            RoleGrant::from_body(&gonzalo_core::Body::Inline(bytes)).is_err(),
+            "an empty array must be rejected"
+        );
+
+        v["granted_by"] = serde_json::json!([{"Person": "p0"}, {"Person": "p0"}]);
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(
+            RoleGrant::from_body(&gonzalo_core::Body::Inline(bytes)).is_err(),
+            "a two-element array must be rejected"
+        );
+    }
+
+    // ---- merge-level tests: composite fields merge atomically (ADR 0022) ----
+
+    fn merge_bodies(
+        kind: RecordKind,
+        base: &gonzalo_core::Body,
+        ours: &gonzalo_core::Body,
+        theirs: &gonzalo_core::Body,
+    ) -> gonzalo_core::MergeOutcome {
+        gonzalo_core::merge(kind.merge_class(), base, ours, theirs)
+    }
+
+    #[test]
+    fn role_grant_variant_mix_on_granted_by_needs_resolution() {
+        // Base: Person; ours: Service; theirs: Unlinked. Without the atomic
+        // wrapper, core's object-recursive Structured merge would delete
+        // "Person" on both sides and add "Service" and "Unlinked", producing
+        // a two-tag body that fails to decode. Wrapped as an array, this is a
+        // genuine conflict instead.
+        let base = RoleGrant {
+            person: "p1".into(),
+            scope: GrantScope::Fleet,
+            role: FleetRole::Operator,
+            granted_by: FleetActor::Person("p0".into()),
+            granted_at: 1_700_000_000_000,
+        };
+        let mut ours = base.clone();
+        ours.granted_by = FleetActor::Service("ariel".into());
+        let mut theirs = base.clone();
+        theirs.granted_by = FleetActor::Unlinked {
+            authenticator: Authenticator::Discord,
+            subject: "1234".into(),
+        };
+
+        let outcome = merge_bodies(
+            RecordKind::RoleGrant,
+            &base.to_body().unwrap(),
+            &ours.to_body().unwrap(),
+            &theirs.to_body().unwrap(),
+        );
+        assert_eq!(outcome, gonzalo_core::MergeOutcome::NeedsResolution);
+    }
+
+    #[test]
+    fn identity_binding_email_half_mix_needs_resolution() {
+        // Base: unverified a@x. Ours changes only the address; theirs verifies
+        // it. Without the atomic wrapper, merging the object key-by-key would
+        // combine ours' `address` with theirs' `verified`, asserting a
+        // verification nobody made for that address.
+        let base = IdentityBinding {
+            authenticator: Authenticator::Discord,
+            subject: "sub-1".into(),
+            person: "p1".into(),
+            handle: None,
+            email: Some(VerifiedEmail {
+                address: "a@x".into(),
+                verified: false,
+            }),
+            bound_at: 1_700_000_000_000,
+            bound_by: BindingOrigin::Operator(FleetActor::Service("ariel".into())),
+        };
+        let mut ours = base.clone();
+        ours.email = Some(VerifiedEmail {
+            address: "b@x".into(),
+            verified: false,
+        });
+        let mut theirs = base.clone();
+        theirs.email = Some(VerifiedEmail {
+            address: "a@x".into(),
+            verified: true,
+        });
+
+        let outcome = merge_bodies(
+            RecordKind::IdentityBinding,
+            &base.to_body().unwrap(),
+            &ours.to_body().unwrap(),
+            &theirs.to_body().unwrap(),
+        );
+        assert_eq!(outcome, gonzalo_core::MergeOutcome::NeedsResolution);
+    }
+
+    #[test]
+    fn identity_binding_disjoint_atomic_fields_merge() {
+        // Ours changes only `handle`; theirs changes only `email`. Disjoint
+        // field edits still merge even though both fields are atomically
+        // wrapped.
+        let base = IdentityBinding {
+            authenticator: Authenticator::Discord,
+            subject: "sub-1".into(),
+            person: "p1".into(),
+            handle: None,
+            email: None,
+            bound_at: 1_700_000_000_000,
+            bound_by: BindingOrigin::Operator(FleetActor::Service("ariel".into())),
+        };
+        let mut ours = base.clone();
+        ours.handle = Some("ada".into());
+        let mut theirs = base.clone();
+        theirs.email = Some(VerifiedEmail {
+            address: "a@x".into(),
+            verified: true,
+        });
+
+        let outcome = merge_bodies(
+            RecordKind::IdentityBinding,
+            &base.to_body().unwrap(),
+            &ours.to_body().unwrap(),
+            &theirs.to_body().unwrap(),
+        );
+        let gonzalo_core::MergeOutcome::Merged(body) = outcome else {
+            panic!("expected a merge, got NeedsResolution");
+        };
+        let merged = IdentityBinding::from_body(&body).unwrap();
+        assert_eq!(merged.handle, Some("ada".into()));
+        assert_eq!(
+            merged.email,
+            Some(VerifiedEmail {
+                address: "a@x".into(),
+                verified: true,
+            })
+        );
+    }
+
+    #[test]
+    fn role_grant_one_sided_atomic_change_merges() {
+        // Only `ours` changed `granted_by`; theirs is unchanged from base.
+        let base = RoleGrant {
+            person: "p1".into(),
+            scope: GrantScope::Fleet,
+            role: FleetRole::Operator,
+            granted_by: FleetActor::Person("p0".into()),
+            granted_at: 1_700_000_000_000,
+        };
+        let mut ours = base.clone();
+        ours.granted_by = FleetActor::Service("ariel".into());
+        let theirs = base.clone();
+
+        let outcome = merge_bodies(
+            RecordKind::RoleGrant,
+            &base.to_body().unwrap(),
+            &ours.to_body().unwrap(),
+            &theirs.to_body().unwrap(),
+        );
+        let gonzalo_core::MergeOutcome::Merged(body) = outcome else {
+            panic!("expected a merge, got NeedsResolution");
+        };
+        let merged = RoleGrant::from_body(&body).unwrap();
+        assert_eq!(merged.granted_by, FleetActor::Service("ariel".into()));
     }
 }

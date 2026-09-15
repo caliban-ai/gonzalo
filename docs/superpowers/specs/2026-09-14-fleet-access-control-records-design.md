@@ -116,21 +116,21 @@ pub enum Authenticator { Discord, Slack, Teams, Oidc { issuer: String }, Other(S
 pub struct VerifiedEmail { pub address: String, pub verified: bool }
 
 pub struct IdentityBinding {
-    pub authenticator: Authenticator,
+    pub authenticator: Authenticator,                // stored as a one-element array; merges atomically (§6)
     pub subject: String,                             // platform user id / OIDC `sub`
     pub person: String,                              // person_id
     pub handle: Option<String>,                      // platform username snapshot
-    pub email: Option<VerifiedEmail>,                // as asserted by the authenticator
+    pub email: Option<VerifiedEmail>,                // stored as a one-element array; merges atomically (§6)
     pub bound_at: i64,
-    pub bound_by: BindingOrigin,
+    pub bound_by: BindingOrigin,                     // stored as a one-element array; merges atomically (§6)
 }
 pub enum BindingOrigin { LinkToken { token_hash: String }, Operator(FleetActor) }
 
 pub struct RoleGrant {
     pub person: String,
-    pub scope: GrantScope,
+    pub scope: GrantScope,                           // stored as a one-element array; merges atomically (§6)
     pub role: FleetRole,
-    pub granted_by: FleetActor,
+    pub granted_by: FleetActor,                      // stored as a one-element array; merges atomically (§6)
     pub granted_at: i64,
 }
 
@@ -249,11 +249,22 @@ resolves a person from `handle` or `email`.
 check: if one side's revision is in the other's `ancestors`, sync fast-forwards
 without merging. The class decides only true divergence.
 
-| Kind | Class | Divergence behaviour |
+Field-level merging of a `Structured` body needs a real common base: git's own
+merge base under `pull`, or the shared parent's retained body under
+`sync_with_ancestry` (ADR 0016). Plain `sync(a, b)` calls `sync_with_ancestry`
+with no ancestry store, so it merges against an empty body; an empty body isn't
+valid JSON, so `structured_merge` returns `NeedsResolution` for every
+divergence. In other words, plain `sync` never field-merges a `Structured`
+fleet kind — any divergence of `Person`, `IdentityBinding`, `RoleGrant` or
+`ChannelConfig` surfaces there as a `SyncConflict`. The table below describes
+divergence behaviour **given a common base**; under plain `sync`, read every
+"merges" as "conflicts" instead.
+
+| Kind | Class | Divergence behaviour (with a common base; under plain `sync`, any divergence is a `SyncConflict` instead) |
 |---|---|---|
 | `Person` | Structured | separate field edits merge; the same field edited differently conflicts |
 | `IdentityBinding` | Structured | binding one account to two different people conflicts on `person`, so a mistaken bind is surfaced, never kept silently; a `handle` refresh on one side merges with anything else |
-| `RoleGrant` | Structured | two different role changes conflict on `role`; a revoke racing an edit is a delete-versus-edit `SyncConflict` (ADR 0021) |
+| `RoleGrant` | Structured | two different role changes conflict on `role`; a revoke racing an edit is a delete-versus-edit `SyncConflict` (ADR 0021) regardless of base, since that path never reaches the body merge |
 | `ChannelConfig` | Structured | `filters` merges per key; `repos` is an array, which merges atomically, so concurrent follows on both sides conflict rather than drop one |
 | `LinkToken` | Opaque | only reachable by two independent redemptions (or edits) of one revision, which must be surfaced (§5.1) |
 | `AuditEntry` | Opaque | entries are write-once under unique keys, so divergence means a collision or tampering and is surfaced |
@@ -264,6 +275,23 @@ line: `ours`, then the lines of `theirs` past their common prefix. Two different
 single-line JSON entries at one key would merge into a two-line body that no
 longer decodes, which is the #204 hazard. `Opaque` surfaces the same situation
 instead. `TicketEvent` keeps `AppendOnly`; this spec doesn't change it.
+
+**Composite fields merge atomically.** `IdentityBinding`'s `authenticator`,
+`email` and `bound_by`, and `RoleGrant`'s `scope` and `granted_by`, are stored
+as one-element JSON arrays (`crates/gonzalo-domain/src/fleet/atomic.rs`,
+`#[serde(with = "…")]`) rather than as plain objects. `merge_value`
+(`crates/gonzalo-core/src/merge.rs`) recurses field-by-field into JSON objects
+but compares arrays whole, so without the wrapper a divergent edit to one of
+these fields would be merged key by key: an externally-tagged enum
+(`FleetActor`, `BindingOrigin`) changed to two different variants merges into a
+body with two variant tags that fails to decode, and `IdentityBinding.email`
+(`Option<VerifiedEmail>`) changed on both sides could merge one side's
+`address` with the other's `verified`, asserting a verification nobody made —
+the same family of hazard as #204. Wrapped as a one-element array, a
+concurrent change to any of these five fields conflicts instead of producing
+an undecodable or unasserted value. `LinkToken` and `AuditEntry` are never
+merged (`Opaque`), and `ChannelConfig`'s fields are already plain strings, a
+role, an array, and a consumer-defined map, so none of those need wrapping.
 
 ## 7. Core change
 
