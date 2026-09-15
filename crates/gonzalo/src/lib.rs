@@ -10,9 +10,12 @@ pub use gonzalo_core::{
 };
 
 pub use gonzalo_domain::{
-    Actor, ActorRole, BodyFormat, Checkpoint, Container, Link, LinkKind, LinkTarget, MemoryTier,
-    Priority, PriorityLevel, Provider, RecordCodec, Resolution, Session, State, StateCategory,
-    Ticket, TicketBody, TicketEvent, Topic, Turn,
+    Actor, ActorRole, AuditEntry, AuditResult, Authenticator, BindingOrigin, BodyFormat,
+    ChannelConfig, Checkpoint, Consumption, Container, FleetActor, FleetKeyError, FleetRole,
+    GrantScope, IdentityBinding, Link, LinkKind, LinkSecret, LinkSecretError, LinkTarget,
+    LinkToken, MemoryTier, Person, Priority, PriorityLevel, Provider, RecordCodec, RedeemError,
+    Resolution, RoleGrant, Session, State, StateCategory, Ticket, TicketBody, TicketEvent, Topic,
+    Turn, VerifiedEmail, fleet,
 };
 
 #[cfg(feature = "fs")]
@@ -79,6 +82,45 @@ mod facade_reexports {
         let _reset_fn = reset;
         let _reset_as_fn = reset_as;
         let _collect_fn = collect;
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn fleet_records_are_re_exported() {
+        let person = Person {
+            display_name: "Ada".into(),
+            email: None,
+        };
+        assert_eq!(Person::KIND, RecordKind::Person);
+        assert!(person.to_body().is_ok());
+        assert_eq!(fleet::FLEET_NAMESPACE, "fleet");
+        assert_eq!(fleet::FLEET_AUDIT_NAMESPACE, "fleet-audit");
+
+        let secret = LinkSecret::from_bytes([0; 32]);
+        let token = LinkToken::new(
+            &secret,
+            FleetRole::Viewer,
+            GrantScope::Fleet,
+            None,
+            FleetActor::Service("test".into()),
+            0,
+            1,
+        );
+        assert_eq!(token.key(), LinkToken::key_for_secret(&secret));
+        let _: Option<(
+            AuditEntry,
+            AuditResult,
+            Authenticator,
+            BindingOrigin,
+            ChannelConfig,
+            Consumption,
+            FleetKeyError,
+            IdentityBinding,
+            LinkSecretError,
+            RedeemError,
+            RoleGrant,
+            VerifiedEmail,
+        )> = None;
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "gonzalo-domain"
-description = "Typed domain views over gonzalo records (memory, sessions, checkpoints)"
+description = "Typed domain views over gonzalo records (memory, sessions, checkpoints, tickets, fleet access control)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

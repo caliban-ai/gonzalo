@@ -9,6 +9,11 @@ pub mod ticket;
 
 pub use checkpoint::Checkpoint;
 pub use codec::RecordCodec;
+pub use fleet::{
+    AuditEntry, AuditResult, Authenticator, BindingOrigin, ChannelConfig, Consumption, FleetActor,
+    FleetKeyError, FleetRole, GrantScope, IdentityBinding, LinkSecret, LinkSecretError, LinkToken,
+    Person, RedeemError, RoleGrant, VerifiedEmail,
+};
 pub use memory::{MemoryTier, Topic};
 pub use session::{Session, Turn};
 pub use ticket::{
