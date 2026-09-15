@@ -46,7 +46,8 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0019](0019-s3-backend-qualification-rustfs.md) | Qualified S3 backend for HA: RustFS | accepted |
 | [0020](0020-rust-native-deliverables.md) | Rust-native deliverables; the daemon is the non-Rust boundary | accepted |
 | [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted |
-| [0022](0022-fleet-access-control-records.md) | Fleet access-control records as a capability layer | accepted |
+| [0022](0022-fleet-access-control-records.md) | Fleet access-control records as a capability layer | accepted (channel config and `GrantScope::Repo` amended by [0023](0023-channel-config-fields.md)) |
+| [0023](0023-channel-config-fields.md) | Channel configuration fields, and workspaces instead of repos | accepted |
 
 ## Adding a new ADR
 

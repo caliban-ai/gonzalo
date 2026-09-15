@@ -89,9 +89,9 @@ fn authenticator_segment(authenticator: &Authenticator) -> Result<String, FleetK
 fn scope_segment(scope: &GrantScope) -> Result<String, FleetKeyError> {
     Ok(match scope {
         GrantScope::Fleet => "fleet".to_string(),
-        GrantScope::Repo(repo) => {
-            non_empty(repo, "repo")?;
-            format!("repo:{}", escape(repo))
+        GrantScope::Workspace(workspace) => {
+            non_empty(workspace, "workspace")?;
+            format!("workspace:{}", escape(workspace))
         }
     })
 }
@@ -115,11 +115,23 @@ pub(crate) fn grant_id(person: &str, scope: &GrantScope) -> Result<String, Fleet
     Ok(format!("{person}:{}", scope_segment(scope)?))
 }
 
-/// `<provider>:<channel_id>`.
-pub(crate) fn channel_id(provider: &str, channel: &str) -> Result<String, FleetKeyError> {
+/// `<provider>:<tenant>:<channel>`. The tenant (guild, workspace or team id) is
+/// part of the key because a platform channel id is only unique within its
+/// tenant on Slack and Teams (ariel ADR 0006; gonzalo ADR 0023).
+pub(crate) fn channel_id(
+    provider: &str,
+    tenant: &str,
+    channel: &str,
+) -> Result<String, FleetKeyError> {
     non_empty(provider, "provider")?;
+    non_empty(tenant, "tenant")?;
     non_empty(channel, "channel id")?;
-    Ok(format!("{}:{}", escape(provider), escape(channel)))
+    Ok(format!(
+        "{}:{}:{}",
+        escape(provider),
+        escape(tenant),
+        escape(channel)
+    ))
 }
 
 /// `<at_ms zero-padded to 13 digits>-<nonce>`.
@@ -180,8 +192,21 @@ mod tests {
             binding_id(&Authenticator::Discord, ":").unwrap()
         );
         assert_ne!(
-            channel_id("a:b", "c").unwrap(),
-            channel_id("a", "b:c").unwrap()
+            channel_id("a:b", "t", "c").unwrap(),
+            channel_id("a", "b:t", "c").unwrap()
+        );
+        assert_ne!(
+            channel_id("discord", "t1", "c").unwrap(),
+            channel_id("discord", "t2", "c").unwrap(),
+            "the same channel id in two tenants keys differently"
+        );
+    }
+
+    #[test]
+    fn channel_ids_name_provider_tenant_and_channel() {
+        assert_eq!(
+            channel_id("discord", "guild-1", "42").unwrap(),
+            "discord:guild-1:42"
         );
     }
 
@@ -189,8 +214,8 @@ mod tests {
     fn grant_ids_name_person_and_scope() {
         assert_eq!(grant_id("p1", &GrantScope::Fleet).unwrap(), "p1:fleet");
         assert_eq!(
-            grant_id("p1", &GrantScope::Repo("caliban-ai/gonzalo".into())).unwrap(),
-            "p1:repo:caliban-ai/gonzalo"
+            grant_id("p1", &GrantScope::Workspace("caliban".into())).unwrap(),
+            "p1:workspace:caliban"
         );
     }
 
@@ -233,16 +258,20 @@ mod tests {
             Err(FleetKeyError::EmptyComponent("issuer"))
         );
         assert_eq!(
-            channel_id("", "c"),
+            channel_id("", "t", "c"),
             Err(FleetKeyError::EmptyComponent("provider"))
         );
         assert_eq!(
-            channel_id("discord", ""),
+            channel_id("discord", "", "c"),
+            Err(FleetKeyError::EmptyComponent("tenant"))
+        );
+        assert_eq!(
+            channel_id("discord", "t", ""),
             Err(FleetKeyError::EmptyComponent("channel id"))
         );
         assert_eq!(
-            grant_id("p1", &GrantScope::Repo(String::new())),
-            Err(FleetKeyError::EmptyComponent("repo"))
+            grant_id("p1", &GrantScope::Workspace(String::new())),
+            Err(FleetKeyError::EmptyComponent("workspace"))
         );
     }
 }

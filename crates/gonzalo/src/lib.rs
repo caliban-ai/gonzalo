@@ -11,11 +11,11 @@ pub use gonzalo_core::{
 
 pub use gonzalo_domain::{
     Actor, ActorRole, AuditEntry, AuditResult, Authenticator, BindingOrigin, BodyFormat,
-    ChannelConfig, Checkpoint, Consumption, Container, FleetActor, FleetKeyError, FleetRole,
-    GrantScope, IdentityBinding, Link, LinkKind, LinkSecret, LinkSecretError, LinkTarget,
-    LinkToken, MemoryTier, Person, Priority, PriorityLevel, Provider, RecordCodec, RedeemError,
-    Resolution, RoleGrant, Session, State, StateCategory, Ticket, TicketBody, TicketEvent, Topic,
-    Turn, VerifiedEmail, fleet,
+    ChannelConfig, Checkpoint, Consumption, Container, EmptyFollowSet, FleetActor, FleetKeyError,
+    FleetRole, Follows, GrantScope, IdentityBinding, Link, LinkKind, LinkSecret, LinkSecretError,
+    LinkTarget, LinkToken, MemoryTier, NotifyPreset, Person, Priority, PriorityLevel, Provider,
+    RecordCodec, RedeemError, Resolution, RoleGrant, Session, State, StateCategory, Ticket,
+    TicketBody, TicketEvent, Topic, Turn, VerifiedEmail, fleet,
 };
 
 #[cfg(feature = "fs")]

@@ -1,6 +1,7 @@
 //! Fleet access-control records: people, the external accounts bound to them,
 //! role grants, per-channel configuration, one-time link tokens, and the audit
-//! trail. See ADR 0022. One-time link tokens store only a hash of their secret.
+//! trail. See ADR 0022, amended for channel configuration by ADR 0023. One-time
+//! link tokens store only a hash of their secret.
 //!
 //! These are typed views only. gonzalo stores the records but never evaluates
 //! the roles in them; consumers such as Ariel read them and decide, including
@@ -17,7 +18,8 @@ pub use audit::{AuditEntry, AuditResult};
 pub use keys::FleetKeyError;
 pub use link::{Consumption, LinkSecret, LinkSecretError, LinkToken, RedeemError};
 pub use records::{
-    BindingOrigin, ChannelConfig, IdentityBinding, Person, RoleGrant, VerifiedEmail,
+    BindingOrigin, ChannelConfig, EmptyFollowSet, Follows, IdentityBinding, NotifyPreset, Person,
+    RoleGrant, VerifiedEmail,
 };
 
 use serde::{Deserialize, Serialize};
@@ -34,9 +36,13 @@ pub const CHANNELS_COLLECTION: &str = "channels";
 pub const LINK_TOKENS_COLLECTION: &str = "link-tokens";
 pub const AUDIT_ENTRIES_COLLECTION: &str = "entries";
 
-/// A fleet role, ordered `Viewer < Operator < Admin`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// A fleet role, ordered `Viewer < Operator < Admin`. Defaults to `Viewer`, the
+/// least privileged, so an omitted ceiling grants nothing extra (ADR 0023).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum FleetRole {
+    #[default]
     Viewer,
     Operator,
     Admin,
@@ -46,8 +52,8 @@ pub enum FleetRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrantScope {
     Fleet,
-    /// One repository, as `owner/name`.
-    Repo(String),
+    /// One workspace, by the name prospero reports for it (ADR 0023).
+    Workspace(String),
 }
 
 /// The system that authenticated an external account.
