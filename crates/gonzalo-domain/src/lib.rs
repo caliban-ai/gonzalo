@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod codec;
+pub mod fleet;
 pub mod memory;
 pub mod session;
 pub mod ticket;
