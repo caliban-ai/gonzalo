@@ -94,11 +94,13 @@ Bodies are JSON via `RecordCodec`, one struct per kind, each exposing
 `pub const KIND`.
 
 ```rust
-pub enum Role { Viewer, Operator, Admin }           // derives Ord: Viewer < Operator < Admin
+// Named with a `Fleet` prefix so they don't collide with `ticket::Actor` at the
+// `gonzalo-domain` and facade roots.
+pub enum FleetRole { Viewer, Operator, Admin }      // derives Ord: Viewer < Operator < Admin
 pub enum GrantScope { Fleet, Repo(String) }         // Repo holds "owner/name"
 
 /// Who did something. Shared by grants, link tokens and audit entries.
-pub enum Actor {
+pub enum FleetActor {
     Person(String),                                  // a person_id
     Unlinked { authenticator: Authenticator, subject: String },
     Service(String),                                 // e.g. "ariel", "ariel-cli"
@@ -122,30 +124,30 @@ pub struct IdentityBinding {
     pub bound_at: i64,
     pub bound_by: BindingOrigin,
 }
-pub enum BindingOrigin { LinkToken { token_hash: String }, Operator(Actor) }
+pub enum BindingOrigin { LinkToken { token_hash: String }, Operator(FleetActor) }
 
 pub struct RoleGrant {
     pub person: String,
     pub scope: GrantScope,
-    pub role: Role,
-    pub granted_by: Actor,
+    pub role: FleetRole,
+    pub granted_by: FleetActor,
     pub granted_at: i64,
 }
 
 pub struct ChannelConfig {
     pub provider: String,                            // "discord", "slack", …
     pub channel_id: String,
-    pub ceiling: Role,
+    pub ceiling: FleetRole,
     pub repos: Vec<String>,                          // followed repos, "owner/name"
     pub filters: BTreeMap<String, serde_json::Value>, // consumer-defined (Ariel open question 4)
 }
 
 pub struct LinkToken {
     pub token_hash: String,
-    pub role: Role,
+    pub role: FleetRole,
     pub scope: GrantScope,
     pub person: Option<String>,                      // Some: add an account to an existing person
-    pub minted_by: Actor,
+    pub minted_by: FleetActor,
     pub minted_at: i64,
     pub expires_at: i64,
     pub consumed: Option<Consumption>,
@@ -153,7 +155,7 @@ pub struct LinkToken {
 pub struct Consumption { pub person: String, pub binding: RecordKey, pub at: i64 }
 
 pub struct AuditEntry {
-    pub actor: Actor,
+    pub actor: FleetActor,
     pub action: String,                              // "spawn", "link", "grant", …
     pub target: String,                              // what it acted on
     pub at: i64,
@@ -193,7 +195,12 @@ pub enum AuditResult { Succeeded, Denied, Failed(String) }
   returns the consumed view, or:
   - `WrongSecret` when `secret.hash() != token_hash`;
   - `Expired` when `now_ms >= expires_at`;
-  - `AlreadyConsumed` when `consumed.is_some()`.
+  - `AlreadyConsumed` when `consumed.is_some()`;
+  - `PersonMismatch` when the token names a `person` and the redeeming person
+    differs, so a token minted to add an account to one person can't attach it
+    to another.
+
+  The checks run in that order.
 
   The consumer writes the result with `put(record, Some(read_revision))`. Two
   concurrent redemptions of the same revision are ordinary OCC: exactly one
@@ -223,7 +230,7 @@ resolves a person from `handle` or `email`.
 - One record per entry. The consumer creates it with `put(record, None)`. A
   `Conflict` means the key already exists (a nonce collision): pick a new nonce
   and retry. An entry is never updated.
-- `AuditEntry::key(&self, nonce) -> Result<RecordKey, KeyError>` builds the key
+- `AuditEntry::key(&self, nonce) -> Result<RecordKey, FleetKeyError>` builds the key
   from `at` and the nonce.
 - Retention is the operator's: `gonzalo reset --namespace fleet-audit` and
   `collect` apply as for any namespace, gated by daemon write access.
@@ -300,7 +307,7 @@ them; one that needs erasure should not keep `fleet` on a git store.
 
 - `gonzalo-core/src/record.rs`: the six variants and arms.
 - `gonzalo-domain`: a `fleet` module with the views, key helpers, `LinkSecret`,
-  `RedeemError`, `KeyError`; registered in `lib.rs`; crate description updated.
+  `RedeemError`, `FleetKeyError`; registered in `lib.rs`; crate description updated.
 - `crates/gonzalo/src/lib.rs`: facade re-exports.
 - `CHANGELOG.md` `[Unreleased]`: the kinds and the upgrade note.
 
