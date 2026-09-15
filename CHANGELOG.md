@@ -21,6 +21,10 @@ against a 0.6 `gonzalod` keeps working for normal reads and writes, and fails
 replication reads with an explicit `upgrade gonzalod` error rather than falling
 back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
 
+The new fleet access-control record kinds need the same all-at-once upgrade: a
+binary built before them fails to decode those records. Upgrade every gonzalod,
+CLI and embedded consumer before any writer uses them. (#278)
+
 ### Added
 
 - **Replicated deletion.** A delete writes a tombstone (`RecordKind::Tombstone`)
@@ -93,6 +97,14 @@ back. See the guide's "Deletion, reset & collection" page and ADR 0021. (#203)
 - **`SyncReport.fast_forwarded_to_a` / `fast_forwarded_to_b`**: the keys
   overwritten on each side because it was behind the other's ancestor chain.
   (#203)
+- **Fleet access-control records.** Six record kinds for people and their
+  access to the fleet: `Person`, `IdentityBinding`, `RoleGrant`,
+  `ChannelConfig`, `LinkToken` and `AuditEntry`. Typed views live in
+  `gonzalo-domain`'s `fleet` module and are re-exported by the `gonzalo` facade.
+  Records sit in the `fleet` namespace, with audit entries in `fleet-audit`.
+  A link token stores only a hash of its secret and is marked consumed when
+  redeemed; audit entries are write-once. gonzalo stores these records but
+  doesn't evaluate the roles in them. See ADR 0022. (#278)
 
 ### Changed
 

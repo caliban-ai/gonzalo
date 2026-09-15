@@ -18,6 +18,22 @@ pub enum RecordKind {
     /// A per-view code-graph manifest: `(repo, view_id) -> { path -> content_hash }`.
     /// Regenerable from source; reconciled last-writer-wins. See ADR 0012.
     GraphManifest,
+    /// A human with fleet roles. Not ADR 0015's `Principal`, which is a gonzalo
+    /// bearer token. See ADR 0022.
+    Person,
+    /// Binds one external account (chat user id, OIDC subject) to a `Person`.
+    /// See ADR 0022.
+    IdentityBinding,
+    /// A person's fleet role, fleet-wide or for one repo. See ADR 0022.
+    RoleGrant,
+    /// A chat channel's role ceiling, followed repos and filters. See ADR 0022.
+    ChannelConfig,
+    /// A one-time, expiring token that links an account to a person. Stores only
+    /// the token's hash, and is marked consumed rather than deleted. See ADR 0022.
+    LinkToken,
+    /// A write-once record of who did what, to what, and with what result.
+    /// See ADR 0022.
+    AuditEntry,
     /// A deletion marker. Hidden from consumer reads (`get`/`list`); replicated
     /// by sync and pull through raw reads; physically removed only by
     /// `Store::purge`. See ADR 0021.
@@ -47,8 +63,16 @@ impl RecordKind {
             RecordKind::Topic | RecordKind::Session | RecordKind::TicketEvent => {
                 MergeClass::AppendOnly
             }
-            RecordKind::MemoryTier | RecordKind::Ticket => MergeClass::Structured,
+            RecordKind::MemoryTier
+            | RecordKind::Ticket
+            | RecordKind::Person
+            | RecordKind::IdentityBinding
+            | RecordKind::RoleGrant
+            | RecordKind::ChannelConfig => MergeClass::Structured,
             RecordKind::Checkpoint => MergeClass::Opaque,
+            // Both diverge only through a double redemption or an audit-key
+            // collision, which must surface rather than merge (ADR 0022).
+            RecordKind::LinkToken | RecordKind::AuditEntry => MergeClass::Opaque,
             RecordKind::GraphManifest => MergeClass::Derived,
             // Sync and pull reconcile tombstones before any body merge runs;
             // the most conservative class guards a path that forgets to.
@@ -153,6 +177,34 @@ mod tests {
             MergeClass::AppendOnly
         );
         assert_eq!(RecordKind::GraphManifest.merge_class(), MergeClass::Derived);
+        assert_eq!(RecordKind::Person.merge_class(), MergeClass::Structured);
+        assert_eq!(
+            RecordKind::IdentityBinding.merge_class(),
+            MergeClass::Structured
+        );
+        assert_eq!(RecordKind::RoleGrant.merge_class(), MergeClass::Structured);
+        assert_eq!(
+            RecordKind::ChannelConfig.merge_class(),
+            MergeClass::Structured
+        );
+        assert_eq!(RecordKind::LinkToken.merge_class(), MergeClass::Opaque);
+        assert_eq!(RecordKind::AuditEntry.merge_class(), MergeClass::Opaque);
+    }
+
+    #[test]
+    fn fleet_kinds_serialize_as_their_names() {
+        for (kind, name) in [
+            (RecordKind::Person, "\"Person\""),
+            (RecordKind::IdentityBinding, "\"IdentityBinding\""),
+            (RecordKind::RoleGrant, "\"RoleGrant\""),
+            (RecordKind::ChannelConfig, "\"ChannelConfig\""),
+            (RecordKind::LinkToken, "\"LinkToken\""),
+            (RecordKind::AuditEntry, "\"AuditEntry\""),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), name);
+            let back: RecordKind = serde_json::from_str(name).unwrap();
+            assert_eq!(back, kind);
+        }
     }
 
     #[test]
