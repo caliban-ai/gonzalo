@@ -2002,8 +2002,11 @@ name = "gonzalo-domain"
 version = "0.6.0"
 dependencies = [
  "gonzalo-core",
+ "gonzalo-store-fs",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
