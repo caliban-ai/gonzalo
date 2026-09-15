@@ -1,5 +1,6 @@
 //! Fleet access-control records: people, the external accounts bound to them,
-//! role grants, per-channel configuration, and the audit trail. See ADR 0022.
+//! role grants, per-channel configuration, one-time link tokens, and the audit
+//! trail. See ADR 0022. One-time link tokens store only a hash of their secret.
 //!
 //! These are typed views only. gonzalo stores the records but never evaluates
 //! the roles in them; consumers such as Ariel read them and decide, including
@@ -8,10 +9,12 @@
 
 mod audit;
 mod keys;
+mod link;
 mod records;
 
 pub use audit::{AuditEntry, AuditResult};
 pub use keys::FleetKeyError;
+pub use link::{Consumption, LinkSecret, LinkSecretError, LinkToken, RedeemError};
 pub use records::{
     BindingOrigin, ChannelConfig, IdentityBinding, Person, RoleGrant, VerifiedEmail,
 };
