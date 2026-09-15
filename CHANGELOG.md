@@ -104,7 +104,11 @@ CLI and embedded consumer before any writer uses them. (#278)
   Records sit in the `fleet` namespace, with audit entries in `fleet-audit`.
   A link token stores only a hash of its secret and is marked consumed when
   redeemed; audit entries are write-once. gonzalo stores these records but
-  doesn't evaluate the roles in them. See ADR 0022. (#278)
+  doesn't evaluate the roles in them. A channel config is keyed by provider,
+  tenant and channel, and carries what the channel `follows` (the whole fleet,
+  or a non-empty set of workspaces), a `notify` preset of `all`, `terminal` or
+  `failures`, and a role `ceiling`. Grants scope to the fleet or to one
+  workspace. See ADR 0022 and ADR 0023. (#278)
 
 ### Changed
 

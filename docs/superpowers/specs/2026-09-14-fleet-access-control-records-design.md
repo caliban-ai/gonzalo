@@ -1,6 +1,6 @@
 # Fleet access-control records
 
-- **Status:** Approved (ADR 0022)
+- **Status:** Approved (ADR 0022; channel configuration and grant scope amended by ADR 0023)
 - **Date:** 2026-09-14
 - **Issues:** gonzalo#277 (design), gonzalo#278 (implementation)
 - **Consumers:** Ariel chat bridge (caliban-ai/prospero#67, ariel#15–#18); later
@@ -62,7 +62,7 @@ Constants in `gonzalo-domain`: `FLEET_NAMESPACE = "fleet"`,
 | `Person` | `fleet/people/<person_id>` |
 | `IdentityBinding` | `fleet/identity-bindings/<authenticator>:<subject>` |
 | `RoleGrant` | `fleet/role-grants/<person_id>:<scope>` |
-| `ChannelConfig` | `fleet/channels/<provider>:<channel_id>` |
+| `ChannelConfig` | `fleet/channels/<provider>:<tenant>:<channel>` (ADR 0023) |
 | `LinkToken` | `fleet/link-tokens/<token_hash>` |
 | `AuditEntry` | `fleet-audit/entries/<at_ms>-<nonce>` |
 
@@ -76,7 +76,10 @@ Segments:
 
 - `<authenticator>`: `discord`, `slack`, `teams`, `oidc:<issuer>`,
   `other:<name>` (the issuer or name escaped as a component).
-- `<scope>`: `fleet`, or `repo:<owner/name>`.
+- `<scope>`: `fleet`, or `workspace:<name>` (ADR 0023).
+- `<tenant>`: the guild, workspace or team the channel belongs to. It is part of
+  the key because a channel id is only unique within its tenant on Slack and
+  Teams (ariel ADR 0006; gonzalo ADR 0023).
 - `<person_id>`: an opaque id the minting consumer generates. It is
   **not** an email, a platform id, or a username, because those change or differ
   between platforms. The view accepts `[A-Za-z0-9_-]{1,64}` and rejects anything
@@ -97,7 +100,7 @@ Bodies are JSON via `RecordCodec`, one struct per kind, each exposing
 // Named with a `Fleet` prefix so they don't collide with `ticket::Actor` at the
 // `gonzalo-domain` and facade roots.
 pub enum FleetRole { Viewer, Operator, Admin }      // derives Ord: Viewer < Operator < Admin
-pub enum GrantScope { Fleet, Repo(String) }         // Repo holds "owner/name"
+pub enum GrantScope { Fleet, Workspace(String) }    // a prospero workspace name (ADR 0023)
 
 /// Who did something. Shared by grants, link tokens and audit entries.
 pub enum FleetActor {
@@ -134,13 +137,18 @@ pub struct RoleGrant {
     pub granted_at: i64,
 }
 
+// ADR 0023: the fields ariel ADR 0009 specifies.
 pub struct ChannelConfig {
     pub provider: String,                            // "discord", "slack", …
-    pub channel_id: String,
-    pub ceiling: FleetRole,
-    pub repos: Vec<String>,                          // followed repos, "owner/name"
-    pub filters: BTreeMap<String, serde_json::Value>, // consumer-defined (Ariel open question 4)
+    pub tenant: String,                              // guild / workspace / team id
+    pub channel: String,                             // platform channel id
+    pub follows: Follows,                            // stored as a one-element array; merges atomically (§6)
+    pub notify: NotifyPreset,                        // default All
+    pub ceiling: FleetRole,                          // default Viewer
 }
+
+pub enum Follows { Fleet, Workspaces { names: BTreeSet<String> } }  // names non-empty
+pub enum NotifyPreset { All, Terminal, Failures }
 
 pub struct LinkToken {
     pub token_hash: String,
@@ -165,8 +173,12 @@ pub struct AuditEntry {
 pub enum AuditResult { Succeeded, Denied, Failed(String) }
 ```
 
-`ChannelConfig` does not derive `Eq`, because `serde_json::Value` isn't `Eq`
-(the same reason as `Ticket`).
+Every view derives `Eq`. `ChannelConfig` did not while it held a
+`serde_json::Value` filter map; ADR 0023 replaced that with `notify`, so it now
+does.
+
+`Follows::Workspaces` names at least one workspace. The constructor and
+deserialization both enforce it, so no decoded value breaks the invariant.
 
 ### 4.1 Where identifying data lives
 
@@ -265,7 +277,7 @@ divergence behaviour **given a common base**; under plain `sync`, read every
 | `Person` | Structured | separate field edits merge; the same field edited differently conflicts |
 | `IdentityBinding` | Structured | binding one account to two different people conflicts on `person`, so a mistaken bind is surfaced, never kept silently; a `handle` refresh on one side merges with anything else |
 | `RoleGrant` | Structured | two different role changes conflict on `role`; a revoke racing an edit is a delete-versus-edit `SyncConflict` (ADR 0021) regardless of base, since that path never reaches the body merge |
-| `ChannelConfig` | Structured | `filters` merges per key; `repos` is an array, which merges atomically, so concurrent follows on both sides conflict rather than drop one |
+| `ChannelConfig` | Structured | `notify` and `ceiling` are scalars; `follows` is atomically wrapped (ADR 0023), so concurrent follow changes conflict rather than splicing two sets or mixing a `kind` with the other side's `names` |
 | `LinkToken` | Opaque | only reachable by two independent redemptions (or edits) of one revision, which must be surfaced (§5.1) |
 | `AuditEntry` | Opaque | entries are write-once under unique keys, so divergence means a collision or tampering and is surfaced |
 
@@ -289,9 +301,11 @@ body with two variant tags that fails to decode, and `IdentityBinding.email`
 `address` with the other's `verified`, asserting a verification nobody made —
 the same family of hazard as #204. Wrapped as a one-element array, a
 concurrent change to any of these five fields conflicts instead of producing
-an undecodable or unasserted value. `LinkToken` and `AuditEntry` are never
-merged (`Opaque`), and `ChannelConfig`'s fields are already plain strings, a
-role, an array, and a consumer-defined map, so none of those need wrapping.
+an undecodable or unasserted value. `ChannelConfig.follows` is wrapped for the
+same reason (ADR 0023): it is a tagged enum, so an unwrapped merge could pair
+one side's `kind` with the other's `names`. Its remaining fields are a string
+and two scalars, and `LinkToken` and `AuditEntry` are never merged (`Opaque`),
+so nothing else needs wrapping.
 
 ## 7. Core change
 

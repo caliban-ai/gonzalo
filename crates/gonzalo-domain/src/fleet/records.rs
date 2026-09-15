@@ -8,8 +8,9 @@ use super::{
 };
 use crate::codec::RecordCodec;
 use gonzalo_core::{RecordKey, RecordKind};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeSet;
+use std::fmt;
 
 /// A human with fleet roles, keyed by an opaque person id the minting
 /// consumer generates.
@@ -133,37 +134,124 @@ impl RoleGrant {
     }
 }
 
-/// Per-chat-channel configuration.
+/// Which workspaces a channel follows (ariel ADR 0009; gonzalo ADR 0023).
 ///
-/// Does not derive `Eq`: `filters` holds `serde_json::Value`s, which are not
-/// `Eq`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Stored tagged: `{"kind":"fleet"}` or
+/// `{"kind":"workspaces","names":[…]}` with at least one name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Follows {
+    /// Every workspace, including ones created later.
+    Fleet,
+    /// A non-empty set of workspace names, as prospero reports them. Build it
+    /// with [`Follows::workspaces`], which rejects an empty set.
+    Workspaces { names: BTreeSet<String> },
+}
+
+impl Follows {
+    /// `Workspaces` over a non-empty set of names.
+    pub fn workspaces<I, S>(names: I) -> Result<Self, EmptyFollowSet>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let names: BTreeSet<String> = names.into_iter().map(Into::into).collect();
+        if names.is_empty() {
+            return Err(EmptyFollowSet);
+        }
+        Ok(Follows::Workspaces { names })
+    }
+}
+
+impl<'de> Deserialize<'de> for Follows {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A shadow type carries the wire shape; the invariant (a non-empty
+        // name set) is enforced here so no decoded `Follows` can break it.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Wire {
+            Fleet,
+            Workspaces { names: BTreeSet<String> },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Fleet => Ok(Follows::Fleet),
+            Wire::Workspaces { names } if names.is_empty() => {
+                Err(serde::de::Error::custom(EmptyFollowSet))
+            }
+            Wire::Workspaces { names } => Ok(Follows::Workspaces { names }),
+        }
+    }
+}
+
+/// `Follows::Workspaces` was given no workspace names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyFollowSet;
+
+impl fmt::Display for EmptyFollowSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a channel following workspaces must name at least one")
+    }
+}
+
+impl std::error::Error for EmptyFollowSet {}
+
+/// How much a channel hears. A preset only narrows the consumer's default
+/// pacing; it can never add event kinds (ariel ADR 0007/0009).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyPreset {
+    /// Everything the consumer's pacing allows.
+    #[default]
+    All,
+    /// Only when an agent ends.
+    Terminal,
+    /// Only when an agent ends failed, crashed or gone.
+    Failures,
+}
+
+/// Per-chat-channel configuration, keyed by provider, tenant and channel
+/// (ariel ADR 0009; gonzalo ADR 0023). It belongs to no person: who changed it
+/// is recorded in the audit trail and in gonzalo's author stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelConfig {
     /// The chat provider, such as `"discord"`.
     pub provider: String,
-    pub channel_id: String,
-    /// The highest role any command in this channel runs with.
+    /// The guild, workspace or team id the channel belongs to. Part of the key,
+    /// because a channel id is only unique within its tenant on some platforms.
+    pub tenant: String,
+    /// The platform's channel id.
+    pub channel: String,
+    /// Stored as a one-element array; merges atomically (ADR 0022), so two
+    /// concurrent follow changes conflict instead of one silently winning.
+    #[serde(with = "super::atomic")]
+    pub follows: Follows,
+    /// Defaults to [`NotifyPreset::All`].
+    #[serde(default)]
+    pub notify: NotifyPreset,
+    /// The highest role any command in this channel runs with. Defaults to
+    /// [`FleetRole::Viewer`]; it governs commands only, never notifications.
+    #[serde(default)]
     pub ceiling: FleetRole,
-    /// Followed repositories, as `owner/name`.
-    pub repos: Vec<String>,
-    /// Consumer-defined notification filters.
-    pub filters: BTreeMap<String, serde_json::Value>,
 }
 impl RecordCodec for ChannelConfig {}
 impl ChannelConfig {
     pub const KIND: RecordKind = RecordKind::ChannelConfig;
 
-    /// `fleet/channels/<provider>:<channel_id>`.
-    pub fn key_for(provider: &str, channel_id: &str) -> Result<RecordKey, FleetKeyError> {
+    /// `fleet/channels/<provider>:<tenant>:<channel>`.
+    pub fn key_for(
+        provider: &str,
+        tenant: &str,
+        channel: &str,
+    ) -> Result<RecordKey, FleetKeyError> {
         Ok(RecordKey::new(
             FLEET_NAMESPACE,
             CHANNELS_COLLECTION,
-            keys::channel_id(provider, channel_id)?,
+            keys::channel_id(provider, tenant, channel)?,
         ))
     }
 
     pub fn key(&self) -> Result<RecordKey, FleetKeyError> {
-        Self::key_for(&self.provider, &self.channel_id)
+        Self::key_for(&self.provider, &self.tenant, &self.channel)
     }
 }
 
@@ -221,7 +309,7 @@ mod tests {
     fn role_grant_roundtrips_and_keys() {
         let g = RoleGrant {
             person: "p1".into(),
-            scope: GrantScope::Repo("caliban-ai/gonzalo".into()),
+            scope: GrantScope::Workspace("caliban".into()),
             role: FleetRole::Operator,
             granted_by: FleetActor::Person("p0".into()),
             granted_at: 1_700_000_000_000,
@@ -230,26 +318,106 @@ mod tests {
         assert_eq!(RoleGrant::KIND, RecordKind::RoleGrant);
         assert_eq!(
             g.key().unwrap(),
-            RecordKey::new("fleet", "role-grants", "p1:repo:caliban-ai/gonzalo")
+            RecordKey::new("fleet", "role-grants", "p1:workspace:caliban")
         );
+    }
+
+    fn ops_channel() -> ChannelConfig {
+        // ariel ADR 0009's `#ops` example: the whole fleet, failures only,
+        // read-only commands.
+        ChannelConfig {
+            provider: "discord".into(),
+            tenant: "guild-1".into(),
+            channel: "42".into(),
+            follows: Follows::Fleet,
+            notify: NotifyPreset::Failures,
+            ceiling: FleetRole::Viewer,
+        }
     }
 
     #[test]
     fn channel_config_roundtrips_and_keys() {
-        let mut filters = BTreeMap::new();
-        filters.insert("events".into(), serde_json::json!(["AgentSpawned"]));
-        let c = ChannelConfig {
-            provider: "discord".into(),
-            channel_id: "42".into(),
-            ceiling: FleetRole::Viewer,
-            repos: vec!["caliban-ai/gonzalo".into()],
-            filters,
-        };
+        let c = ops_channel();
         assert_eq!(ChannelConfig::from_body(&c.to_body().unwrap()).unwrap(), c);
         assert_eq!(ChannelConfig::KIND, RecordKind::ChannelConfig);
         assert_eq!(
             c.key().unwrap(),
-            RecordKey::new("fleet", "channels", "discord:42")
+            RecordKey::new("fleet", "channels", "discord:guild-1:42")
+        );
+    }
+
+    #[test]
+    fn channel_config_keys_include_the_tenant() {
+        // The same channel id under two tenants is two records, not one
+        // (ariel ADR 0006).
+        let a = ops_channel();
+        let mut b = ops_channel();
+        b.tenant = "guild-2".into();
+        assert_ne!(a.key().unwrap(), b.key().unwrap());
+    }
+
+    #[test]
+    fn follows_stores_ariel_adr_0009_wire_shape() {
+        // ariel ADR 0009: {"kind":"fleet"} or
+        // {"kind":"workspaces","names":[…]}, inside gonzalo's atomic wrapper.
+        let mut c = ops_channel();
+        c.follows = Follows::workspaces(["caliban"]).unwrap();
+        let body = c.to_body().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(body.bytes()).unwrap();
+        assert_eq!(
+            v["follows"],
+            serde_json::json!([{"kind": "workspaces", "names": ["caliban"]}])
+        );
+        assert_eq!(v["notify"], serde_json::json!("failures"));
+
+        let fleet_body = ops_channel().to_body().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(fleet_body.bytes()).unwrap();
+        assert_eq!(v["follows"], serde_json::json!([{"kind": "fleet"}]));
+        assert_eq!(ChannelConfig::from_body(&body).unwrap(), c);
+    }
+
+    #[test]
+    fn follows_workspaces_must_name_at_least_one() {
+        assert_eq!(
+            Follows::workspaces(Vec::<String>::new()),
+            Err(EmptyFollowSet)
+        );
+        assert!(Follows::workspaces(["caliban", "gonzalo"]).is_ok());
+
+        // The invariant also holds for a body written by hand.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(ops_channel().to_body().unwrap().bytes()).unwrap();
+        v["follows"] = serde_json::json!([{"kind": "workspaces", "names": []}]);
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(
+            ChannelConfig::from_body(&gonzalo_core::Body::Inline(bytes)).is_err(),
+            "an empty workspace set must be rejected"
+        );
+    }
+
+    #[test]
+    fn channel_config_defaults_notify_all_and_ceiling_viewer() {
+        // `follows` is required; the other two are optional (ariel ADR 0009).
+        let json = serde_json::json!({
+            "provider": "discord",
+            "tenant": "guild-1",
+            "channel": "42",
+            "follows": [{"kind": "fleet"}],
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let c = ChannelConfig::from_body(&gonzalo_core::Body::Inline(bytes)).unwrap();
+        assert_eq!(c.notify, NotifyPreset::All);
+        assert_eq!(c.ceiling, FleetRole::Viewer);
+
+        let missing_follows = serde_json::json!({
+            "provider": "discord",
+            "tenant": "guild-1",
+            "channel": "42",
+        });
+        let bytes = serde_json::to_vec(&missing_follows).unwrap();
+        assert!(
+            ChannelConfig::from_body(&gonzalo_core::Body::Inline(bytes)).is_err(),
+            "follows is required"
         );
     }
 
@@ -450,5 +618,47 @@ mod tests {
         };
         let merged = RoleGrant::from_body(&body).unwrap();
         assert_eq!(merged.granted_by, FleetActor::Service("ariel".into()));
+    }
+
+    #[test]
+    fn channel_follows_changed_on_both_sides_needs_resolution() {
+        // Two concurrent follow edits conflict rather than one silently
+        // winning or the two sets being spliced together (ADR 0023).
+        let base = ops_channel();
+        let mut ours = base.clone();
+        ours.follows = Follows::workspaces(["caliban"]).unwrap();
+        let mut theirs = base.clone();
+        theirs.follows = Follows::workspaces(["gonzalo"]).unwrap();
+
+        let outcome = merge_bodies(
+            RecordKind::ChannelConfig,
+            &base.to_body().unwrap(),
+            &ours.to_body().unwrap(),
+            &theirs.to_body().unwrap(),
+        );
+        assert_eq!(outcome, gonzalo_core::MergeOutcome::NeedsResolution);
+    }
+
+    #[test]
+    fn channel_disjoint_notify_and_follows_edits_merge() {
+        // Ours retargets the channel; theirs only widens what it hears.
+        let base = ops_channel();
+        let mut ours = base.clone();
+        ours.follows = Follows::workspaces(["caliban"]).unwrap();
+        let mut theirs = base.clone();
+        theirs.notify = NotifyPreset::All;
+
+        let outcome = merge_bodies(
+            RecordKind::ChannelConfig,
+            &base.to_body().unwrap(),
+            &ours.to_body().unwrap(),
+            &theirs.to_body().unwrap(),
+        );
+        let gonzalo_core::MergeOutcome::Merged(body) = outcome else {
+            panic!("expected a merge, got NeedsResolution");
+        };
+        let merged = ChannelConfig::from_body(&body).unwrap();
+        assert_eq!(merged.follows, Follows::workspaces(["caliban"]).unwrap());
+        assert_eq!(merged.notify, NotifyPreset::All);
     }
 }
