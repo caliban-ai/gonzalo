@@ -274,7 +274,18 @@ pub fn chunk(record: &Record) -> Result<Option<Vec<String>>> {
         // Tombstone is listed here defensively, not definitionally: consumer
         // reads never surface one, so indexing never actually sees this kind
         // (ADR 0021).
-        RecordKind::Checkpoint | RecordKind::GraphManifest | RecordKind::Tombstone => {
+        // Fleet access-control records are configuration and audit data, and
+        // hold personal data (emails, handles), so they are never indexed for
+        // semantic search (ADR 0022).
+        RecordKind::Checkpoint
+        | RecordKind::GraphManifest
+        | RecordKind::Tombstone
+        | RecordKind::Person
+        | RecordKind::IdentityBinding
+        | RecordKind::RoleGrant
+        | RecordKind::ChannelConfig
+        | RecordKind::LinkToken
+        | RecordKind::AuditEntry => {
             return Ok(None);
         }
     };
