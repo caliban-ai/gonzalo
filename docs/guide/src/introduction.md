@@ -16,7 +16,7 @@ and a tree-sitter code graph that agents query through an MCP server.
 |---|---|
 | [caliban](https://github.com/caliban-ai/caliban) | the agent. Gonzalo started as a shareable home for its local-first state. |
 | [prospero](https://github.com/caliban-ai/prospero) | runs the caliban agent fleet |
-| [ariel](https://github.com/caliban-ai/ariel) | the chat bridge for the fleet: Discord first, then Slack and Teams. Its identity, role grants, channel configuration and audit trail are meant to be gonzalo records, and ariel stores nothing of its own. Ariel is in early implementation and does not yet read or write gonzalo; the record kinds it needs are tracked in [gonzalo#277](https://github.com/caliban-ai/gonzalo/issues/277) and [#278](https://github.com/caliban-ai/gonzalo/issues/278). |
+| [ariel](https://github.com/caliban-ai/ariel) | the chat bridge for the fleet: Discord first, then Slack and Teams. Its identity, role grants, channel configuration and audit trail are gonzalo records, and ariel stores nothing of its own. Ariel is in early implementation and does not yet read or write gonzalo; the record kinds it needs shipped in 0.7.0 as the [fleet access-control records](./fleet.md) ([ADR 0022](./adr/0022-fleet-access-control-records.md), [ADR 0023](./adr/0023-channel-config-fields.md)). |
 | **gonzalo** | persistence: records, stores, capability layers, the daemon, and the code-graph MCP server |
 
 Rust consumers depend on the `gonzalo` facade crate. Everything else talks to the
