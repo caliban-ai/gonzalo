@@ -9,6 +9,16 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-15
+
+Deletion replicates. A delete used to be local: sync met a peer that still held
+the record and copied it straight back, so a deleted record returned on the next
+run and a namespace-wide reset was unusable on anything replicated. This release
+makes a delete a write of its own — a tombstone that travels like any record —
+and builds namespace `reset` and horizon-based `collect` on top of it. It also
+adds fleet access-control records, the identity, role, channel and audit state
+the Ariel chat bridge keeps in gonzalo.
+
 **Upgrade every gonzalo binary together.** Deletion now replicates, and it does
 so with a record kind older binaries can't read. A 0.6 `gonzalo`, `gonzalod`, or
 any program built on `gonzalo-core` 0.6 that reads a store holding a tombstone
@@ -1108,7 +1118,8 @@ milestone (M1–M6).
   ADRs 0001–0009; added CI (fmt/clippy/build/test), a line-coverage gate, the
   Kanban label taxonomy, and board/triage automation.
 
-[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/gonzalo/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/caliban-ai/gonzalo/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/caliban-ai/gonzalo/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/caliban-ai/gonzalo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/gonzalo/compare/v0.3.0...v0.4.0
