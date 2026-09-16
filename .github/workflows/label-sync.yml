@@ -11,7 +11,10 @@ jobs:
   labeler:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      # The one action still on the deprecated Node 20 runtime: upstream has
+      # published no Node 24 release (latest is v2.3.3). GitHub forces it onto
+      # Node 24 and warns; revisit when upstream ships one (gonzalo#303).
       - uses: EndBug/label-sync@v2.3.3
         with:
           config-file: .github/labels.yml

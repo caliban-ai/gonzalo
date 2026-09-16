@@ -62,7 +62,7 @@ jobs:
       # (see the ordering note in docs/releasing.md) the archive is still
       # retrievable with `gh run download`, so recovery costs seconds rather than
       # a full rebuild.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PKG }}
           path: dist/${{ env.PKG }}.tar.gz*

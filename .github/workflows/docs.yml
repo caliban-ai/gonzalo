@@ -37,7 +37,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install mdBook toolchain
         uses: taiki-e/install-action@v2
@@ -45,7 +45,7 @@ jobs:
           tool: mdbook@${{ env.MDBOOK_VERSION }},mdbook-admonish@${{ env.MDBOOK_ADMONISH_VERSION }},mdbook-mermaid@${{ env.MDBOOK_MERMAID_VERSION }}
 
       - name: Fetch shared theme from the hub
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: caliban-ai/caliban-ai.github.io
           path: .hub
@@ -85,7 +85,7 @@ jobs:
 
       - name: Upload Pages artifact
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/guide/book
 
@@ -102,4 +102,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
