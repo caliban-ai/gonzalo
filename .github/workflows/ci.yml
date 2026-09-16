@@ -125,13 +125,13 @@ jobs:
       # GITHUB_TOKEN is read-only).
       - name: Post coverage comment
         if: ${{ !cancelled() && needs.check.outputs.code == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: coverage
           path: coverage-comment.md
       - name: Upload coverage reports
         if: ${{ !cancelled() && needs.check.outputs.code == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-reports
           path: |
