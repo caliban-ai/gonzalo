@@ -118,6 +118,24 @@ CLI and embedded consumer before any writer uses them. (#278)
 
 ### Changed
 
+- **Breaking: `CoreError` gains `Invalid`.** A call the store will never accept
+  — a consumer `put` of a tombstone record, which must go through `delete_as` —
+  now returns `CoreError::Invalid` instead of `Backend`. The daemon answers
+  `400` (gRPC `InvalidArgument`) rather than an opaque `500`, and `ServerStore`
+  restores it as `Invalid`, so a store behind a daemon fails the way a local one
+  does. Code matching exhaustively on `CoreError` must add the variant. (#299)
+- **`gonzalo sync` names the keys it could not settle.** It printed counts only,
+  so an operator learned a conflict existed but not where; it now prints a
+  `conflict: <key>` or `unconverged: <key>` line per key on stderr, as `delete`,
+  `reset` and `collect` already do, and `SyncSummary`'s `conflicts` and
+  `unconverged` fields carry the keys rather than counts. `sync --help` gained
+  the exit-code section every other command has, and `migrate` now names the
+  directory it could not read. (#299)
+- **The `gonzalo` facade re-exports `BlobStore`, `AncestryStore`,
+  `sync_with_ancestry` and `now_ms`.** Without `BlobStore`, `Body::Blob` could
+  not be used through the facade at all, though its own docs point at the trait;
+  without the ancestry pair, a consumer wanting ADR 0016's three-way merge had to
+  depend on `gonzalo-core` directly. (#299)
 - **`gonzalo sync` now exits 3 on conflicts or non-convergence**, instead of
   always exiting 0. A conflict to resolve and a run that gave up before
   converging are both recoverable outcomes a script should notice, which is what

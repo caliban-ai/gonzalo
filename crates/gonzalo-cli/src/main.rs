@@ -129,7 +129,12 @@ enum Commands {
         #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
     },
-    /// Sync two filesystem stores.
+    /// Sync two filesystem stores, in both directions. Replicates deletions:
+    /// a tombstone copies like any record. Exits 3 when it reports conflicts to
+    /// resolve, or gave up before the stores converged.
+    #[command(
+        after_help = "Exit codes: 0 converged with no conflicts, 1 error, 2 usage error, 3 conflicts or non-convergence"
+    )]
     Sync {
         /// Root directory of store A.
         #[arg(value_parser = store_root)]
@@ -441,12 +446,20 @@ async fn main() -> Result<ExitCode> {
             println!("copied_to_b:    {}", summary.copied_to_b);
             println!("fast_forwarded: {}", summary.fast_forwarded);
             println!("merged:         {}", summary.merged);
-            println!("conflicts:      {}", summary.conflicts);
-            println!("unconverged:    {}", summary.unconverged);
-            if summary.unconverged > 0 {
+            println!("conflicts:      {}", summary.conflicts.len());
+            println!("unconverged:    {}", summary.unconverged.len());
+            // Name the keys, the way `reset` and `collect` do: a count alone
+            // leaves the operator with nowhere to look (#299).
+            for key in &summary.conflicts {
+                eprintln!("conflict:    {key}");
+            }
+            for key in &summary.unconverged {
+                eprintln!("unconverged: {key}");
+            }
+            if !summary.unconverged.is_empty() {
                 eprintln!(
                     "sync gave up before converging on {} key(s); re-run once writers settle",
-                    summary.unconverged
+                    summary.unconverged.len()
                 );
             }
             return Ok(ExitCode::from(sync_exit_code(&summary)));

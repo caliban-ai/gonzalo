@@ -1,0 +1,46 @@
+{
+  "key": {
+    "namespace": "notes",
+    "collection": "topics",
+    "id": "note1.json"
+  },
+  "kind": "Topic",
+  "revision": {
+    "counter": 0,
+    "hash": "1515b0fccff8fa4797d80d2dcb6711fa5b0a172f484e7fbfd29fad73b9d42e6f"
+  },
+  "parent": null,
+  "body": {
+    "Inline": [
+      123,
+      34,
+      104,
+      101,
+      108,
+      108,
+      111,
+      34,
+      58,
+      34,
+      119,
+      111,
+      114,
+      108,
+      100,
+      34,
+      125,
+      10
+    ]
+  },
+  "meta": {
+    "author": {
+      "id": "gonzalo-cli",
+      "display": null
+    },
+    "origin_system": "migrate",
+    "created": 0,
+    "updated": 0,
+    "labels": {}
+  },
+  "links": []
+}

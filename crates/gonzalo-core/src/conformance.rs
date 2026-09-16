@@ -428,9 +428,11 @@ async fn consumer_put_of_a_tombstone_is_rejected<S: Store>(store: &S) {
     t.kind = RecordKind::Tombstone;
     t.deleted_at = Some(1);
     let out = store.put(t, None).await;
+    // `Invalid`, not `Backend`: the call can never succeed, so a daemon in front
+    // of this store answers 400 rather than 500 (gonzalo#299).
     assert!(
-        out.is_err(),
-        "consumer put of a tombstone-kind record over an absent key must error, got {out:?}"
+        matches!(out, Err(CoreError::Invalid(_))),
+        "consumer put of a tombstone-kind record over an absent key must be Invalid, got {out:?}"
     );
     assert_eq!(store.get_raw(&absent).await.unwrap(), None);
 
@@ -442,8 +444,8 @@ async fn consumer_put_of_a_tombstone_is_rejected<S: Store>(store: &S) {
     over_live.revision = rev.next(b"");
     let out = store.put(over_live, Some(rev.clone())).await;
     assert!(
-        out.is_err(),
-        "consumer put of a tombstone-kind record over a live record must error, got {out:?}"
+        matches!(out, Err(CoreError::Invalid(_))),
+        "consumer put of a tombstone-kind record over a live record must be Invalid, got {out:?}"
     );
     let raw = store.get_raw(&key).await.unwrap().unwrap();
     assert_eq!(raw.revision, rev);

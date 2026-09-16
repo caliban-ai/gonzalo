@@ -646,6 +646,15 @@ fn classify_put_response(status: reqwest::StatusCode, body: &str) -> Result<PutR
             let outcome: PutOutcome = serde_json::from_str(body).map_err(se)?;
             Ok(outcome_to_result(outcome))
         }
+        // A `400` is always the call being wrong — a consumer put of a
+        // tombstone, or a path/body key disagreement (#158) — never the store
+        // failing. Restore it as `Invalid` so a store behind the daemon fails
+        // the way a local one does instead of looking like an outage, keeping
+        // the status in the message as every other failure does (#299).
+        reqwest::StatusCode::BAD_REQUEST => Err(CoreError::Invalid(format!(
+            "daemon returned {}: {body}",
+            reqwest::StatusCode::BAD_REQUEST
+        ))),
         other => Err(CoreError::Backend(format!(
             "daemon returned {other}: {body}"
         ))),
@@ -770,6 +779,10 @@ fn replication_status(s: tonic::Status) -> CoreError {
 fn put_status(s: tonic::Status, key: &RecordKey) -> CoreError {
     if s.code() == tonic::Code::FailedPrecondition {
         CoreError::NotFound(key.clone())
+    } else if s.code() == tonic::Code::InvalidArgument {
+        // The daemon rejected the call itself; mirrors HTTP's 400 so both
+        // transports surface `Invalid` (gonzalo#299).
+        CoreError::Invalid(s.message().to_string())
     } else {
         status(s)
     }
@@ -906,6 +919,22 @@ mod tests {
         assert_eq!(read.to_string(), blob_write.to_string());
     }
 
+    /// A `400` is the daemon saying the call itself is wrong (a consumer put of
+    /// a tombstone). It comes back as `Invalid`, so a daemon-backed store fails
+    /// the way a local one does instead of looking like an outage (#299).
+    #[test]
+    fn a_bad_request_becomes_invalid_not_backend() {
+        let err = classify_put_response(
+            StatusCode::BAD_REQUEST,
+            "consumer put cannot write a tombstone; use delete_as",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::Invalid(ref m) if m.contains("delete_as")),
+            "got {err:?}"
+        );
+    }
+
     /// `413` is the other status #147 cared about; it must survive a read too.
     #[test]
     fn a_read_failure_preserves_any_status() {
@@ -986,17 +1015,18 @@ mod tests {
     }
 
     /// `400 Bad Request` (plain-text body) surfaces status + body, not a decode
-    /// error.
+    /// error — as `Invalid`, since a `400` is always the call being wrong
+    /// rather than the store failing (#299).
     #[test]
     fn bad_request_surfaces_status_and_body() {
         let body = "path/body key disagreement";
         let err = classify_put_response(StatusCode::BAD_REQUEST, body).unwrap_err();
         match err {
-            CoreError::Backend(msg) => {
+            CoreError::Invalid(msg) => {
                 assert!(msg.contains("400"), "want status 400 in {msg:?}");
                 assert!(msg.contains(body), "want daemon body in {msg:?}");
             }
-            other => panic!("expected Backend error, got {other:?}"),
+            other => panic!("expected Invalid error, got {other:?}"),
         }
     }
 

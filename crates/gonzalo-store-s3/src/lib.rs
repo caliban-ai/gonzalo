@@ -322,7 +322,7 @@ fn put_step(key: &RecordKey, plan: PutPlan) -> Result<Planned<PutResult>> {
         PutPlan::NotFound => Err(CoreError::NotFound(key.clone())),
         // Only consumer `plan_put` produces this, for a `RecordKind::Tombstone`
         // record: deletes go through `delete_as`, replication through `put_raw`.
-        PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
+        PutPlan::Rejected(reason) => Err(CoreError::Invalid(reason.to_string())),
     }
 }
 
@@ -806,12 +806,14 @@ mod tests {
     }
 
     #[test]
-    fn put_step_maps_rejected_to_backend_error() {
+    fn put_step_maps_rejected_to_an_invalid_call() {
+        // `Invalid`, not `Backend`: the call can never succeed, and a daemon in
+        // front of this store answers 400 rather than 500 (#299).
         let k = RecordKey::new("ns", "col", "put-rejected");
         let reason = gonzalo_core::CONSUMER_TOMBSTONE_REJECTED;
         match put_step(&k, PutPlan::Rejected(reason)) {
-            Err(CoreError::Backend(msg)) => assert_eq!(msg, reason),
-            other => panic!("expected Backend, got {other:?}"),
+            Err(CoreError::Invalid(msg)) => assert_eq!(msg, reason),
+            other => panic!("expected Invalid, got {other:?}"),
         }
     }
 

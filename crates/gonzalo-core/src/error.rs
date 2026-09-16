@@ -11,6 +11,14 @@ pub enum CoreError {
     NotFound(RecordKey),
     #[error("serialization error: {0}")]
     Serde(String),
+    /// The call itself is wrong, and repeating it unchanged cannot succeed: a
+    /// consumer `put` of a tombstone record, for instance, which must go
+    /// through `delete_as`. Kept apart from [`Backend`](Self::Backend) so a
+    /// caller — and the daemon, which answers `400`/`InvalidArgument` rather
+    /// than `500` — can tell "you asked for something impossible" from "the
+    /// store failed" (gonzalo#299).
+    #[error("invalid request: {0}")]
+    Invalid(String),
     #[error("backend error: {0}")]
     Backend(String),
 }

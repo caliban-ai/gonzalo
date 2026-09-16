@@ -141,6 +141,10 @@ fn put_outcome_response(result: gonzalo_core::Result<PutResult>) -> Response {
             format!("record not found: {key}"),
         )
             .into_response(),
+        // The caller asked for something the store will never accept, such as a
+        // consumer put of a tombstone. Retrying is pointless, so say so with a
+        // 400 instead of hiding it behind an opaque 500 (gonzalo#299).
+        Err(CoreError::Invalid(reason)) => (StatusCode::BAD_REQUEST, reason).into_response(),
         Err(e) => server_error(e),
     }
 }
@@ -889,6 +893,32 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn consumer_put_of_a_tombstone_is_a_bad_request() {
+        // Reading a record through a raw route and writing it back through the
+        // consumer route is an easy mistake. The store refuses it, and that
+        // refusal must read as the caller's error, not an outage (#299).
+        let (svc, _d) = fs_service();
+        let mut record = record_at("writer", Revision::initial(b"{}"));
+        record.kind = gonzalo_core::RecordKind::Tombstone;
+        record.deleted_at = Some(1);
+        let (s, body) = call(
+            svc,
+            scoped(),
+            "PUT",
+            "/v1/records/memory/col/x",
+            Some("wtok"),
+            Some(put_body_with(record, None)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("delete_as"),
+            "should name the API to use: {body}"
+        );
     }
 
     #[tokio::test]
