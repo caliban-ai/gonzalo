@@ -48,6 +48,23 @@ pub struct SyncReport {
     pub merged: Vec<RecordKey>,
     /// Divergences needing manual resolution.
     pub conflicts: Vec<SyncConflict>,
+    /// Keys whose write still lost a race on the final pass, when sync gave up
+    /// after [`MAX_SYNC_PASSES`]. Empty on every run that reached a clean pass,
+    /// so a non-empty list means **the stores may still disagree on these keys,
+    /// even when `conflicts` is empty** (gonzalo#290). Re-run sync once the
+    /// writers settle.
+    pub unconverged: Vec<RecordKey>,
+}
+
+impl SyncReport {
+    /// Whether sync reached a pass in which no write lost a race. `false` means
+    /// the pass limit was exhausted and the stores may still disagree on
+    /// [`unconverged`](Self::unconverged); it says nothing about `conflicts`,
+    /// which are a settled outcome a caller resolves.
+    #[must_use]
+    pub fn converged(&self) -> bool {
+        self.unconverged.is_empty()
+    }
 }
 
 /// Upper bound on sync passes before giving up on a non-quiescent pair.
@@ -61,6 +78,10 @@ const MAX_SYNC_PASSES: usize = 16;
 /// Reconcile stores `a` and `b`. After a run with no `conflicts` that did not
 /// exhaust [`MAX_SYNC_PASSES`], both stores hold the same record (live or
 /// tombstone) for every key.
+///
+/// Check [`SyncReport::converged`] as well as `conflicts`: an exhausted run
+/// reports the still-racing keys in [`SyncReport::unconverged`], and treating
+/// its empty `conflicts` list as "in sync" would be wrong (gonzalo#290).
 ///
 /// Stores need not be quiescent. A single pass can lose a write that lands in
 /// the read→merge→write window (the OCC `put_raw` returns `Conflict`, or
@@ -86,9 +107,12 @@ pub async fn sync_with_ancestry(
     for _ in 0..MAX_SYNC_PASSES {
         let (pass, raced) = sync_pass(a, b, ancestry).await?;
         report = pass;
-        if !raced {
+        if raced.is_empty() {
             break; // quiescent: this pass landed cleanly, stores have converged.
         }
+        // Carried on the report only if this turns out to be the last pass:
+        // a later clean pass replaces the whole report, leaving it empty.
+        report.unconverged = raced;
     }
     Ok(report)
 }
@@ -142,16 +166,17 @@ fn lossless_cap(a: &Record, b: &Record) -> usize {
 }
 
 /// One reconciliation pass over the union of raw keys. Returns the pass's
-/// report and whether any write lost a race (`true` ⇒ a store changed mid-pass,
-/// so the caller should re-loop). A `SyncConflict` is a terminal divergence
-/// (surfaced in the report), not a race, and does not trigger a re-loop.
+/// report and the keys whose write lost a race (non-empty ⇒ a store changed
+/// mid-pass, so the caller should re-loop). A `SyncConflict` is a terminal
+/// divergence (surfaced in the report), not a race, and does not trigger a
+/// re-loop.
 async fn sync_pass(
     a: &dyn Store,
     b: &dyn Store,
     ancestry: Option<&dyn BlobStore>,
-) -> Result<(SyncReport, bool)> {
+) -> Result<(SyncReport, Vec<RecordKey>)> {
     let mut report = SyncReport::default();
-    let mut raced = false;
+    let mut raced: Vec<RecordKey> = Vec::new();
 
     // Raw reads only: consumer reads hide tombstones, and a tombstone that sync
     // cannot see is copied over by the peer's live record (resurrection).
@@ -167,14 +192,14 @@ async fn sync_pass(
                 if copy(b, &rec).await? {
                     report.copied_to_b.push(key);
                 } else {
-                    raced = true;
+                    raced.push(key);
                 }
             }
             (None, Some(rec)) => {
                 if copy(a, &rec).await? {
                     report.copied_to_a.push(key);
                 } else {
-                    raced = true;
+                    raced.push(key);
                 }
             }
             (Some(rec_a), Some(rec_b)) => match relate(&rec_a, &rec_b) {
@@ -183,14 +208,14 @@ async fn sync_pass(
                     if overwrite(b, &rec_a, &rec_b.revision).await? {
                         report.fast_forwarded_to_b.push(key);
                     } else {
-                        raced = true;
+                        raced.push(key);
                     }
                 }
                 Relation::BAhead => {
                     if overwrite(a, &rec_b, &rec_a.revision).await? {
                         report.fast_forwarded_to_a.push(key);
                     } else {
-                        raced = true;
+                        raced.push(key);
                     }
                 }
                 Relation::Diverged => match (rec_a.is_tombstone(), rec_b.is_tombstone()) {
@@ -204,7 +229,7 @@ async fn sync_pass(
                         if la && lb {
                             report.merged.push(key);
                         } else {
-                            raced = true;
+                            raced.push(key);
                         }
                     }
                     (true, false) | (false, true) => {
@@ -229,7 +254,7 @@ async fn sync_pass(
                                     // At least one side raced; re-loop to
                                     // reconcile the store that moved against
                                     // the now-merged peer.
-                                    raced = true;
+                                    raced.push(key);
                                 }
                             }
                             MergeOutcome::NeedsResolution => {
@@ -1154,6 +1179,51 @@ mod tests {
             a.get_raw(&k("d")).await.unwrap().unwrap().revision,
             tomb.revision
         );
+
+        // The stores still disagree — B holds the live record, A the tombstone —
+        // and `conflicts` is empty, so the report must say so itself (#290).
+        assert!(
+            !report.converged(),
+            "an exhausted run must not look converged"
+        );
+        assert_eq!(report.unconverged, vec![k("d")]);
+    }
+
+    #[tokio::test]
+    async fn a_settled_pair_reports_convergence() {
+        // The ordinary case: one clean pass, so nothing is left racing.
+        let a = MemStore::new();
+        let b = MemStore::new();
+        commit(&a, rec("x", RecordKind::Topic, "v0\n"), None).await;
+
+        let report = sync(&a, &b).await.unwrap();
+
+        assert_eq!(report.copied_to_b, vec![k("x")]);
+        assert!(report.converged());
+        assert!(report.unconverged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_settles_after_a_race_reports_convergence() {
+        // B races the first overwrite, then behaves. The later clean pass
+        // replaces the racing pass's whole report, so no stale unconverged
+        // keys survive into the result.
+        let a = MemStore::new();
+        let b = RacyStore::flaky_once();
+        let _ = a
+            .put(rec("t", RecordKind::Topic, "base\nfrom_a\n"), None)
+            .await
+            .unwrap();
+        let _ = b
+            .put(rec("t", RecordKind::Topic, "base\nfrom_b\n"), None)
+            .await
+            .unwrap();
+
+        let report = sync(&a, &b).await.unwrap();
+
+        assert!(report.conflicts.is_empty());
+        assert!(report.converged(), "the retry pass landed cleanly");
+        assert!(report.unconverged.is_empty());
     }
 
     // ---- write helpers treat store movement as a race ----

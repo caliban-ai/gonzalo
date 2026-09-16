@@ -1154,6 +1154,22 @@ pub struct SyncSummary {
     pub fast_forwarded: usize,
     pub merged: usize,
     pub conflicts: usize,
+    /// Keys still racing when sync gave up after its pass limit. Non-zero means
+    /// the stores may still disagree on them even with no conflicts, so the run
+    /// is not proof of convergence (gonzalo#290).
+    pub unconverged: usize,
+}
+
+/// The process exit code for a finished `sync`: 0 when it converged with no
+/// conflicts, [`EXIT_CONFLICT`] when it reports conflicts to resolve or gave up
+/// before converging. Both are recoverable outcomes a script retries or acts on,
+/// matching `delete`, `reset` and `collect` (#290).
+pub fn sync_exit_code(summary: &SyncSummary) -> u8 {
+    if summary.conflicts == 0 && summary.unconverged == 0 {
+        0
+    } else {
+        EXIT_CONFLICT
+    }
 }
 
 /// Sync two filesystem stores via [`gonzalo_core::sync`], at the default
@@ -1173,6 +1189,7 @@ pub async fn sync_stores_with_cap(a: &Path, b: &Path, ancestor_cap: usize) -> Re
         fast_forwarded: report.fast_forwarded_to_a.len() + report.fast_forwarded_to_b.len(),
         merged: report.merged.len(),
         conflicts: report.conflicts.len(),
+        unconverged: report.unconverged.len(),
     })
 }
 
@@ -2749,5 +2766,32 @@ mod tombstone_cli_tests {
             conflicts: vec![RecordKey::new("ns", "col", "b")],
         };
         assert_eq!(reset_exit_code(&conflicted), EXIT_CONFLICT);
+    }
+
+    #[test]
+    fn sync_exit_code_is_three_for_conflicts_or_non_convergence() {
+        let clean = SyncSummary {
+            copied_to_a: 1,
+            copied_to_b: 2,
+            fast_forwarded: 3,
+            merged: 4,
+            conflicts: 0,
+            unconverged: 0,
+        };
+        assert_eq!(sync_exit_code(&clean), 0);
+
+        let conflicted = SyncSummary {
+            conflicts: 1,
+            ..clean
+        };
+        assert_eq!(sync_exit_code(&conflicted), EXIT_CONFLICT);
+
+        // A run that gave up before converging is not "in sync", even though it
+        // reports no conflicts (#290).
+        let unconverged = SyncSummary {
+            unconverged: 1,
+            ..clean
+        };
+        assert_eq!(sync_exit_code(&unconverged), EXIT_CONFLICT);
     }
 }
