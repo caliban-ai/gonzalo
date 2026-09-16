@@ -1,11 +1,12 @@
 name: publish
 
-# A `v*` tag drives TWO release workflows in lockstep off the same push:
-#   - release-image.yml → builds & pushes the ghcr.io/caliban-ai/gonzalo image
-#   - this workflow      → publishes the crate set to crates.io
-# One tag, one release; image ↔ crate versions never drift. (The very first
-# crates.io publish is run locally — see docs/releasing.md — because the
-# new-crate rate limit exceeds a single CI run.)
+# A `v*` tag drives THREE release workflows in lockstep off the same push:
+#   - release-image.yml    → builds & pushes the ghcr.io/caliban-ai/gonzalo image
+#   - this workflow        → publishes the crate set to crates.io
+#   - release-binaries.yml → builds & attaches the macOS arm64 archive
+# One tag, one release; image, crate and binary versions never drift. (The
+# very first crates.io publish is run locally — see docs/releasing.md —
+# because the new-crate rate limit exceeds a single CI run.)
 on:
   push:
     tags:

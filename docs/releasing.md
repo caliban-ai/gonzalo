@@ -25,6 +25,9 @@ The whole workspace **except** dev/bench harnesses:
   root `Cargo.toml`), so `--workspace` never sees it.
 - `gonzalo-soak` — a workspace member marked `publish = false` (HA chaos-soak
   harness, gonzalo#52).
+- `gonzalo-integration-tests` — a workspace member marked `publish = false`
+  (cross-crate integration tests that dev-depend on the `gonzalo-server`
+  binary and the full `gonzalo-graph` grammar set, gonzalo#190/#187).
 
 Everything else (24 crates) publishes: the `gonzalo` facade, the libraries
 (`gonzalo-core`, `gonzalo-store-{fs,git,s3,server}`, `gonzalo-proto`,

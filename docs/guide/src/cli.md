@@ -42,6 +42,11 @@ codes: 0 success, 1 error, 2 usage error, 3 conflict — `delete` with a stale
 `sync` reporting conflicts or giving up before it converged (see below).
 `collect` reports conflicts but exits 0.
 
+`delete` on a key that's already deleted (or never existed) exits `0` and ignores
+`--expected`: to a consumer the key is already absent, so there's nothing to
+check the expected revision against. This is the idempotent-delete rule, not a
+bug — see [Deleting a record](./deletion.md#deleting-a-record).
+
 `migrate --kind` is one of `topic` (default), `memory-tier`, `session` or
 `checkpoint`. It prints how many files it imported and skipped.
 

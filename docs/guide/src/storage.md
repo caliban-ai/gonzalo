@@ -24,7 +24,8 @@ Rust consumers depend on the `gonzalo` crate and enable what they need
 | `ticket`, `ticket-github`, `ticket-jira`, `ticket-linear`, `ticket-gitlab`, `ticket-asana` | the ticket layer and its connectors |
 
 The core and `gonzalo-domain` (typed views for memory tiers, topics, sessions,
-checkpoints and tickets) are always included.
+checkpoints, tickets and [fleet access-control records](./fleet.md)) are
+always included.
 
 ## Choosing a substrate
 

@@ -25,7 +25,7 @@ docker run --rm -p 8080:8080 -p 50051:50051 \
 On startup it prints one line naming what it chose:
 
 ```
-gonzalod: store fs(./gonzalo-data), HTTP on 127.0.0.1:8080, gRPC on 127.0.0.1:50051, auth off
+gonzalod: store fs(./gonzalo-data), ancestor cap 32, HTTP on 127.0.0.1:8080, gRPC on 127.0.0.1:50051, auth off
 ```
 
 ## Configuration
@@ -41,6 +41,7 @@ a silent fallback.
 | `GONZALO_S3_ENDPOINT` | S3 endpoint for a self-hosted store such as RustFS | ambient AWS config |
 | `GONZALO_S3_REGION` | region override | ambient AWS config |
 | `AWS_*` | S3 credentials, read the standard way | none |
+| `GONZALO_ANCESTOR_CAP` | revisions kept in each record's ancestor list (see [Ancestor cap](./deletion.md#ancestor-cap)) | `32` |
 | `GONZALO_HTTP_ADDR` | HTTP bind address | `127.0.0.1:8080` (image: `0.0.0.0:8080`) |
 | `GONZALO_GRPC_ADDR` | gRPC bind address | `127.0.0.1:50051` (image: `0.0.0.0:50051`) |
 | `GONZALO_MAX_BLOB_SIZE` | max bytes per blob over the transports | 64 MiB |

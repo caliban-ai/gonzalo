@@ -24,9 +24,11 @@ pub enum RecordKind {
     /// Binds one external account (chat user id, OIDC subject) to a `Person`.
     /// See ADR 0022.
     IdentityBinding,
-    /// A person's fleet role, fleet-wide or for one repo. See ADR 0022.
+    /// A person's fleet role, fleet-wide or for one workspace. See ADR 0022,
+    /// amended by ADR 0023.
     RoleGrant,
-    /// A chat channel's role ceiling, followed repos and filters. See ADR 0022.
+    /// A chat channel's configuration: what it follows, a notify preset, and
+    /// a role ceiling. See ADR 0022, amended by ADR 0023.
     ChannelConfig,
     /// A one-time, expiring token that links an account to a person. Stores only
     /// the token's hash, and is marked consumed rather than deleted. See ADR 0022.

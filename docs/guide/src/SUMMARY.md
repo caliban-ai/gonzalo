@@ -13,6 +13,7 @@
 - [Running gonzalod](./daemon.md)
 - [Storage backends](./storage.md)
 - [Deletion, reset & collection](./deletion.md)
+- [Fleet access-control records](./fleet.md)
 
 # Changelog
 
@@ -43,3 +44,5 @@
   - [ADR 0019 · Qualified S3 backend for HA: RustFS](./adr/0019-s3-backend-qualification-rustfs.md)
   - [ADR 0020 · Rust-native deliverables; the daemon is the non-Rust boundary](./adr/0020-rust-native-deliverables.md)
   - [ADR 0021 · Replicated deletion with tombstones](./adr/0021-replicated-deletion-with-tombstones.md)
+  - [ADR 0022 · Fleet access-control records as a capability layer](./adr/0022-fleet-access-control-records.md)
+  - [ADR 0023 · Channel configuration fields, and workspaces instead of repos](./adr/0023-channel-config-fields.md)
