@@ -38,18 +38,26 @@ stdout empty, so scripts can tell absent from present.
 
 `delete`, `reset`, `collect` and `sync` accept `--ancestor-cap <n>` (default 32). Exit
 codes: 0 success, 1 error, 2 usage error, 3 conflict — `delete` with a stale
-`--expected`, or `reset` leaving records that were edited concurrently (re-run it).
+`--expected`, `reset` leaving records that were edited concurrently (re-run it), or
+`sync` reporting conflicts or giving up before it converged (see below).
 `collect` reports conflicts but exits 0.
 
 `migrate --kind` is one of `topic` (default), `memory-tier`, `session` or
 `checkpoint`. It prints how many files it imported and skipped.
 
 `sync` copies records each side is missing, merges records both sides changed, and
-reports `copied_to_a`, `copied_to_b`, `fast_forwarded`, `merged` and `conflicts`. It
-also replicates deletions, since tombstones are copied like records. Merging is keyed
-by record kind and uses stored ancestry for a 3-way merge
+reports `copied_to_a`, `copied_to_b`, `fast_forwarded`, `merged`, `conflicts` and
+`unconverged`. It also replicates deletions, since tombstones are copied like
+records. Merging is keyed by record kind and uses stored ancestry for a 3-way merge
 ([ADR 0016](./adr/0016-threeway-merge-stored-ancestry.md)). A conflict it cannot
 resolve is reported, never silently overwritten.
+
+`unconverged` counts keys whose write was still losing a race when sync gave up
+after its pass limit, which happens when writers never stop touching the same keys
+during a run. It is normally `0`. When it isn't, **the two stores may still disagree
+on those keys even though `conflicts` is `0`**: the run is not proof that they match.
+`sync` then prints a line on stderr and exits `3`, so a script can re-run it once the
+writers settle rather than treating the run as a success.
 
 ## Code graph
 

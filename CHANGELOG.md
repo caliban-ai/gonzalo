@@ -109,8 +109,20 @@ CLI and embedded consumer before any writer uses them. (#278)
   or a non-empty set of workspaces), a `notify` preset of `all`, `terminal` or
   `failures`, and a role `ceiling`. Grants scope to the fleet or to one
   workspace. See ADR 0022 and ADR 0023. (#278)
+- **`SyncReport` says when sync did not converge.** A new `unconverged` field
+  lists the keys whose write was still losing a race when sync gave up after its
+  pass limit, and `SyncReport::converged()` reports whether any pass landed
+  cleanly. Before this, a run that never won a race returned an empty
+  `conflicts` list, which read as "in sync" while the two stores still
+  disagreed. `gonzalo sync` prints `unconverged` and warns on stderr. (#290)
 
 ### Changed
+
+- **`gonzalo sync` now exits 3 on conflicts or non-convergence**, instead of
+  always exiting 0. A conflict to resolve and a run that gave up before
+  converging are both recoverable outcomes a script should notice, which is what
+  `delete`, `reset` and `collect` already signal with exit 3. A sync that
+  converges with no conflicts still exits 0. (#290)
 
 - **Breaking: `gonzalo-core`'s `Store` trait gains required methods**
   (`get_raw`, `list_raw`, `put_raw`, `purge`, `delete_as`), `delete` becomes a

@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
     DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, WatchConfig, collect, delete, gc, get,
     index_with_gc_filtered, list, migrate, parse_horizon, parse_revision, reset, reset_exit_code,
-    resolve_parse_worker, status, sync_stores_with_cap, ticket_move, ticket_sync, watch,
+    resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap, ticket_move, ticket_sync,
+    watch,
 };
 use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
 use gonzalo_store_fs::expand_tilde;
@@ -441,6 +442,14 @@ async fn main() -> Result<ExitCode> {
             println!("fast_forwarded: {}", summary.fast_forwarded);
             println!("merged:         {}", summary.merged);
             println!("conflicts:      {}", summary.conflicts);
+            println!("unconverged:    {}", summary.unconverged);
+            if summary.unconverged > 0 {
+                eprintln!(
+                    "sync gave up before converging on {} key(s); re-run once writers settle",
+                    summary.unconverged
+                );
+            }
+            return Ok(ExitCode::from(sync_exit_code(&summary)));
         }
 
         Commands::Delete {
