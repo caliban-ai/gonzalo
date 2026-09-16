@@ -392,7 +392,7 @@ fn put_locked(
         PutPlan::NotFound => Err(CoreError::NotFound(key)),
         // Only consumer `plan_put` produces this, for a `RecordKind::Tombstone`
         // record: deletes go through `delete_as`, replication through `put_raw`.
-        PutPlan::Rejected(reason) => Err(CoreError::Backend(reason.to_string())),
+        PutPlan::Rejected(reason) => Err(CoreError::Invalid(reason.to_string())),
     }
 }
 

@@ -462,6 +462,9 @@ impl Gonzalo for GrpcAdapter {
 fn put_error(e: CoreError) -> Status {
     match e {
         CoreError::NotFound(key) => Status::failed_precondition(format!("record not found: {key}")),
+        // A call the store will never accept (a consumer put of a tombstone):
+        // the caller's fault, not an outage, so not `Internal` (gonzalo#299).
+        CoreError::Invalid(reason) => Status::invalid_argument(reason),
         other => internal(other),
     }
 }
@@ -788,6 +791,18 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn an_invalid_call_is_invalid_argument_not_internal() {
+        // A consumer put of a tombstone can never succeed: the caller's fault,
+        // so `InvalidArgument`, not an outage-looking `Internal` (#299). The
+        // reason is safe to return — it names the API to use, not the store.
+        let status = put_error(CoreError::Invalid(
+            gonzalo_core::CONSUMER_TOMBSTONE_REJECTED.to_string(),
+        ));
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("delete_as"), "{status:?}");
     }
 
     #[tokio::test]

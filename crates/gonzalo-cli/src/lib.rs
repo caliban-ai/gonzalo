@@ -148,7 +148,10 @@ fn collect_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 fn collect_files_inner(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
+    // Name the directory: a bare "No such file or directory (os error 2)"
+    // leaves the user guessing which path was wrong (#299).
+    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+    for entry in entries {
         let entry = entry?;
         let ft = entry.file_type()?;
         if ft.is_dir() {
@@ -1146,6 +1149,7 @@ pub fn parse_revision(raw: &str) -> std::result::Result<Revision, String> {
 // ─── sync_stores ─────────────────────────────────────────────────────────────
 
 /// Summary returned by [`sync_stores`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncSummary {
     pub copied_to_a: usize,
     pub copied_to_b: usize,
@@ -1153,11 +1157,13 @@ pub struct SyncSummary {
     /// overwritten (both directions, tombstones included).
     pub fast_forwarded: usize,
     pub merged: usize,
-    pub conflicts: usize,
-    /// Keys still racing when sync gave up after its pass limit. Non-zero means
+    /// The keys sync could not reconcile, so the caller can print them rather
+    /// than only a count (gonzalo#299).
+    pub conflicts: Vec<RecordKey>,
+    /// Keys still racing when sync gave up after its pass limit. Non-empty means
     /// the stores may still disagree on them even with no conflicts, so the run
     /// is not proof of convergence (gonzalo#290).
-    pub unconverged: usize,
+    pub unconverged: Vec<RecordKey>,
 }
 
 /// The process exit code for a finished `sync`: 0 when it converged with no
@@ -1165,7 +1171,7 @@ pub struct SyncSummary {
 /// before converging. Both are recoverable outcomes a script retries or acts on,
 /// matching `delete`, `reset` and `collect` (#290).
 pub fn sync_exit_code(summary: &SyncSummary) -> u8 {
-    if summary.conflicts == 0 && summary.unconverged == 0 {
+    if summary.conflicts.is_empty() && summary.unconverged.is_empty() {
         0
     } else {
         EXIT_CONFLICT
@@ -1188,8 +1194,8 @@ pub async fn sync_stores_with_cap(a: &Path, b: &Path, ancestor_cap: usize) -> Re
         copied_to_b: report.copied_to_b.len(),
         fast_forwarded: report.fast_forwarded_to_a.len() + report.fast_forwarded_to_b.len(),
         merged: report.merged.len(),
-        conflicts: report.conflicts.len(),
-        unconverged: report.unconverged.len(),
+        conflicts: report.conflicts.into_iter().map(|c| c.key).collect(),
+        unconverged: report.unconverged,
     })
 }
 
@@ -1525,7 +1531,8 @@ mod tests {
         let summary = sync_stores(store_a.path(), store_b.path()).await.unwrap();
         assert_eq!(summary.fast_forwarded, 1);
         assert_eq!(summary.merged, 0);
-        assert_eq!(summary.conflicts, 0);
+        assert!(summary.conflicts.is_empty());
+        assert!(summary.unconverged.is_empty());
     }
 
     // ── ticket_sync: empty config → no reports ───────────────────────────────
@@ -2775,21 +2782,21 @@ mod tombstone_cli_tests {
             copied_to_b: 2,
             fast_forwarded: 3,
             merged: 4,
-            conflicts: 0,
-            unconverged: 0,
+            conflicts: Vec::new(),
+            unconverged: Vec::new(),
         };
         assert_eq!(sync_exit_code(&clean), 0);
 
         let conflicted = SyncSummary {
-            conflicts: 1,
-            ..clean
+            conflicts: vec![RecordKey::new("ns", "col", "a")],
+            ..clean.clone()
         };
         assert_eq!(sync_exit_code(&conflicted), EXIT_CONFLICT);
 
         // A run that gave up before converging is not "in sync", even though it
         // reports no conflicts (#290).
         let unconverged = SyncSummary {
-            unconverged: 1,
+            unconverged: vec![RecordKey::new("ns", "col", "b")],
             ..clean
         };
         assert_eq!(sync_exit_code(&unconverged), EXIT_CONFLICT);

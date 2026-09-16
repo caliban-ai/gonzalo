@@ -4,9 +4,10 @@
 //! selects storage substrates via Cargo features (`fs` is on by default).
 
 pub use gonzalo_core::{
-    Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix,
-    MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey, RecordKind, ResetReport, Result,
-    Revision, Store, SyncConflict, SyncReport, collect, merge, reset, reset_as, sync,
+    AncestryStore, BlobStore, Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult,
+    Identity, KeyPrefix, MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey, RecordKind,
+    ResetReport, Result, Revision, Store, SyncConflict, SyncReport, collect, merge, now_ms, reset,
+    reset_as, sync, sync_with_ancestry,
 };
 
 pub use gonzalo_domain::{
