@@ -2,41 +2,22 @@
 //! redeemed token, sync conflict on independent redemptions, and write-once
 //! audit entries and bindings (ADR 0022).
 
-use gonzalo_core::{
-    Body, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Revision, Store, sync,
-};
+use gonzalo_core::{Body, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Store, sync};
 use gonzalo_domain::RecordCodec;
 use gonzalo_domain::fleet::{
     AuditEntry, AuditResult, Authenticator, BindingOrigin, FleetActor, FleetRole, GrantScope,
     IdentityBinding, LinkSecret, LinkToken,
 };
 use gonzalo_store_fs::FsStore;
-use std::collections::BTreeMap;
 
 const NOW: i64 = 1_700_000_000_000;
 
-fn record(key: RecordKey, kind: RecordKind, body: Body, parent: Option<Revision>) -> Record {
-    let revision = match &parent {
-        Some(prev) => prev.next(body.bytes()),
-        None => Revision::initial(body.bytes()),
-    };
-    Record {
-        key,
-        kind,
-        revision,
-        parent,
-        body,
-        meta: Meta {
-            author: Identity::new("fleet-test"),
-            origin_system: "fleet-test".into(),
-            created: 0,
-            updated: 0,
-            labels: BTreeMap::new(),
-        },
-        links: Vec::new(),
-        ancestors: Vec::new(),
-        deleted_at: None,
-    }
+fn meta() -> Meta {
+    Meta::new(Identity::new("fleet-test"), "fleet-test")
+}
+
+fn record(key: RecordKey, kind: RecordKind, body: Body) -> Record {
+    Record::create(key, kind, body, meta())
 }
 
 fn secret() -> LinkSecret {
@@ -62,10 +43,7 @@ fn binding_key() -> RecordKey {
 async fn put_unredeemed(store: &dyn Store) {
     let t = token();
     let result = store
-        .put(
-            record(t.key(), LinkToken::KIND, t.to_body().unwrap(), None),
-            None,
-        )
+        .put(record(t.key(), LinkToken::KIND, t.to_body().unwrap()), None)
         .await
         .unwrap();
     assert!(matches!(result, PutResult::Committed(_)));
@@ -77,12 +55,7 @@ fn redeemed(stored: &Record, person: &str, at: i64) -> Record {
         .unwrap()
         .redeem(&secret(), person, binding_key(), at)
         .unwrap();
-    record(
-        stored.key.clone(),
-        LinkToken::KIND,
-        t.to_body().unwrap(),
-        Some(stored.revision.clone()),
-    )
+    stored.update(t.to_body().unwrap(), meta())
 }
 
 async fn consumed_by(store: &dyn Store) -> Option<String> {
@@ -190,12 +163,7 @@ async fn audit_entries_are_write_once_per_key() {
     let key = entry.key("n1").unwrap();
     let first = store
         .put(
-            record(
-                key.clone(),
-                AuditEntry::KIND,
-                entry.to_body().unwrap(),
-                None,
-            ),
+            record(key.clone(), AuditEntry::KIND, entry.to_body().unwrap()),
             None,
         )
         .await
@@ -208,7 +176,7 @@ async fn audit_entries_are_write_once_per_key() {
     };
     let second = store
         .put(
-            record(key, AuditEntry::KIND, collision.to_body().unwrap(), None),
+            record(key, AuditEntry::KIND, collision.to_body().unwrap()),
             None,
         )
         .await
@@ -239,7 +207,6 @@ async fn second_bind_of_one_account_conflicts() {
                 key.clone(),
                 IdentityBinding::KIND,
                 bind("p1").to_body().unwrap(),
-                None,
             ),
             None,
         )
@@ -248,12 +215,7 @@ async fn second_bind_of_one_account_conflicts() {
     assert!(matches!(first, PutResult::Committed(_)));
     let second = store
         .put(
-            record(
-                key,
-                IdentityBinding::KIND,
-                bind("p2").to_body().unwrap(),
-                None,
-            ),
+            record(key, IdentityBinding::KIND, bind("p2").to_body().unwrap()),
             None,
         )
         .await

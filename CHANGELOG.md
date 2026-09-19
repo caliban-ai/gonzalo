@@ -9,6 +9,16 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **Builders for the common record paths.** `Record::create` makes a record
+  that doesn't exist yet, and `record.update(body, meta)` makes the next version
+  of one you read: it sets the revision to follow and `parent` to the revision
+  it was built from, which is the pairing OCC depends on and the easiest thing
+  to get wrong by hand — a mismatch doesn't fail at build time, it surfaces
+  later as a spurious conflict. `Meta::new(author, origin_system)` covers the
+  provenance. Fields stay public, so nothing existing breaks. (#305)
+
 ### Fixed
 
 - **The git store writes record files atomically.** It wrote with
