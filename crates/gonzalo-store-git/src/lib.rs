@@ -44,6 +44,12 @@ pub struct PullConflict {
 pub struct PullReport {
     /// The pull was a clean fast-forward (or already up-to-date).
     pub fast_forwarded: bool,
+    /// Records taken from the remote because the local side was simply behind:
+    /// the local revision appears in the remote record's `ancestors`, so this
+    /// is an advance rather than a divergence, exactly as `sync` decides it
+    /// (spec §3.4, gonzalo#289). Nothing local is lost — the local revision is
+    /// already in the chain being adopted.
+    pub advanced: Vec<RecordKey>,
     /// Records reconciled by a content-aware 3-way merge into a merge commit.
     pub merged: Vec<RecordKey>,
     /// Divergences kept local and surfaced for the caller to resolve.
@@ -453,6 +459,19 @@ fn merge_non_ff(
             // Same revision, e.g. two independent deletes of one revision whose
             // files differ only in `deleted_at`: already in sync, keep local.
             (Some(local), Some(remote)) if local.revision == remote.revision => {}
+            // One side is only behind the other: its revision is in the other's
+            // `ancestors`, so this is an advance, not a divergence — the rule
+            // `sync` applies first (spec §3.4, gonzalo#289). Checked before the
+            // kind arms, so advancing to a tombstone is not mistaken for a
+            // delete-versus-edit conflict and advancing an `Opaque` body is not
+            // a spurious one.
+            (Some(local), Some(remote)) if remote.ancestors.contains(&local.revision) => {
+                stage_record(&mut index, &path, &remote)?;
+                report.advanced.push(key);
+            }
+            // Local is ahead: it is already staged from `local_tree`, and the
+            // remote's revision is in its chain, so there is nothing to take.
+            (Some(local), Some(remote)) if local.ancestors.contains(&remote.revision) => {}
             // Two diverged tombstones: the higher (counter, hash) wins, carrying
             // both chains. Checked by kind, because two tombstones always have
             // equal (empty) bodies and the body guard below would skip them.

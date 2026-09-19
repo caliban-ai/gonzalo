@@ -31,6 +31,18 @@ the patch version for fixes.
 
 ### Fixed
 
+- **Git `pull` honours ancestor ordering, like `sync`.** For a record changed on
+  both sides, pull went straight to comparing kinds and bodies, so a remote that
+  had simply advanced past the local revision — the normal state after a peer
+  received the record through `sync` and wrote again — was reported as a
+  divergence. A remote delete came back as a delete-versus-edit conflict that
+  kept the deleted record alive, and an advance of an `Opaque` body, a
+  checkpoint say, conflicted too, while `sync` fast-forwarded both. Pull now
+  checks ancestry first and takes the side that is ahead, naming those keys in
+  the new `PullReport.advanced`. Nothing was ever lost — the old behaviour
+  failed safe and kept the local side — but pull and sync disagreed about the
+  same pair of stores. (#289)
+
 - **The git store writes record files atomically.** It wrote with
   `std::fs::write`, which truncates the file before writing it, while `get` and
   `list` read the working tree without the repo lock. A read that landed
