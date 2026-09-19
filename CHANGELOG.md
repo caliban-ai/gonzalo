@@ -38,6 +38,13 @@ the patch version for fixes.
   precedence, the principals file with an example, the `_blobs` namespace for
   blob access, the 401/403 responses on both transports, and how writes are
   stamped with the principal's name. It also lists `GONZALO_ANCESTOR_CAP`. (#281)
+- **The `gonzalo` crate docs have runnable examples.** The docs.rs page for the
+  crate consumers depend on was a bare list of re-exports; the only walkthrough
+  lived in a private test that never reached the published docs. It now opens
+  with four doctests: store and read a record, update it conditionally and
+  handle the conflict, delete it and watch the delete survive a sync, and map a
+  typed view through `RecordCodec`. They run in CI, so they cannot drift from
+  the API. (#307)
 
 ## [0.7.0] - 2026-09-15
 
