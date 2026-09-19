@@ -613,3 +613,182 @@ async fn nonff_pull_takes_remote_edit_over_local_purge() {
     assert_eq!(raw.revision, remote_rev);
     assert!(!raw.is_tombstone());
 }
+
+// ---- ancestry: pull advances where sync would fast-forward (#289) ----
+//
+// These are the cases where pull used to disagree with sync. Each one has the
+// remote holding a record whose `ancestors` contain the local revision, which
+// is what a peer produces after it received the local record through `sync`
+// and then wrote again. The remote side is written with `put_raw`, the
+// replication write, because that is how such a record reaches a peer: it
+// stores the chain verbatim instead of re-stamping it.
+
+/// The remote advanced a record the local side also changed: local is simply
+/// behind, so pull takes the remote rather than reporting a conflict.
+async fn advanced_remote(remote: &GitStore, id: &str, rec: Record, expected: Revision) -> Revision {
+    let revision = rec.revision.clone();
+    assert!(
+        matches!(
+            remote.put_raw(rec, Some(expected)).await.unwrap(),
+            PutResult::Committed(_)
+        ),
+        "the peer's replication write must land for {id}"
+    );
+    revision
+}
+
+#[tokio::test]
+async fn nonff_pull_advances_to_a_remote_tombstone() {
+    // The peer received the local edit, then deleted it. Before #289 this was
+    // reported as delete-versus-edit and the deleted record stayed alive.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+
+    let local_rev = base_rev.next(b"local\n");
+    commit(
+        &local,
+        record(
+            "m",
+            RecordKind::Topic,
+            "base\nlocal\n",
+            local_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+
+    let mut tomb = record("m", RecordKind::Tombstone, "", local_rev.next(b""), None);
+    tomb.body = Body::Inline(Vec::new());
+    tomb.revision = gonzalo_core::Revision {
+        counter: local_rev.counter + 1,
+        hash: gonzalo_core::tombstone_hash(),
+    };
+    tomb.parent = Some(local_rev.clone());
+    tomb.ancestors = vec![local_rev.clone(), base_rev.clone()];
+    tomb.deleted_at = Some(1_700_000_000_000);
+    let tomb_rev = advanced_remote(&remote, "m", tomb, base_rev).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.conflicts.is_empty(), "an advance is not a conflict");
+    assert!(report.merged.is_empty());
+    assert_eq!(report.advanced, vec![key("m")]);
+    assert!(local.get(&key("m")).await.unwrap().is_none(), "deleted");
+    let raw = local.get_raw(&key("m")).await.unwrap().unwrap();
+    assert!(raw.is_tombstone());
+    assert_eq!(raw.revision, tomb_rev);
+}
+
+#[tokio::test]
+async fn nonff_pull_advances_to_a_remote_recreation() {
+    // Local deleted the record; the peer, holding that tombstone, recreated it.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Topic, "base\n").await;
+
+    let tomb = tombstone(&local, "m", base_rev.clone()).await;
+
+    let mut fresh = record("m", RecordKind::Topic, "reborn\n", base_rev.clone(), None);
+    fresh.revision = gonzalo_core::Revision {
+        counter: tomb.revision.counter + 1,
+        hash: gonzalo_core::ContentHash::of(b"reborn\n"),
+    };
+    fresh.parent = Some(tomb.revision.clone());
+    fresh.ancestors = vec![tomb.revision.clone(), base_rev.clone()];
+    let fresh_rev = advanced_remote(&remote, "m", fresh, base_rev).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.conflicts.is_empty() && report.merged.is_empty());
+    assert_eq!(report.advanced, vec![key("m")]);
+    let got = local.get(&key("m")).await.unwrap().unwrap();
+    assert_eq!(got.revision, fresh_rev);
+    assert_eq!(got.body.bytes(), b"reborn\n");
+}
+
+#[tokio::test]
+async fn nonff_pull_advances_an_opaque_body() {
+    // A `Checkpoint` never merges by content, so before #289 a pure advance of
+    // one was a conflict under pull while sync fast-forwarded it.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Checkpoint, r#"{"at":1}"#).await;
+
+    let local_rev = base_rev.next(br#"{"at":2}"#);
+    commit(
+        &local,
+        record(
+            "m",
+            RecordKind::Checkpoint,
+            r#"{"at":2}"#,
+            local_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+
+    let mut ahead = record(
+        "m",
+        RecordKind::Checkpoint,
+        r#"{"at":3}"#,
+        local_rev.next(br#"{"at":3}"#),
+        Some(local_rev.clone()),
+    );
+    ahead.ancestors = vec![local_rev.clone(), base_rev.clone()];
+    let ahead_rev = advanced_remote(&remote, "m", ahead, base_rev).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.conflicts.is_empty() && report.merged.is_empty());
+    assert_eq!(report.advanced, vec![key("m")]);
+    assert_eq!(body_of(local.get(&key("m")).await.unwrap())["at"], 3);
+    assert_eq!(
+        local.get(&key("m")).await.unwrap().unwrap().revision,
+        ahead_rev
+    );
+}
+
+#[tokio::test]
+async fn nonff_pull_keeps_a_local_record_that_is_ahead() {
+    // The mirror image: the remote is behind, so there is nothing to take and
+    // nothing to report.
+    let (_r, _l, remote, local, _p, branch, base_rev) =
+        cloned_base(RecordKind::Checkpoint, r#"{"at":1}"#).await;
+
+    // The remote edits the record; the local side then advances past it.
+    let remote_rev = base_rev.next(br#"{"at":2}"#);
+    commit(
+        &remote,
+        record(
+            "m",
+            RecordKind::Checkpoint,
+            r#"{"at":2}"#,
+            remote_rev.clone(),
+            Some(base_rev.clone()),
+        ),
+        Some(base_rev.clone()),
+    )
+    .await;
+
+    let mut ahead = record(
+        "m",
+        RecordKind::Checkpoint,
+        r#"{"at":3}"#,
+        remote_rev.next(br#"{"at":3}"#),
+        Some(remote_rev.clone()),
+    );
+    ahead.ancestors = vec![remote_rev.clone(), base_rev.clone()];
+    let ahead_rev = advanced_remote(&local, "m", ahead, base_rev).await;
+
+    let report = local.pull("origin", &branch).await.unwrap();
+
+    assert!(report.conflicts.is_empty() && report.merged.is_empty());
+    assert!(
+        report.advanced.is_empty(),
+        "nothing was taken from the remote"
+    );
+    assert_eq!(
+        local.get(&key("m")).await.unwrap().unwrap().revision,
+        ahead_rev
+    );
+}

@@ -389,7 +389,16 @@ real merge base. Changes:
   remote tombstone is just a modified file, so it replaces the local live
   record. A remote *purge* is a git deletion and removes the local file, which
   is correct (the remote already collected it).
-- **Changed on both sides:** before the body comparison, look at kinds:
+- **Changed on both sides:** check ancestry first, then kinds:
+  - equal revisions → no-op
+  - **one side's revision is in the other's `ancestors` → an advance, not a
+    divergence: take the record that is ahead.** This is §3.4's rule, applied
+    before the kind arms so that advancing to a tombstone is not mistaken for
+    delete-versus-edit, and advancing an `Opaque` body is not a spurious
+    conflict. `PullReport.advanced` names the keys taken from the remote; a
+    local record that is already ahead is kept and reported nowhere, since
+    nothing changed. (Amended by gonzalo#289: pull now matches sync on every
+    §3.4 row. ADR 0021's Consequences note that it did not is superseded.)
   - both tombstones, equal revisions → no-op
   - both tombstones, different revisions → keep the higher `(counter, hash)`,
     with ancestors folded from both
