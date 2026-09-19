@@ -27,7 +27,7 @@ pub use diff::{ChangedPaths, changed_paths, head_commit, is_git_repo};
 /// A put planner: `gonzalo_core::plan_put` (consumer write) or
 /// `gonzalo_core::plan_put_raw` (replication write). Both run inside the same
 /// locked read→plan→write→commit path, `GitStore::put_locked`.
-type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, usize) -> PutPlan;
+type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, i64, usize) -> PutPlan;
 
 /// A record that diverged on both sides of a pull and could not be auto-merged;
 /// the local version is kept and both sides are surfaced for resolution.
@@ -106,7 +106,7 @@ impl GitStore {
         // The decision (recreation re-stamping for `put`, verbatim for
         // `put_raw`, ancestor folding for both) is the shared core planner's
         // (spec §3.2).
-        match plan(current.as_ref(), record, expected, self.cap) {
+        match plan(current.as_ref(), record, expected, now_ms(), self.cap) {
             PutPlan::Write(stored) => {
                 self.write_and_commit(&stored, &format!("put {key}"))?;
                 Ok(PutResult::Committed(stored.revision))

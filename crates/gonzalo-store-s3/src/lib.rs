@@ -426,7 +426,15 @@ impl gonzalo_core::Store for S3Store {
         self.write_planned(&key, |current| {
             put_step(
                 &key,
-                plan_put(current, record.clone(), expected.clone(), self.cap),
+                // The clock is read per attempt: a retry after a lost race is
+                // a later write, and its stamps should say so (gonzalo#293).
+                plan_put(
+                    current,
+                    record.clone(),
+                    expected.clone(),
+                    now_ms(),
+                    self.cap,
+                ),
             )
         })
         .await
@@ -471,7 +479,13 @@ impl gonzalo_core::Store for S3Store {
         self.write_planned(&key, |current| {
             put_step(
                 &key,
-                plan_put_raw(current, record.clone(), expected.clone(), self.cap),
+                plan_put_raw(
+                    current,
+                    record.clone(),
+                    expected.clone(),
+                    now_ms(),
+                    self.cap,
+                ),
             )
         })
         .await
@@ -731,6 +745,7 @@ mod tests {
             Some(&tomb(&k, b"old")),
             live(&k, b"new"),
             None,
+            now_ms(),
             DEFAULT_ANCESTOR_CAP,
         );
         assert!(matches!(plan, PutPlan::Write(_)));

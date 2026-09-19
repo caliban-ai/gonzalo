@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 /// A put planner: `gonzalo_core::plan_put` (consumer write) or
 /// `gonzalo_core::plan_put_raw` (replication write). Both run inside the same
 /// locked read→plan→write path, `put_locked`.
-type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, usize) -> PutPlan;
+type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, i64, usize) -> PutPlan;
 
 /// A `Store` backed by JSON files under a root directory.
 pub struct FsStore {
@@ -381,7 +381,9 @@ fn put_locked(
     // Critical section: the read, the decision and the write are serialized
     // per record.
     let current = read_current(&path)?;
-    match plan(current.as_ref(), record, expected, cap) {
+    // Read the clock inside the lock, so a record's stamped times order the
+    // same way its revisions do (gonzalo#293).
+    match plan(current.as_ref(), record, expected, now_ms(), cap) {
         PutPlan::Write(stored) => {
             write_durable(&path, &stored)?;
             Ok(PutResult::Committed(stored.revision))

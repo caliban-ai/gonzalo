@@ -170,7 +170,16 @@ async fn put_then_get_roundtrips<S: Store>(store: &S) {
         panic!("expected Committed");
     };
     assert_eq!(committed_rev, rec.revision);
-    assert_eq!(store.get(&key).await.unwrap(), Some(rec));
+    // The store stamps the times (#293); the rest round-trips verbatim.
+    let stored = store.get(&key).await.unwrap().expect("just written");
+    assert!(stored.meta.created > 0 && stored.meta.created == stored.meta.updated);
+    assert_eq!(
+        Record {
+            meta: rec.meta.clone(),
+            ..stored
+        },
+        rec
+    );
 }
 
 async fn stale_expected_returns_conflict<S: Store>(store: &S) {
@@ -253,6 +262,8 @@ where
     replication_overwrite_of_tombstone(&factory().await).await;
     put_raw_create_over_tombstone_conflicts(&factory().await).await;
     put_raw_never_restamps(&factory().await).await;
+    store_stamps_record_times(&factory().await).await;
+    put_raw_keeps_the_source_times(&factory().await).await;
     delete_as_stamps_author(&factory().await).await;
     delete_keeps_the_prior_author(&factory().await).await;
     purge_removes_physically(&factory().await).await;
@@ -261,6 +272,79 @@ where
     ancestors_capped_and_ordered(&factory().await, cap).await;
     put_raw_truncates_ancestors_and_excludes_own_revision(&factory().await, cap).await;
     reset_tombstones_a_collection_and_leaves_siblings(&factory().await).await;
+}
+
+/// The store stamps `meta.created` and `meta.updated`, whatever the client
+/// sent: `created` survives an edit, a delete counts as an update, and a
+/// recreation over a tombstone starts a new `created` (gonzalo#293).
+///
+/// Asserted as relations between the stamps rather than against a wall clock,
+/// so two writes landing in the same millisecond can't make this flaky.
+async fn store_stamps_record_times<S: Store>(store: &S) {
+    let key = tomb_key("times");
+    let mut incoming = sample(key.clone(), b"v0");
+    incoming.meta.created = 999;
+    incoming.meta.updated = 999;
+    let rev = committed(store, incoming, None).await;
+
+    let created = store.get(&key).await.unwrap().unwrap().meta;
+    assert_ne!(created.created, 999, "the client's value is not authority");
+    assert!(created.created > 0, "a create is stamped");
+    assert_eq!(
+        created.created, created.updated,
+        "a fresh record was created and updated at the same instant"
+    );
+
+    let mut next = sample(key.clone(), b"v1");
+    next.revision = rev.next(b"v1");
+    let rev = committed(store, next, Some(rev)).await;
+    let edited = store.get(&key).await.unwrap().unwrap().meta;
+    assert_eq!(edited.created, created.created, "created survives an edit");
+    assert!(
+        edited.updated >= created.updated,
+        "updated moves forward: {} then {}",
+        created.updated,
+        edited.updated
+    );
+
+    assert_eq!(
+        store.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+    assert!(tomb.is_tombstone());
+    assert_eq!(tomb.meta.created, created.created, "created is untouched");
+    assert_eq!(
+        tomb.meta.updated,
+        tomb.deleted_at.unwrap(),
+        "a delete is the record's last update"
+    );
+
+    committed(store, sample(key.clone(), b"again"), None).await;
+    let recreated = store.get(&key).await.unwrap().unwrap().meta;
+    assert_eq!(
+        recreated.created, recreated.updated,
+        "a recreation is a new record at an old key"
+    );
+    assert!(recreated.created >= created.created);
+}
+
+/// A replication write keeps the times the source recorded: what it copies
+/// happened elsewhere, and restamping would make every sync look like an edit
+/// (gonzalo#293).
+async fn put_raw_keeps_the_source_times<S: Store>(store: &S) {
+    let key = tomb_key("raw-times");
+    let mut incoming = sample(key.clone(), b"from-a-peer");
+    incoming.meta.created = 111;
+    incoming.meta.updated = 222;
+
+    match store.put_raw(incoming, None).await.unwrap() {
+        PutResult::Committed(_) => {}
+        other => panic!("expected a commit, got {other:?}"),
+    }
+
+    let stored = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!((stored.meta.created, stored.meta.updated), (111, 222));
 }
 
 fn tomb_key(id: &str) -> RecordKey {

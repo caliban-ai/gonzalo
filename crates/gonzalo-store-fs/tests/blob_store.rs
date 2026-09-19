@@ -109,7 +109,16 @@ async fn put_record_syncs_and_leaves_no_temp_file() {
         panic!("expected Committed");
     };
     assert_eq!(rev, rec.revision);
-    assert_eq!(store.get(&key).await.unwrap(), Some(rec));
+    // The store stamps the times (#293); everything else round-trips verbatim.
+    let stored = store.get(&key).await.unwrap().expect("just written");
+    assert!(stored.meta.created > 0 && stored.meta.created == stored.meta.updated);
+    assert_eq!(
+        Record {
+            meta: rec.meta.clone(),
+            ..stored
+        },
+        rec
+    );
 
     // The record's directory holds the committed `.json` (plus the advisory
     // `.json.lock`) but never a leftover `.json.tmp`.
@@ -158,7 +167,16 @@ async fn record_with_blob_body_roundtrips_through_store() {
         panic!("expected Committed");
     };
     assert_eq!(rev, rec.revision);
-    assert_eq!(store.get(&key).await.unwrap(), Some(rec));
+    // The store stamps the times (#293); everything else round-trips verbatim.
+    let stored = store.get(&key).await.unwrap().expect("just written");
+    assert!(stored.meta.created > 0 && stored.meta.created == stored.meta.updated);
+    assert_eq!(
+        Record {
+            meta: rec.meta.clone(),
+            ..stored
+        },
+        rec
+    );
     // The referenced content is still fetchable via the blob store.
     assert_eq!(
         store.get_blob(&hash).await.unwrap().as_deref(),
