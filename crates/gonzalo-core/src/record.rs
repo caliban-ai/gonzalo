@@ -156,7 +156,79 @@ pub struct Record {
     pub deleted_at: Option<i64>,
 }
 
+impl Meta {
+    /// Provenance for a write by `author` from `origin_system`, with no labels.
+    ///
+    /// `created` and `updated` are left at `0`: no store populates them yet
+    /// (gonzalo#293). Set the fields directly for labels or timestamps.
+    pub fn new(author: Identity, origin_system: impl Into<String>) -> Self {
+        Self {
+            author,
+            origin_system: origin_system.into(),
+            created: 0,
+            updated: 0,
+            labels: BTreeMap::new(),
+        }
+    }
+}
+
 impl Record {
+    /// A record that does not exist yet: the body's first revision, no parent
+    /// and no history. Write it with `put(record, None)` (gonzalo#305).
+    ///
+    /// ```
+    /// use gonzalo_core::{Body, Identity, Meta, Record, RecordKey, RecordKind, Revision};
+    ///
+    /// let key = RecordKey::new("caliban", "topics", "rust");
+    /// let meta = Meta::new(Identity::new("ada"), "example");
+    /// let v0 = Record::create(key, RecordKind::Topic, Body::Inline(b"first".to_vec()), meta);
+    /// assert_eq!(v0.revision, Revision::initial(b"first"));
+    /// assert_eq!(v0.parent, None);
+    ///
+    /// // The next version descends from it: `put(v1, Some(v0.revision))` commits.
+    /// let meta = Meta::new(Identity::new("ada"), "example");
+    /// let v1 = v0.update(Body::Inline(b"second".to_vec()), meta);
+    /// assert_eq!(v1.revision, v0.revision.next(b"second"));
+    /// assert_eq!(v1.parent, Some(v0.revision));
+    /// ```
+    pub fn create(key: RecordKey, kind: RecordKind, body: Body, meta: Meta) -> Self {
+        Self {
+            revision: Revision::initial(body.bytes()),
+            key,
+            kind,
+            parent: None,
+            body,
+            meta,
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+        }
+    }
+
+    /// The next version of this record carrying `body`, written by `meta`.
+    ///
+    /// Its revision follows this one and its `parent` is this revision, so
+    /// `put(next, Some(current.revision))` commits it and a stale read
+    /// conflicts — which is the pairing that is easy to get wrong by hand
+    /// (gonzalo#305). `key`, `kind` and `links` carry over.
+    ///
+    /// `ancestors` is left empty: the store folds this record's revision and
+    /// history in when it commits, bounded by its ancestor cap. `deleted_at`
+    /// is cleared, since only a store writes a tombstone.
+    pub fn update(&self, body: Body, meta: Meta) -> Self {
+        Self {
+            key: self.key.clone(),
+            kind: self.kind,
+            revision: self.revision.next(body.bytes()),
+            parent: Some(self.revision.clone()),
+            body,
+            meta,
+            links: self.links.clone(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+        }
+    }
+
     /// Whether this record is a deletion marker.
     pub fn is_tombstone(&self) -> bool {
         self.kind == RecordKind::Tombstone
@@ -166,6 +238,101 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- builders (#305) ----
+
+    fn meta_by(author: &str) -> Meta {
+        Meta::new(Identity::new(author), "test")
+    }
+
+    #[test]
+    fn meta_new_carries_author_and_origin_and_nothing_else() {
+        let m = meta_by("ada");
+        assert_eq!(m.author, Identity::new("ada"));
+        assert_eq!(m.origin_system, "test");
+        assert_eq!((m.created, m.updated), (0, 0));
+        assert!(m.labels.is_empty());
+    }
+
+    #[test]
+    fn create_is_a_first_revision_with_no_history() {
+        let key = RecordKey::new("ns", "col", "id");
+        let body = Body::Inline(b"hello".to_vec());
+        let r = Record::create(key.clone(), RecordKind::Topic, body.clone(), meta_by("ada"));
+
+        assert_eq!(r.key, key);
+        assert_eq!(r.kind, RecordKind::Topic);
+        assert_eq!(r.revision, Revision::initial(b"hello"));
+        assert_eq!(r.parent, None);
+        assert_eq!(r.body, body);
+        assert!(r.links.is_empty() && r.ancestors.is_empty());
+        assert_eq!(r.deleted_at, None);
+    }
+
+    #[test]
+    fn update_follows_the_revision_it_was_built_from() {
+        let key = RecordKey::new("ns", "col", "id");
+        let mut v0 = Record::create(
+            key.clone(),
+            RecordKind::Topic,
+            Body::Inline(b"v0".to_vec()),
+            meta_by("ada"),
+        );
+        v0.links = vec![RecordKey::new("ns", "col", "other")];
+
+        let v1 = v0.update(Body::Inline(b"v1".to_vec()), meta_by("grace"));
+
+        assert_eq!(v1.revision, v0.revision.next(b"v1"));
+        assert_eq!(v1.parent, Some(v0.revision.clone()));
+        assert_eq!(v1.body, Body::Inline(b"v1".to_vec()));
+        assert_eq!(
+            v1.meta.author,
+            Identity::new("grace"),
+            "the updater writes it"
+        );
+        assert_eq!((v1.key, v1.kind), (key, RecordKind::Topic));
+        assert_eq!(v1.links, v0.links, "links carry over");
+        assert!(
+            v1.ancestors.is_empty(),
+            "the store folds history in on commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn built_records_commit_through_occ() {
+        use crate::{PutResult, Store, memstore::MemStore};
+
+        let store = MemStore::new();
+        let key = RecordKey::new("ns", "col", "id");
+        let v0 = Record::create(
+            key.clone(),
+            RecordKind::Topic,
+            Body::Inline(b"v0".to_vec()),
+            meta_by("ada"),
+        );
+        assert!(matches!(
+            store.put(v0.clone(), None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+
+        // Update what was read back, the way a consumer does.
+        let current = store.get(&key).await.unwrap().unwrap();
+        let v1 = current.update(Body::Inline(b"v1".to_vec()), meta_by("ada"));
+        assert!(matches!(
+            store.put(v1, Some(current.revision.clone())).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+
+        // A second update built from the now-stale read conflicts, as OCC should.
+        let stale = current.update(Body::Inline(b"v1b".to_vec()), meta_by("ada"));
+        assert!(matches!(
+            store
+                .put(stale, Some(current.revision.clone()))
+                .await
+                .unwrap(),
+            PutResult::Conflict(_)
+        ));
+    }
 
     #[test]
     fn merge_class_is_assigned_per_kind() {

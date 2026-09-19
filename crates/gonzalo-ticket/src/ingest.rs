@@ -6,7 +6,6 @@
 use crate::{TicketSource, record_key};
 use gonzalo_core::{ContentHash, Identity, Meta, PutResult, Record, Revision, Store};
 use gonzalo_domain::{RecordCodec, Ticket};
-use std::collections::BTreeMap;
 
 /// How many tickets a sync created, updated, or left untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -88,26 +87,10 @@ async fn upsert(
     }
 
     let expected: Option<Revision> = existing.as_ref().map(|r| r.revision.clone());
-    let revision = match &expected {
-        Some(prev) => prev.next(body.bytes()),
-        None => Revision::initial(body.bytes()),
-    };
-    let record = Record {
-        key: key.clone(),
-        kind: Ticket::KIND,
-        revision,
-        parent: expected.clone(),
-        body,
-        meta: Meta {
-            author: Identity::new(author),
-            origin_system: "ticket-ingest".into(),
-            created: 0,
-            updated: 0,
-            labels: BTreeMap::new(),
-        },
-        links: vec![],
-        ancestors: Vec::new(),
-        deleted_at: None,
+    let meta = Meta::new(Identity::new(author), "ticket-ingest");
+    let record = match &existing {
+        Some(current) => current.update(body, meta),
+        None => Record::create(key.clone(), Ticket::KIND, body, meta),
     };
     match store.put(record, expected).await? {
         PutResult::Committed(_) => Ok(if existing.is_some() {
@@ -129,6 +112,7 @@ mod tests {
     use crate::InMemorySource;
     use gonzalo_domain::{BodyFormat, Provider, State, StateCategory, TicketBody};
     use gonzalo_store_fs::FsStore;
+    use std::collections::BTreeMap;
 
     fn ticket(uid: &str, title: &str) -> Ticket {
         Ticket {
