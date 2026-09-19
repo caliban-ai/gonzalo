@@ -9,6 +9,18 @@ the patch version for fixes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The git store writes record files atomically.** It wrote with
+  `std::fs::write`, which truncates the file before writing it, while `get` and
+  `list` read the working tree without the repo lock. A read that landed
+  mid-write saw an empty or half-written record and failed with a serialization
+  error, and a crash between the truncate and the write left a zero-length
+  record. Since 0.7.0 a delete writes a tombstone file too, so deletes had the
+  same exposure. A write now goes to a temp file that is synced, renamed over
+  the record and followed by a directory fsync, as the fs store already did, so
+  a reader sees the old record or the new one and never a torn file. (#283)
+
 ## [0.7.0] - 2026-09-15
 
 Deletion replicates. A delete used to be local: sync met a peer that still held

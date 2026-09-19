@@ -130,7 +130,7 @@ impl GitStore {
         }
         let bytes =
             serde_json::to_vec_pretty(record).map_err(|e| CoreError::Serde(e.to_string()))?;
-        std::fs::write(&abs, &bytes).map_err(be)?;
+        write_atomic(&abs, &bytes).map_err(be)?;
         self.commit_file(&rel, message)
     }
 
@@ -271,6 +271,49 @@ fn rel_path(key: &RecordKey) -> PathBuf {
 
 fn be<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Backend(e.to_string())
+}
+
+/// Replace the file at `path` with `bytes` in one step, the way the fs store's
+/// `write_durable` does (gonzalo#283).
+///
+/// Consumer `get` and `list` read the working tree without the repo lock. A
+/// plain `std::fs::write` truncates the file first, so a reader landing
+/// mid-write saw an empty or half-written record, and a crash between the
+/// truncate and the write left a zero-length one. Since tombstones (#203) a
+/// delete writes a file too, so it had the same exposure.
+///
+/// Instead: write a temp file beside the target, `sync_all` it so its bytes are
+/// on disk, rename it over the target (atomic against readers), then fsync the
+/// directory so the new entry survives a crash. A reader sees the old record or
+/// the new one, never a torn file. The temp name ends in `.tmp`, not `.json`,
+/// so a crash that leaves it behind can't be walked as a record, and it is
+/// never staged: commits add paths explicitly.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Best-effort fsync of the directory `path`, making a preceding `rename` into
+/// it durable across a crash. Where a platform rejects fsync on a directory
+/// handle (`InvalidInput`), treat it as a no-op rather than a write failure.
+/// Mirrors the fs store's helper; `gonzalo-core` does no I/O, so there is no
+/// shared home for it.
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    let dir = std::fs::File::open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Acquire the repo-level exclusive lock guarding the OCC critical section of
