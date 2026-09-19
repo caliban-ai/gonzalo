@@ -21,6 +21,14 @@ the patch version for fixes.
   the record and followed by a directory fsync, as the fs store already did, so
   a reader sees the old record or the new one and never a torn file. (#283)
 
+### Docs
+
+- **The container guide covers scoped auth.** `docs/container.md` listed
+  `GONZALO_AUTH_FILE` but never said what goes in it. It now documents the mode
+  precedence, the principals file with an example, the `_blobs` namespace for
+  blob access, the 401/403 responses on both transports, and how writes are
+  stamped with the principal's name. It also lists `GONZALO_ANCESTOR_CAP`. (#281)
+
 ## [0.7.0] - 2026-09-15
 
 Deletion replicates. A delete used to be local: sync met a peer that still held
