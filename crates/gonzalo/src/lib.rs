@@ -2,6 +2,147 @@
 //!
 //! This facade re-exports the curated surface most consumers need and
 //! selects storage substrates via Cargo features (`fs` is on by default).
+//!
+//! Everything is one [`Record`] — a body plus provenance at a [`RecordKey`] —
+//! behind one [`Store`] trait, so the substrate is configuration rather than
+//! API. The examples below use [`FsStore`]; a daemon-backed `ServerStore`, git
+//! or S3 store behaves the same way.
+//!
+//! # Store and read a record
+//!
+//! ```
+//! use gonzalo::{Body, FsStore, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Store};
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! let dir = tempfile::tempdir().unwrap();
+//! let store = FsStore::new(dir.path());
+//!
+//! let key = RecordKey::new("caliban", "topics", "rust");
+//! let meta = Meta::new(Identity::new("ada"), "example");
+//! let record = Record::create(
+//!     key.clone(),
+//!     RecordKind::Topic,
+//!     Body::Inline(b"ownership\n".to_vec()),
+//!     meta,
+//! );
+//!
+//! // `None` means "this key should not exist yet".
+//! let PutResult::Committed(revision) = store.put(record, None).await? else {
+//!     panic!("the key was already taken");
+//! };
+//!
+//! let stored = store.get(&key).await?.expect("just written");
+//! assert_eq!(stored.revision, revision);
+//! assert_eq!(stored.body, Body::Inline(b"ownership\n".to_vec()));
+//! # Ok::<(), gonzalo::CoreError>(())
+//! # }).unwrap();
+//! ```
+//!
+//! # Update without losing a concurrent write
+//!
+//! A write names the revision it expects to replace. If someone else got there
+//! first, the store returns [`PutResult::Conflict`] carrying their record
+//! instead of overwriting it — concurrent edits are never silently lost
+//! (ADR 0005). Re-read, re-apply, retry.
+//!
+//! ```
+//! use gonzalo::{Body, FsStore, Identity, Meta, PutResult, Record, RecordKey, RecordKind, Store};
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let store = FsStore::new(dir.path());
+//! # let key = RecordKey::new("caliban", "topics", "rust");
+//! # let meta = Meta::new(Identity::new("ada"), "example");
+//! # let first = Record::create(key.clone(), RecordKind::Topic, Body::Inline(b"v0\n".to_vec()), meta);
+//! # store.put(first, None).await?;
+//! let current = store.get(&key).await?.expect("stored above");
+//! let meta = Meta::new(Identity::new("ada"), "example");
+//! let next = current.update(Body::Inline(b"v1\n".to_vec()), meta);
+//!
+//! match store.put(next, Some(current.revision.clone())).await? {
+//!     PutResult::Committed(revision) => println!("now at {revision:?}"),
+//!     PutResult::Conflict(c) => {
+//!         // Someone wrote between our read and our write; `c.current` is theirs.
+//!         println!("stale: the store holds {:?}", c.current.revision);
+//!     }
+//! }
+//!
+//! // Writing again from the same stale read conflicts rather than clobbering.
+//! let meta = Meta::new(Identity::new("ada"), "example");
+//! let stale = current.update(Body::Inline(b"v1-again\n".to_vec()), meta);
+//! assert!(matches!(
+//!     store.put(stale, Some(current.revision)).await?,
+//!     PutResult::Conflict(_)
+//! ));
+//! # Ok::<(), gonzalo::CoreError>(())
+//! # }).unwrap();
+//! ```
+//!
+//! # Deletes replicate
+//!
+//! A delete writes a tombstone, so it survives replication: syncing with a peer
+//! that still holds the record does not bring it back (ADR 0021). Consumer
+//! reads hide tombstones; `get_raw` shows them.
+//!
+//! ```
+//! use gonzalo::{Body, FsStore, Identity, Meta, Record, RecordKey, RecordKind, Store, sync};
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+//! let (a, b) = (FsStore::new(dir_a.path()), FsStore::new(dir_b.path()));
+//!
+//! let key = RecordKey::new("caliban", "topics", "rust");
+//! let meta = Meta::new(Identity::new("ada"), "example");
+//! let record = Record::create(key.clone(), RecordKind::Topic, Body::Inline(b"v0\n".to_vec()), meta);
+//! let revision = match a.put(record, None).await? {
+//!     gonzalo::PutResult::Committed(r) => r,
+//!     gonzalo::PutResult::Conflict(_) => unreachable!("fresh store"),
+//! };
+//!
+//! sync(&a, &b).await?;                       // B has it
+//! a.delete(&key, Some(revision)).await?;     // deleted on A
+//! let report = sync(&a, &b).await?;          // the delete travels
+//! assert!(report.conflicts.is_empty() && report.converged());
+//!
+//! assert!(b.get(&key).await?.is_none(), "gone for consumers");
+//! assert!(b.get_raw(&key).await?.unwrap().is_tombstone(), "a tombstone remains");
+//! # Ok::<(), gonzalo::CoreError>(())
+//! # }).unwrap();
+//! ```
+//!
+//! # Typed views
+//!
+//! Domain types map to and from a record body with [`RecordCodec`], so a
+//! consumer works with its own structs rather than bytes.
+//!
+//! ```
+//! use gonzalo::{FsStore, Identity, Meta, Record, RecordCodec, RecordKey, Store, Topic};
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let store = FsStore::new(dir.path());
+//! let topic = Topic {
+//!     slug: "rust".into(),
+//!     bullets: vec!["ownership".into(), "borrowing".into()],
+//! };
+//! let key = RecordKey::new("caliban", "topics", "rust");
+//! let meta = Meta::new(Identity::new("ada"), "example");
+//! store
+//!     .put(Record::create(key.clone(), Topic::KIND, topic.to_body()?, meta), None)
+//!     .await?;
+//!
+//! let stored = store.get(&key).await?.expect("just written");
+//! assert_eq!(Topic::from_body(&stored.body)?, topic);
+//! # Ok::<(), gonzalo::CoreError>(())
+//! # }).unwrap();
+//! ```
+//!
+//! The guide covers the rest: [deletion, reset and collection][del], the
+//! [daemon][daemon] and the [fleet records][fleet].
+//!
+//! [del]: https://caliban-ai.github.io/gonzalo/deletion.html
+//! [daemon]: https://caliban-ai.github.io/gonzalo/daemon.html
+//! [fleet]: https://caliban-ai.github.io/gonzalo/fleet.html
 
 pub use gonzalo_core::{
     AncestryStore, BlobStore, Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult,
