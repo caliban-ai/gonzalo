@@ -11,6 +11,16 @@ the patch version for fixes.
 
 ### Added
 
+- **Records carry their times.** `Meta.created` and `Meta.updated` were always
+  `0`; the store now stamps both inside the same critical section that decides
+  the write, exactly as it stamps a tombstone's `deleted_at`. `created` survives
+  every edit, a delete counts as the record's last update (its `updated` equals
+  the tombstone's `deleted_at`), and a recreation over a tombstone starts a new
+  `created`, because that is a new record at an old key. A replication write
+  keeps the source's times, so syncing a record is not an edit. A client's
+  values are overwritten: times a caller can set are times a caller can lie
+  about. The conformance suite asserts all of it, so every substrate agrees.
+  (#293)
 - **Builders for the common record paths.** `Record::create` makes a record
   that doesn't exist yet, and `record.update(body, meta)` makes the next version
   of one you read: it sets the revision to follow and `parent` to the revision

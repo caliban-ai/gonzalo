@@ -71,6 +71,10 @@ pub fn fold_ancestors(
 /// The tombstone that deleting the live record `current` produces. `author`,
 /// when given, is the deleter and replaces `meta.author`; otherwise the
 /// tombstone keeps the last live writer's metadata.
+///
+/// A delete is a write, so `meta.updated` becomes the delete's time while
+/// `meta.created` stays the deleted record's (gonzalo#293). `deleted_at` is the
+/// same instant, and is what collection reads.
 pub fn tombstone_of(
     current: &Record,
     now_ms: i64,
@@ -86,6 +90,7 @@ pub fn tombstone_of(
     if let Some(author) = author {
         meta.author = author.clone();
     }
+    meta.updated = now_ms;
     Record {
         key: current.key.clone(),
         kind: RecordKind::Tombstone,
@@ -132,10 +137,22 @@ pub const CONSUMER_TOMBSTONE_REJECTED: &str =
 /// absent: a create (`expected == None`) recreates the key past the
 /// tombstone, and any `Some(_)` is `NotFound`. Replication writes use
 /// [`plan_put_raw`].
+///
+/// The store stamps `meta.created` and `meta.updated` on every consumer write,
+/// inside the same critical section that decides the write, exactly as it
+/// stamps a tombstone's `deleted_at` (gonzalo#293). A client's values are
+/// overwritten: times a caller can set are times a caller can lie about, and
+/// two substrates would disagree about what a record's history means.
+///
+/// `updated` is always the write's time. `created` is the live record's
+/// `created` when one is being replaced, so it survives every edit, and the
+/// write's time otherwise — including a recreation over a tombstone, which is a
+/// new record at an old key, not a continuation of the deleted one.
 pub fn plan_put(
     current: Option<&Record>,
     mut record: Record,
     expected: Option<Revision>,
+    now_ms: i64,
     cap: usize,
 ) -> PutPlan {
     if record.is_tombstone() {
@@ -146,6 +163,8 @@ pub fn plan_put(
             if expected.is_some() {
                 return PutPlan::NotFound;
             }
+            record.meta.created = now_ms;
+            record.meta.updated = now_ms;
             record.ancestors = fold_ancestors(&record.revision, &record.ancestors, None, cap);
             PutPlan::Write(record)
         }
@@ -161,6 +180,10 @@ pub fn plan_put(
                 };
                 record.parent = Some(t.revision.clone());
                 record.deleted_at = None;
+                // A recreation starts a new life at this key: the deleted
+                // record's `created` does not carry over.
+                record.meta.created = now_ms;
+                record.meta.updated = now_ms;
                 record.ancestors =
                     fold_ancestors(&record.revision, &record.ancestors, Some(t), cap);
                 PutPlan::Write(record)
@@ -171,6 +194,8 @@ pub fn plan_put(
         },
         Some(c) => {
             if expected.as_ref() == Some(&c.revision) {
+                record.meta.created = c.meta.created;
+                record.meta.updated = now_ms;
                 record.ancestors =
                     fold_ancestors(&record.revision, &record.ancestors, Some(c), cap);
                 PutPlan::Write(record)
@@ -189,10 +214,18 @@ pub fn plan_put(
 /// a tombstone is an ordinary record here. A create that finds anything stored
 /// (live or tombstone) is a `Conflict` carrying it, so sync re-reads instead of
 /// turning a copy into a recreation that would resurrect a deleted record.
+///
+/// `now_ms` is deliberately unused: a replication write copies a record that
+/// already happened elsewhere, so it keeps the source's `created` and `updated`
+/// (gonzalo#293). Stamping them here would make every sync look like an edit
+/// and lose when the record was really written. The parameter is kept so both
+/// planners share one signature, which is what lets a store hand either to its
+/// locked read→plan→write path.
 pub fn plan_put_raw(
     current: Option<&Record>,
     mut record: Record,
     expected: Option<Revision>,
+    _now_ms: i64,
     cap: usize,
 ) -> PutPlan {
     match (current, expected) {
@@ -282,6 +315,31 @@ mod tests {
     use crate::{Body, Identity, Meta, RecordKey, RecordKind};
     use std::collections::BTreeMap;
 
+    /// A fixed clock for the tests that are about a plan's shape rather than
+    /// its stamps (gonzalo#293).
+    const NOW: i64 = 1_700_000_000_000;
+
+    /// [`super::plan_put`] at [`NOW`]. The stamping itself is covered by the
+    /// `records_are_stamped_*` tests below, which call the planner directly.
+    fn plan_put(
+        current: Option<&Record>,
+        record: Record,
+        expected: Option<Revision>,
+        cap: usize,
+    ) -> PutPlan {
+        super::plan_put(current, record, expected, NOW, cap)
+    }
+
+    /// [`super::plan_put_raw`] at [`NOW`], which it ignores.
+    fn plan_put_raw(
+        current: Option<&Record>,
+        record: Record,
+        expected: Option<Revision>,
+        cap: usize,
+    ) -> PutPlan {
+        super::plan_put_raw(current, record, expected, NOW, cap)
+    }
+
     fn rev(counter: u64, body: &[u8]) -> Revision {
         Revision {
             counter,
@@ -307,6 +365,94 @@ mod tests {
             ancestors,
             deleted_at: None,
         }
+    }
+
+    // ---- record times (#293) ----
+
+    /// The `PutPlan::Write` a plan produced, or a panic naming what it was.
+    fn written(plan: PutPlan) -> Record {
+        match plan {
+            PutPlan::Write(r) => r,
+            other => panic!("expected a write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_create_is_stamped_with_the_write_time() {
+        let mut incoming = live(0, b"v0", vec![]);
+        // A client's values carry no authority; the store decides.
+        incoming.meta.created = 999;
+        incoming.meta.updated = 999;
+
+        let stored = written(super::plan_put(None, incoming, None, NOW, 32));
+
+        assert_eq!(stored.meta.created, NOW);
+        assert_eq!(stored.meta.updated, NOW);
+    }
+
+    #[test]
+    fn an_update_keeps_created_and_advances_updated() {
+        let mut current = live(0, b"v0", vec![]);
+        current.meta.created = NOW;
+        current.meta.updated = NOW;
+        let later = NOW + 5_000;
+
+        let stored = written(super::plan_put(
+            Some(&current),
+            live(1, b"v1", vec![]),
+            Some(current.revision.clone()),
+            later,
+            32,
+        ));
+
+        assert_eq!(stored.meta.created, NOW, "created survives every edit");
+        assert_eq!(stored.meta.updated, later);
+    }
+
+    #[test]
+    fn a_recreation_over_a_tombstone_starts_a_new_created() {
+        // The key is reused, but the record is a new one: carrying the deleted
+        // record's `created` across would claim a history it doesn't have.
+        let mut deleted = live(0, b"v0", vec![]);
+        deleted.meta.created = NOW;
+        let tomb = tombstone_of(&deleted, NOW + 1_000, 32, None);
+        let later = NOW + 9_000;
+
+        let stored = written(super::plan_put(
+            Some(&tomb),
+            live(0, b"fresh", vec![]),
+            None,
+            later,
+            32,
+        ));
+
+        assert_eq!(stored.meta.created, later);
+        assert_eq!(stored.meta.updated, later);
+    }
+
+    #[test]
+    fn a_tombstone_records_the_delete_as_its_update() {
+        let mut current = live(0, b"v0", vec![]);
+        current.meta.created = NOW;
+        current.meta.updated = NOW;
+
+        let tomb = tombstone_of(&current, NOW + 250, 32, None);
+
+        assert_eq!(tomb.meta.created, NOW, "the record was created when it was");
+        assert_eq!(tomb.meta.updated, NOW + 250);
+        assert_eq!(tomb.deleted_at, Some(NOW + 250));
+    }
+
+    #[test]
+    fn a_replication_write_keeps_the_source_times() {
+        // What sync copies happened elsewhere, at the time the source says.
+        let mut incoming = live(0, b"v0", vec![]);
+        incoming.meta.created = 111;
+        incoming.meta.updated = 222;
+
+        let stored = written(super::plan_put_raw(None, incoming, None, NOW, 32));
+
+        assert_eq!((stored.meta.created, stored.meta.updated), (111, 222));
     }
 
     #[test]
@@ -383,7 +529,11 @@ mod tests {
         assert_eq!(t.body, Body::Inline(Vec::new()));
         assert_eq!(t.ancestors, vec![cur.revision.clone(), rev(4, b"prev")]);
         assert_eq!(t.deleted_at, Some(1_234));
-        assert_eq!(t.meta, cur.meta);
+        assert_eq!(t.meta.author, cur.meta.author);
+        assert_eq!(t.meta.origin_system, cur.meta.origin_system);
+        assert_eq!(t.meta.created, cur.meta.created);
+        // The delete is the record's last update (#293).
+        assert_eq!(t.meta.updated, 1_234);
         assert!(t.links.is_empty());
     }
 
@@ -424,7 +574,11 @@ mod tests {
     #[test]
     fn put_create_on_absent_writes() {
         let rec = live(0, b"new", vec![]);
-        assert_eq!(plan_put(None, rec.clone(), None, 32), PutPlan::Write(rec));
+        let mut stamped = rec.clone();
+        // The only thing the planner changes is the times (#293).
+        stamped.meta.created = NOW;
+        stamped.meta.updated = NOW;
+        assert_eq!(plan_put(None, rec, None, 32), PutPlan::Write(stamped));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// A store-side planner for a record write: [`plan_put`] or [`plan_put_raw`].
-type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, usize) -> PutPlan;
+type PutPlanner = fn(Option<&Record>, Record, Option<Revision>, i64, usize) -> PutPlan;
 
 /// Reference in-memory store. See the module docs.
 pub struct MemStore {
@@ -72,7 +72,7 @@ impl MemStore {
     ) -> Result<PutResult> {
         let mut g = self.records.lock().unwrap();
         let key = record.key.clone();
-        match plan(g.get(&key), record, expected, self.cap) {
+        match plan(g.get(&key), record, expected, self.now(), self.cap) {
             PutPlan::Write(stored) => {
                 let rev = stored.revision.clone();
                 g.insert(key, stored);

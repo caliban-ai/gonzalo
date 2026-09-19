@@ -130,7 +130,15 @@ impl Body {
 pub struct Meta {
     pub author: Identity,
     pub origin_system: String,
+    /// When this record was first written, in ms since the Unix epoch. Stamped
+    /// by the store and carried across every edit; a recreation over a
+    /// tombstone starts a new one, because that is a new record at an old key
+    /// (gonzalo#293).
     pub created: i64,
+    /// When this record was last written, in ms since the Unix epoch. Stamped
+    /// by the store, including on a delete, where it equals the tombstone's
+    /// `deleted_at`. A replication write keeps the source's times rather than
+    /// restamping, so syncing is not an edit.
     pub updated: i64,
     pub labels: BTreeMap<String, String>,
 }
@@ -159,8 +167,9 @@ pub struct Record {
 impl Meta {
     /// Provenance for a write by `author` from `origin_system`, with no labels.
     ///
-    /// `created` and `updated` are left at `0`: no store populates them yet
-    /// (gonzalo#293). Set the fields directly for labels or timestamps.
+    /// `created` and `updated` are left at `0` and the store stamps them on
+    /// write (gonzalo#293), so there is nothing useful to pass here. Set the
+    /// fields directly for labels.
     pub fn new(author: Identity, origin_system: impl Into<String>) -> Self {
         Self {
             author,
