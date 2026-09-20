@@ -33,7 +33,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0006](0006-substrate-conformance-suite.md) | Shared substrate conformance suite | accepted |
 | [0007](0007-dual-transport-daemon.md) | Dual-transport daemon: gRPC + HTTP/JSON over one schema | accepted |
 | [0008](0008-capability-layers-over-core.md) | Domain, vector, and graph as capability layers over core | accepted |
-| [0009](0009-workspace-layout-and-facade.md) | Workspace layout and single-facade public surface | accepted |
+| [0009](0009-workspace-layout-and-facade.md) | Workspace layout and single-facade public surface | accepted (facade surface grouped by [0026](0026-grouped-facade-surface.md)) |
 | [0010](0010-ticket-system-capability-layer.md) | Ticket systems as a normalized work-item capability layer | accepted |
 | [0011](0011-knowledge-store-capability.md) | Knowledge store over the capability layers | accepted |
 | [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted (blob GC marking amended by [0024](0024-blob-garbage-collection.md)) |
@@ -50,6 +50,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0023](0023-channel-config-fields.md) | Channel configuration fields, and workspaces instead of repos | accepted |
 | [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted |
 | [0025](0025-s3-tombstone-markers.md) | Sibling tombstone markers in the S3 layout | accepted |
+| [0026](0026-grouped-facade-surface.md) | A grouped facade surface | accepted |
 
 ## Adding a new ADR
 
