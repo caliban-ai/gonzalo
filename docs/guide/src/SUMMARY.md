@@ -11,6 +11,7 @@
 - [The CLI](./cli.md)
 - [The MCP server](./mcp.md)
 - [Running gonzalod](./daemon.md)
+- [Generating a client](./clients.md)
 - [Storage backends](./storage.md)
 - [Deletion, reset & collection](./deletion.md)
 - [Fleet access-control records](./fleet.md)

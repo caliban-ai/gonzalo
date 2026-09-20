@@ -11,5 +11,5 @@ mod service;
 pub use auth::{Access, Auth, Principal};
 pub use config::{StoreConfig, ancestor_cap_from_env};
 pub use grpc::{GrpcAdapter, serve_grpc};
-pub use http::{router, serve_http};
+pub use http::{SERVED_OPERATIONS, router, serve_http};
 pub use service::{Service, ViewSummary};
