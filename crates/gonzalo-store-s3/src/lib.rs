@@ -216,6 +216,60 @@ impl S3Store {
         }
     }
 
+    /// Write the zero-byte tombstone marker for `key` (ADR 0025).
+    /// Unconditional: the marker carries no version, so writing one that
+    /// already exists is a no-op rather than a race to lose.
+    async fn put_marker(&self, key: &RecordKey) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .body(Vec::new().into())
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
+    }
+
+    /// Remove the marker for `key`. Idempotent: `DeleteObject` succeeds on an
+    /// absent key, so callers never have to check first.
+    async fn delete_marker(&self, key: &RecordKey) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
+    }
+
+    /// Whether `key` currently carries a tombstone marker.
+    ///
+    /// For inspecting the layout — tests and operational debugging. `list`
+    /// reads markers out of the listing it already made instead, which is the
+    /// entire point of putting them in the key space (ADR 0025).
+    pub async fn marker_exists(&self, key: &RecordKey) -> Result<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() {
+                    Ok(false)
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
+    }
+
     /// The compare-and-swap loop behind every mutating method. Each attempt
     /// reads the object and its ETag, asks `plan` what to do given that exact
     /// record, and carries it out with a conditional write gated on the same
@@ -256,6 +310,17 @@ impl S3Store {
             let (outcome, answer) = match plan(current.as_ref().map(|(rec, _)| rec))? {
                 Planned::Finish(answer) => return Ok(Step::Done(answer)),
                 Planned::Put(record, answer) => {
+                    // The marker goes first (ADR 0025). A crash after this
+                    // leaves a stale marker, which costs one wasted read; a
+                    // crash after the tombstone would leave one *unmarked*,
+                    // which is the single state a flagged collection cannot
+                    // survive — `list` would show the deleted record as live.
+                    if record.is_tombstone() {
+                        self.put_marker(key).await?;
+                    }
+                    let replaced_tombstone = current
+                        .as_ref()
+                        .is_some_and(|(rec, _)| rec.is_tombstone());
                     let outcome = self.put_record_if(&record, precondition(etag)).await?;
                     if let WriteOutcome::LostRace(_) = outcome {
                         // Remember it, so the next attempt can recognise its own
@@ -266,6 +331,12 @@ impl S3Store {
                             WriteOutcome::Applied => unreachable!("checked above"),
                         });
                     }
+                    // The key is live again, so nothing pins its marker. Only
+                    // on a recreation over a tombstone: a plain update never
+                    // had one to clear.
+                    if replaced_tombstone && !record.is_tombstone() {
+                        self.delete_marker(key).await?;
+                    }
                     (outcome, answer)
                 }
                 Planned::Remove(answer) => {
@@ -273,7 +344,12 @@ impl S3Store {
                     // was read. The empty fallback can never match; it would
                     // just 412 and re-plan.
                     let tag = etag.unwrap_or_default().to_string();
-                    (self.delete_record_if_match(key, tag).await?, answer)
+                    let outcome = self.delete_record_if_match(key, tag).await?;
+                    if let WriteOutcome::Applied = outcome {
+                        // Purge removed the record the marker pointed at.
+                        self.delete_marker(key).await?;
+                    }
+                    (outcome, answer)
                 }
             };
             Ok(match outcome {

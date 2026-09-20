@@ -466,3 +466,101 @@ async fn purge_racing_recreation_never_removes_the_recreated_record() {
     assert!(!raw.is_tombstone(), "the recreated record must be live");
     assert_eq!(raw.revision, committed[0]);
 }
+
+// ── tombstone markers (ADR 0025, gonzalo#294) ───────────────────────────────
+
+#[tokio::test]
+async fn delete_writes_a_marker_and_recreation_removes_it() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let key = RecordKey::new("ns", "col", "marked");
+
+    let rev = seed(&store, &key).await;
+    assert!(
+        !store.marker_exists(&key).await.unwrap(),
+        "a live record has no marker"
+    );
+
+    assert_eq!(
+        store.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    assert!(
+        store.marker_exists(&key).await.unwrap(),
+        "a tombstone must carry a marker"
+    );
+
+    // Recreating the key makes it live again, so nothing pins its marker.
+    match store
+        .put(
+            sample(key.clone(), b"v2", Revision::initial(b"v2"), None),
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        PutResult::Committed(_) => {}
+        PutResult::Conflict(c) => panic!("recreation conflicted: {c:?}"),
+    }
+    assert!(
+        !store.marker_exists(&key).await.unwrap(),
+        "a recreation clears the marker"
+    );
+}
+
+#[tokio::test]
+async fn purge_removes_the_marker_with_the_tombstone() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let key = RecordKey::new("ns", "col", "purged");
+
+    let rev = seed(&store, &key).await;
+    assert_eq!(
+        store.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store.get_raw(&key).await.unwrap().expect("tombstone");
+    assert!(store.marker_exists(&key).await.unwrap());
+
+    assert_eq!(
+        store.purge(&key, tomb.revision).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    assert!(
+        !store.marker_exists(&key).await.unwrap(),
+        "purge must not leave an orphan marker"
+    );
+}
+
+#[tokio::test]
+async fn replicating_a_tombstone_writes_a_marker() {
+    // `put_raw` is the replication write. A tombstone arriving from a peer must
+    // be marked exactly like a locally-written one, or the receiving store's
+    // `list` would show the deleted record as live.
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let source = fresh_bucket_store(&endpoint).await;
+    let store = fresh_bucket_store(&endpoint).await;
+    let key = RecordKey::new("ns", "col", "replicated");
+
+    let rev = seed(&source, &key).await;
+    assert_eq!(
+        source.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = source.get_raw(&key).await.unwrap().expect("tombstone");
+
+    match store.put_raw(tomb, None).await.unwrap() {
+        PutResult::Committed(_) => {}
+        PutResult::Conflict(c) => panic!("replication conflicted: {c:?}"),
+    }
+    assert!(
+        store.marker_exists(&key).await.unwrap(),
+        "a replicated tombstone must be marked too"
+    );
+}
