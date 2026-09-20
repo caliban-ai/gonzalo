@@ -24,7 +24,9 @@ pub mod manifest;
 pub use manifest::{Manifest, Reconciliation, desired_set};
 
 pub mod gc;
-pub use gc::{GcReport, gc_blobs, live_slice_hashes, unreferenced_slices};
+pub use gc::{
+    GcReport, gc_blobs, live_blob_hashes, live_slice_hashes, sweep_blobs, unreferenced_slices,
+};
 
 pub mod error;
 pub use error::{CoreError, Result};

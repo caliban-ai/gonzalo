@@ -225,6 +225,7 @@ mod tests {
             key: RecordKey::new("ns", "col", "k"),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 

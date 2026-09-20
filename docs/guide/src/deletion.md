@@ -189,10 +189,6 @@ tombstone, the next sync copies it back. That's harmless (it's still a delete),
 but to reclaim space everywhere, run `collect` on every store with the same
 horizon.
 
-Blobs referenced by deleted records aren't removed by collection. Blobs are
-shared between records by content, so removing one safely needs a separate blob
-garbage collector, which doesn't exist yet.
-
 ## Choosing a collection horizon
 
 **This is the one decision in this page that can lose data.**
@@ -231,6 +227,37 @@ Practical advice:
   reappears.
 - **Retiring a peer?** Sync it one last time before you drop it, so its view of
   deletes is current. A peer that is gone for good can't resurrect anything.
+
+## Reclaiming a deleted record's bytes
+
+Deleting a blob-backed record doesn't free the blob, and neither does collecting
+its tombstone on its own. Blobs are content-addressed and shared — two records
+with identical content hold one blob — so freeing one means proving no record
+points at it. That's a separate, explicit sweep:
+
+```console
+$ gonzalo gc --root ./store
+scanned:  128
+freed:    3
+retained: 41
+```
+
+`gc` marks every blob the store still needs, from the records themselves: a
+record whose body *is* a blob, the blob a tombstone pins, and every code-graph
+slice a view's manifest names. Everything else is deleted.
+
+**A tombstone pins the blob of the record it replaced** (ADR 0024). A delete is
+replicated, not final: while the tombstone is around, a peer that never saw the
+delete can still sync the record back, and re-putting the same content doesn't
+re-upload it. So the bytes survive exactly as long as the tombstone does, which
+is the horizon you already chose. Reclaiming them is three steps, in order:
+
+1. `delete` the record — the tombstone appears, holding the blob;
+2. `collect` past the horizon — the tombstone goes, releasing the pin;
+3. `gc` — nothing references the blob now, so it's swept.
+
+Like collection, GC is explicit and never automatic: a blob swept while some
+peer still holds the record naming it can't be restored by a later sync.
 
 ## Ancestor cap
 
@@ -287,3 +314,11 @@ is too old to have them.
 
 Purge requires admin because it is the one operation that can make a
 delete undoable across peers.
+
+**Blob GC is not a daemon route.** `gonzalo gc` sweeps a filesystem store
+directly. A library caller can run `gc_blobs` against any store that is both a
+`Store` and a `BlobStore`, a daemon-backed one included, but the token then
+needs `read` on `*` (the sweep lists every key, tombstones included) and
+`read`/`write` on `_blobs`. A token scoped to one namespace would mark a partial
+view of liveness and sweep the rest — which is why the mark set is never a
+caller's to supply.

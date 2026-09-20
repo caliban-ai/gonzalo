@@ -483,6 +483,7 @@ mod tests {
             key: Manifest::key(repo, view),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
         let outcome = fs.put(record, None).await.unwrap();
         assert!(matches!(outcome, PutResult::Committed(_)));
@@ -726,6 +727,7 @@ mod tests {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
             key,
         }
     }

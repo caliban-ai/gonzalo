@@ -767,6 +767,7 @@ mod tests {
             key: RecordKey::new(namespace, "col", "x"),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
         serde_json::to_vec(&PutBody {
             record,
@@ -1132,6 +1133,7 @@ mod tests {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
             key: RecordKey::new("memory", "col", "x"),
         }
     }

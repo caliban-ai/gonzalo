@@ -617,6 +617,7 @@ fn build_record(key: &RecordKey, body_bytes: &[u8], parent: Option<Revision>) ->
         key: key.clone(),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     }
 }
 

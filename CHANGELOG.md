@@ -28,8 +28,27 @@ the patch version for fixes.
   to get wrong by hand — a mismatch doesn't fail at build time, it surfaces
   later as a spurious conflict. `Meta::new(author, origin_system)` covers the
   provenance. Fields stay public, so nothing existing breaks. (#305)
+- **Blob garbage collection, and tombstones pin their blobs.** `gonzalo gc` now
+  marks against every record in the store instead of a caller-supplied list of
+  manifests: a record whose body *is* a blob, the blob a tombstone pins, and
+  every code-graph slice a manifest names. A tombstone carries the deleted
+  record's blob hash in the new `Record.deleted_blob`, so a delete never
+  destroys content a peer can still sync back, and re-putting the same content
+  doesn't re-upload it. Reclaiming a deleted record's bytes is three deliberate
+  steps: `delete`, `collect` past the horizon, then `gc`. `gc_blobs` takes the
+  store and does its own listing; `sweep_blobs` and `live_blob_hashes` are the
+  halves, for a caller that already knows its live set. See
+  [ADR 0024](docs/adr/0024-blob-garbage-collection.md). (#292)
 
 ### Fixed
+
+- **`gonzalo gc` no longer deletes live records' content.** The mark set was
+  built from graph manifests alone — the only blob references that existed when
+  it was written — so on any store holding a record whose body is a blob, a
+  sweep deleted that record's bytes while the record still pointed at them. The
+  dangling reference surfaced later, as a failed fetch, with nothing to tie it
+  back to the sweep. GC now marks from the records themselves, and an
+  undecodable manifest is an error rather than an empty reference set. (#292)
 
 - **S3 hardening, before any backend other than RustFS is qualified.** Four
   fixes from the #203 review, none of which affected the pinned RustFS: an

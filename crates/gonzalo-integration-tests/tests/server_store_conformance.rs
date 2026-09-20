@@ -169,6 +169,7 @@ async fn sync_replicates_a_tombstone_to_a_daemon_peer() {
         key: key.clone(),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     };
     assert!(matches!(
         a.put(record, None).await.unwrap(),

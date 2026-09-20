@@ -945,6 +945,7 @@ mod tests {
             key: Manifest::key("r", "main"),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
         assert!(matches!(
             fs.put(record, None).await.unwrap(),
@@ -1458,6 +1459,7 @@ mod tests {
                 key: Manifest::key("r", view),
                 ancestors: Vec::new(),
                 deleted_at: None,
+                deleted_blob: None,
             };
             assert!(matches!(
                 fs.put(record, None).await.unwrap(),

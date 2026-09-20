@@ -36,7 +36,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0009](0009-workspace-layout-and-facade.md) | Workspace layout and single-facade public surface | accepted |
 | [0010](0010-ticket-system-capability-layer.md) | Ticket systems as a normalized work-item capability layer | accepted |
 | [0011](0011-knowledge-store-capability.md) | Knowledge store over the capability layers | accepted |
-| [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted |
+| [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted (blob GC marking amended by [0024](0024-blob-garbage-collection.md)) |
 | [0013](0013-local-candle-embedder.md) | Local Candle embedder for real semantic embeddings | accepted |
 | [0014](0014-approximate-vector-index-backend.md) | Approximate vector index backend (hnsw_rs) | accepted |
 | [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted |
@@ -45,9 +45,10 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted (local-only deletion superseded by [0021](0021-replicated-deletion-with-tombstones.md)) |
 | [0019](0019-s3-backend-qualification-rustfs.md) | Qualified S3 backend for HA: RustFS | accepted |
 | [0020](0020-rust-native-deliverables.md) | Rust-native deliverables; the daemon is the non-Rust boundary | accepted |
-| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted |
+| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted (blob GC follow-up settled by [0024](0024-blob-garbage-collection.md)) |
 | [0022](0022-fleet-access-control-records.md) | Fleet access-control records as a capability layer | accepted (channel config and `GrantScope::Repo` amended by [0023](0023-channel-config-fields.md)) |
 | [0023](0023-channel-config-fields.md) | Channel configuration fields, and workspaces instead of repos | accepted |
+| [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted |
 
 ## Adding a new ADR
 

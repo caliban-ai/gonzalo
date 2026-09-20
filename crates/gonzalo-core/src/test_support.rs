@@ -27,6 +27,7 @@ pub(crate) fn rec(ns: &str, col: &str, id: &str, payload: &str) -> Record {
         links: Vec::new(),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     }
 }
 

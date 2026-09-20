@@ -162,6 +162,16 @@ pub struct Record {
     /// Stamped by the store. `None` means collection never purges it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<i64>,
+    /// Tombstones only: the blob the deleted record's body referenced, if it
+    /// had one. A tombstone's own body is empty, so without this the hash
+    /// would be lost the moment the record was deleted and blob collection
+    /// could not tell a blob that is merely deleted from one nothing points at.
+    ///
+    /// **A tombstone pins its blob**: the blob survives until the tombstone
+    /// itself is collected, so a record restored from a peer, or recreated
+    /// from the same content, still has its bytes (gonzalo#292).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_blob: Option<ContentHash>,
 }
 
 impl Meta {
@@ -211,6 +221,7 @@ impl Record {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 
@@ -235,6 +246,7 @@ impl Record {
             links: self.links.clone(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 
@@ -428,6 +440,7 @@ mod tests {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 

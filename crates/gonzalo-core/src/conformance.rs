@@ -29,6 +29,7 @@ fn sample(key: RecordKey, payload: &[u8]) -> Record {
         key,
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     }
 }
 
@@ -251,6 +252,7 @@ where
 {
     delete_hides_from_get_and_list(&factory().await).await;
     delete_visible_to_raw_reads(&factory().await).await;
+    tombstone_pins_the_deleted_records_blob(&factory().await).await;
     delete_stale_expected_writes_no_tombstone(&factory().await).await;
     delete_of_absent_key_writes_nothing(&factory().await).await;
     delete_of_tombstone_is_noop(&factory().await).await;
@@ -406,6 +408,45 @@ async fn delete_visible_to_raw_reads<S: Store>(store: &S) {
     assert_eq!(t.parent, Some(rev.clone()));
     assert_eq!(t.ancestors.first(), Some(&rev));
     assert!(store.list_raw(&tomb_prefix()).await.unwrap().contains(&key));
+}
+
+/// Deleting a blob-backed record leaves the blob's hash on the tombstone, and
+/// the substrate round-trips it. The tombstone's body is empty, so this pin is
+/// the only thing standing between the content and the next blob sweep
+/// (gonzalo#292) — a substrate that drops the field on the way to storage frees
+/// bytes a peer can still resurrect the record from.
+async fn tombstone_pins_the_deleted_records_blob<S: Store>(store: &S) {
+    let key = tomb_key("pinned");
+    let mut record = sample(key.clone(), b"unused inline bytes");
+    record.body = Body::blob(b"the out-of-line content");
+    record.revision = Revision::initial(record.body.bytes());
+    committed(store, record, None).await;
+
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let t = store.get_raw(&key).await.unwrap().expect("tombstone");
+    assert!(t.is_tombstone());
+    assert_eq!(t.body, Body::Inline(Vec::new()));
+    assert_eq!(
+        t.deleted_blob,
+        Some(ContentHash::of(b"the out-of-line content")),
+        "a tombstone pins the blob of the record it replaced"
+    );
+
+    // Recreating the key releases the pin: the new record's own body is what
+    // keeps a blob alive.
+    let mut again = sample(key.clone(), b"recreated");
+    again.revision = Revision::initial(again.body.bytes());
+    committed(store, again, None).await;
+    let live = store
+        .get_raw(&key)
+        .await
+        .unwrap()
+        .expect("recreated record");
+    assert_eq!(live.deleted_blob, None);
 }
 
 /// A stale conditional delete conflicts and leaves the live record in place.

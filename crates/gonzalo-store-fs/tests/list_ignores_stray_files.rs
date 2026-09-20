@@ -22,6 +22,7 @@ fn sample(key: RecordKey) -> Record {
         key,
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     }
 }
 

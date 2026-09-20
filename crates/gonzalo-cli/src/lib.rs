@@ -128,6 +128,7 @@ pub async fn migrate(
             links: vec![],
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
 
         match store.put(record, None).await? {
@@ -628,6 +629,7 @@ pub async fn index_with_worker(
         links: Vec::new(),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     };
     match store.put(record, expected).await? {
         PutResult::Committed(_) => {}
@@ -858,50 +860,55 @@ async fn build_desired_incremental(
 
 /// Summary returned by [`gc`].
 pub struct GcSummary {
-    /// Live manifests scanned to build the mark set.
-    pub manifests: usize,
-    /// Orphaned slice blobs deleted.
+    /// Records scanned to build the mark set, tombstones included.
+    pub scanned: usize,
+    /// Unreferenced blobs deleted.
     pub freed: usize,
-    /// Slice blobs kept because some live view still references them.
+    /// Blobs kept because some record still references them.
     pub retained: usize,
 }
 
-/// Sweep orphaned code-graph slices from the store at `root`.
+/// Sweep unreferenced blobs from the store at `root` (gonzalo#292).
 ///
-/// Slices are content-addressed and **shared across views** (identical content
-/// dedups), so GC must mark against *every* live view's manifest — deleting a
-/// slice still referenced by another view would corrupt it. This enumerates all
-/// `graph-manifest` records across every repo/view, unions their referenced
-/// hashes, and mark-sweeps the blob store via [`gonzalo_core::gc_blobs`] (A6).
+/// Blobs are content-addressed and **shared** — identical content dedups across
+/// views and records alike — so GC marks against every record in the store at
+/// once. Three things keep a blob: a record whose body *is* the blob, a
+/// tombstone pinning the blob its record used to hold, and every slice a
+/// `graph-manifest` names (ADR 0012). Marking any one alone would delete the
+/// other two's content, so this scans raw (tombstones included) and unions all
+/// three via [`gonzalo_core::live_blob_hashes`].
+///
+/// Deleting a record therefore does not reclaim its bytes: the tombstone pins
+/// them until `collect` removes it past the horizon. Reclaiming is `delete`,
+/// then `collect`, then this.
 pub async fn gc(root: &Path) -> Result<GcSummary> {
     let store = FsStore::new(root);
 
-    // Every view's manifest, across all repos (namespace unset = all repos).
-    let prefix = KeyPrefix {
-        namespace: None,
-        collection: Some(Manifest::collection().to_string()),
-    };
-    let keys = store.list(&prefix).await?;
-    let mut manifests = Vec::with_capacity(keys.len());
+    // Every record, across all repos and collections (unset prefix = all), and
+    // raw so tombstones — the things that pin deleted records' blobs — are seen.
+    let keys = store.list_raw(&KeyPrefix::default()).await?;
+    let mut records = Vec::with_capacity(keys.len());
     for key in &keys {
-        if let Some(rec) = store.get(key).await? {
-            manifests.push(Manifest::from_body(&rec.body)?);
+        if let Some(record) = store.get_raw(key).await? {
+            records.push(record);
         }
     }
 
-    let report = gonzalo_core::gc_blobs(&store, &manifests).await?;
+    let live = gonzalo_core::live_blob_hashes(&records)?;
+    let report = gonzalo_core::sweep_blobs(&store, &live).await?;
     Ok(GcSummary {
-        manifests: manifests.len(),
+        scanned: records.len(),
         freed: report.freed.len(),
         retained: report.retained,
     })
 }
 
-/// [`index`] the `(repo, view)` view, then — when `gc_after` — sweep orphaned
-/// slices. The opt-in post-index trigger of gonzalo#104: the sweep runs only
-/// after a successful index and always goes through [`gc`], which marks against
-/// *every* live view's manifest (never a per-view subset), so a slice the just-
-/// indexed view dropped but another view still references is preserved.
+/// [`index`] the `(repo, view)` view, then — when `gc_after` — sweep
+/// unreferenced blobs. The opt-in post-index trigger of gonzalo#104: the sweep
+/// runs only after a successful index and always goes through [`gc`], which
+/// marks against *every* record in the store (never a per-view subset), so a
+/// slice the just-indexed view dropped but another view still references is
+/// preserved.
 pub async fn index_with_gc(
     root: &Path,
     src: &Path,
@@ -2235,13 +2242,13 @@ mod tests {
         assert!(!summary.incremental, "a non-git tree cannot go incremental");
     }
 
-    // ── gc: sweep orphaned slices across all live views (gonzalo#94) ─────────
+    // ── gc: sweep blobs no record references (gonzalo#94, #292) ─────────────
 
     #[tokio::test]
     async fn gc_on_empty_store_frees_nothing() {
         let root = TempDir::new().unwrap();
         let summary = gc(root.path()).await.unwrap();
-        assert_eq!(summary.manifests, 0);
+        assert_eq!(summary.scanned, 0);
         assert_eq!(summary.freed, 0);
         assert_eq!(summary.retained, 0);
     }
@@ -2258,7 +2265,7 @@ mod tests {
         index(root.path(), src.path(), "r", "main").await.unwrap();
 
         let summary = gc(root.path()).await.unwrap();
-        assert_eq!(summary.manifests, 1);
+        assert_eq!(summary.scanned, 1, "the view's manifest record");
         assert_eq!(summary.freed, 1, "the pre-edit slice is unreferenced");
         assert_eq!(summary.retained, 1, "the current slice stays");
 
@@ -2457,7 +2464,7 @@ mod tests {
         index(root.path(), src_a.path(), "r", "a").await.unwrap();
 
         let summary = gc(root.path()).await.unwrap();
-        assert_eq!(summary.manifests, 2);
+        assert_eq!(summary.scanned, 2, "one manifest record per view");
         assert_eq!(
             summary.freed, 0,
             "the shared slice is live via view B and must not be swept"
@@ -2682,6 +2689,7 @@ mod tombstone_cli_tests {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
         let live = record.revision.clone();
         assert!(matches!(
@@ -2735,6 +2743,7 @@ mod tombstone_cli_tests {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
         assert!(matches!(
             store.put(record, None).await.unwrap(),
