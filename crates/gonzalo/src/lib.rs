@@ -112,11 +112,14 @@
 //!
 //! # Typed views
 //!
-//! Domain types map to and from a record body with [`RecordCodec`], so a
-//! consumer works with its own structs rather than bytes.
+//! Domain types map to and from a record body with [`codec::RecordCodec`], so
+//! a consumer works with its own structs rather than bytes. Each lives under
+//! the module naming its domain — `memory`, `session`, `ticket`, `fleet` — so
+//! nothing here occupies a name a consumer might want (ADR 0026).
 //!
 //! ```
-//! use gonzalo::{FsStore, Identity, Meta, Record, RecordCodec, RecordKey, Store, Topic};
+//! use gonzalo::{FsStore, Identity, Meta, Record, RecordKey, Store};
+//! use gonzalo::{codec::RecordCodec, memory::Topic};
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! # let dir = tempfile::tempdir().unwrap();
@@ -144,20 +147,15 @@
 //! [daemon]: https://caliban-ai.github.io/gonzalo/daemon.html
 //! [fleet]: https://caliban-ai.github.io/gonzalo/fleet.html
 
+// The root holds the record and store core: what every consumer touches
+// whatever else they use, and the part of the surface that was never ambiguous
+// (ADR 0026). Everything that is a *domain noun* lives under the module naming
+// its domain, mirroring the structure `gonzalo-domain` already has.
 pub use gonzalo_core::{
     AncestryStore, BlobStore, Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult,
     GcReport, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey,
     RecordKind, ResetReport, Result, Revision, Store, SyncConflict, SyncReport, collect, gc_blobs,
     merge, now_ms, reset, reset_as, sync, sync_with_ancestry,
-};
-
-pub use gonzalo_domain::{
-    Actor, ActorRole, AuditEntry, AuditResult, Authenticator, BindingOrigin, BodyFormat,
-    ChannelConfig, Checkpoint, Consumption, Container, EmptyFollowSet, FleetActor, FleetKeyError,
-    FleetRole, Follows, GrantScope, IdentityBinding, Link, LinkKind, LinkSecret, LinkSecretError,
-    LinkTarget, LinkToken, MemoryTier, NotifyPreset, Person, Priority, PriorityLevel, Provider,
-    RecordCodec, RedeemError, Resolution, RoleGrant, Session, State, StateCategory, Ticket,
-    TicketBody, TicketEvent, Topic, Turn, VerifiedEmail, fleet,
 };
 
 #[cfg(feature = "fs")]
@@ -172,44 +170,92 @@ pub use gonzalo_store_s3::S3Store;
 #[cfg(feature = "remote")]
 pub use gonzalo_store_server::ServerStore;
 
+/// Memory-tier records and the topics they summarize.
+pub mod memory {
+    pub use gonzalo_domain::memory::{MemoryTier, Topic};
+}
+
+/// Conversation sessions and their turns.
+pub mod session {
+    pub use gonzalo_domain::session::{Session, Turn};
+}
+
+/// Point-in-time checkpoints over a session.
+pub mod checkpoint {
+    pub use gonzalo_domain::checkpoint::Checkpoint;
+}
+
+/// The trait tying a typed view to the record body that stores it.
+pub mod codec {
+    pub use gonzalo_domain::codec::RecordCodec;
+}
+
+/// Fleet access-control records: people, identity bindings, role grants,
+/// channel configuration, link tokens and the audit trail (ADR 0022, 0023).
+pub mod fleet {
+    pub use gonzalo_domain::fleet::*;
+}
+
+/// Tickets: the typed records, and — with the `ticket` feature — the source
+/// layer and its connectors that import a board into them.
+pub mod ticket {
+    pub use gonzalo_domain::ticket::{
+        Actor, ActorRole, BodyFormat, Container, Link, LinkKind, LinkTarget, Priority,
+        PriorityLevel, Provider, Resolution, State, StateCategory, Ticket, TicketBody, TicketEvent,
+    };
+
+    #[cfg(feature = "ticket")]
+    pub use gonzalo_ticket::{
+        Capabilities, Cursor, FieldMapping, InMemorySource, Page, SourceError, StateMapping,
+        StateSignal, TicketSource, record_key, scoped_uid,
+    };
+
+    #[cfg(feature = "ticket-github")]
+    pub use gonzalo_ticket_github::GitHubSource;
+
+    #[cfg(feature = "ticket-jira")]
+    pub use gonzalo_ticket_jira::JiraSource;
+
+    #[cfg(feature = "ticket-linear")]
+    pub use gonzalo_ticket_linear::LinearSource;
+
+    #[cfg(feature = "ticket-gitlab")]
+    pub use gonzalo_ticket_gitlab::GitLabSource;
+
+    #[cfg(feature = "ticket-asana")]
+    pub use gonzalo_ticket_asana::AsanaSource;
+}
+
+/// Vector search: the `Embedder` trait and the indexes over it.
 #[cfg(feature = "vector")]
-pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
+pub mod vector {
+    pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
+}
 
+/// The tree-sitter code graph.
+///
+/// `Page` lives here as well as in [`ticket`] — two layers using one word,
+/// which the previous flat surface could not express (ADR 0026).
 #[cfg(feature = "graph")]
-pub use gonzalo_graph::{
-    CodeGraph, GraphStore, InMemoryGraphStore, Located, Reference, Symbol, SymbolKind, assemble,
-    build_rust,
-};
+pub mod graph {
+    pub use gonzalo_graph::{
+        CodeGraph, GraphStore, InMemoryGraphStore, Located, Reference, Symbol, SymbolKind,
+        assemble, build_rust,
+    };
+}
 
-#[cfg(feature = "ticket")]
-pub use gonzalo_ticket::{
-    Capabilities, Cursor, FieldMapping, InMemorySource, Page, SourceError, StateMapping,
-    StateSignal, TicketSource, record_key, scoped_uid,
-};
-
-#[cfg(feature = "ticket-github")]
-pub use gonzalo_ticket_github::GitHubSource;
-
-#[cfg(feature = "ticket-jira")]
-pub use gonzalo_ticket_jira::JiraSource;
-
-#[cfg(feature = "ticket-linear")]
-pub use gonzalo_ticket_linear::LinearSource;
-
-#[cfg(feature = "ticket-gitlab")]
-pub use gonzalo_ticket_gitlab::GitLabSource;
-
-#[cfg(feature = "ticket-asana")]
-pub use gonzalo_ticket_asana::AsanaSource;
-
+/// Records plus vector search by [`RecordKey`], resolving hits back to whole
+/// records (ADR 0011).
 #[cfg(feature = "knowledge")]
-pub use gonzalo_knowledge::{Hit, KnowledgeStore, knowledge_text};
+pub mod knowledge {
+    pub use gonzalo_knowledge::{Hit, KnowledgeStore, knowledge_text};
+}
 
-/// Compile-checked: the facade crate has no doctests, and no other test
-/// touches replicated deletion, so a re-export dropped from the `pub use
-/// gonzalo_core::{...}` block above (`ResetReport`, `CollectReport`,
-/// `reset`, `reset_as`, `collect`) would otherwise go unnoticed until a
-/// downstream consumer's build broke.
+/// Compile-checked: a re-export dropped from the blocks above would otherwise
+/// go unnoticed until a downstream consumer's build broke. Since ADR 0026 the
+/// cases also pin *where* each name lives — the grouping is the public contract
+/// now, so a name quietly promoted back to the root is as much a regression as
+/// one that disappeared.
 #[cfg(test)]
 mod facade_reexports {
     use super::*;
@@ -239,6 +285,13 @@ mod facade_reexports {
     #[test]
     #[allow(clippy::type_complexity)]
     fn fleet_records_are_re_exported() {
+        use crate::codec::RecordCodec;
+        use crate::fleet::{
+            AuditEntry, AuditResult, Authenticator, BindingOrigin, ChannelConfig, Consumption,
+            FleetActor, FleetKeyError, FleetRole, GrantScope, IdentityBinding, LinkSecret,
+            LinkSecretError, LinkToken, Person, RedeemError, RoleGrant, VerifiedEmail,
+        };
+
         let person = Person {
             display_name: "Ada".into(),
             email: None,
@@ -274,11 +327,85 @@ mod facade_reexports {
             VerifiedEmail,
         )> = None;
     }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn domain_nouns_live_under_their_module() {
+        // The grouping itself, asserted by path (ADR 0026). Every name here was
+        // at the root before 0.8.0, and each module keeps its own.
+        let _: Option<(memory::MemoryTier, memory::Topic)> = None;
+        let _: Option<(session::Session, session::Turn)> = None;
+        let _: Option<checkpoint::Checkpoint> = None;
+        let _: Option<(
+            ticket::Ticket,
+            ticket::TicketBody,
+            ticket::TicketEvent,
+            ticket::State,
+            ticket::StateCategory,
+            ticket::Actor,
+            ticket::ActorRole,
+            ticket::Priority,
+            ticket::PriorityLevel,
+            ticket::Resolution,
+            ticket::Provider,
+            ticket::Container,
+            ticket::Link,
+            ticket::LinkKind,
+            ticket::LinkTarget,
+            ticket::BodyFormat,
+        )> = None;
+        // `RecordCodec` is the seam every typed view implements, so it is the
+        // one that would be most tempting to promote back to the root.
+        fn _codec_is_a_trait<T: codec::RecordCodec>() {}
+    }
+
+    /// The capability layers, each behind its own feature.
+    #[test]
+    #[cfg(feature = "graph")]
+    fn graph_lives_under_its_module() {
+        let _: Option<(graph::CodeGraph, graph::Symbol, graph::SymbolKind)> = None;
+        let _ = graph::build_rust;
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn vector_lives_under_its_module() {
+        let _: Option<(vector::Match, vector::MemoryVectorIndex)> = None;
+    }
+
+    #[test]
+    #[cfg(feature = "knowledge")]
+    fn knowledge_lives_under_its_module() {
+        let _: Option<knowledge::Hit> = None;
+        let _ = knowledge::knowledge_text;
+    }
+
+    #[test]
+    #[cfg(feature = "ticket")]
+    #[allow(clippy::type_complexity)]
+    fn the_ticket_source_layer_joins_the_ticket_module() {
+        // The typed records and the connectors that import them are one domain
+        // even though they are three crates, so they share one module.
+        let _: Option<(
+            ticket::Capabilities,
+            ticket::Cursor,
+            ticket::FieldMapping,
+            ticket::InMemorySource,
+            ticket::Page,
+            ticket::SourceError,
+            ticket::StateMapping,
+            ticket::StateSignal,
+        )> = None;
+        let _ = ticket::record_key;
+        let _ = ticket::scoped_uid;
+    }
 }
 
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::codec::RecordCodec;
+    use crate::memory::Topic;
     use std::collections::BTreeMap;
 
     #[tokio::test]

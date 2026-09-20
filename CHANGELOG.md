@@ -55,6 +55,39 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: the facade's surface is grouped into modules.** `gonzalo`
+  re-exported 74 names flat, many of them ordinary nouns — `Actor`, `State`,
+  `Provider`, `Container`, `Link`, `Topic`, `Session`, `Priority`, `Person` —
+  which collided with a consumer's own types and said nothing about which layer
+  they came from. The flat surface also could not express two layers using one
+  word: `gonzalo-ticket` and `gonzalo-graph` both define a `Page`, and only one
+  of them could ever be re-exported. The root now holds the record and store
+  core and nothing else; every domain type lives under the module naming its
+  domain, mirroring the structure `gonzalo-domain` already had. There is no
+  deprecation window — the flat names are gone in this release — so the mapping
+  is below. See [ADR 0026](docs/adr/0026-grouped-facade-surface.md). (#319)
+
+  | was | now |
+  |---|---|
+  | `gonzalo::MemoryTier`, `Topic` | `gonzalo::memory::{MemoryTier, Topic}` |
+  | `gonzalo::Session`, `Turn` | `gonzalo::session::{Session, Turn}` |
+  | `gonzalo::Checkpoint` | `gonzalo::checkpoint::Checkpoint` |
+  | `gonzalo::RecordCodec` | `gonzalo::codec::RecordCodec` |
+  | `gonzalo::Ticket`, `TicketBody`, `TicketEvent`, `State`, `StateCategory`, `Actor`, `ActorRole`, `Priority`, `PriorityLevel`, `Resolution`, `Provider`, `Container`, `Link`, `LinkKind`, `LinkTarget`, `BodyFormat` | `gonzalo::ticket::*` |
+  | `gonzalo::TicketSource`, `Capabilities`, `Cursor`, `FieldMapping`, `InMemorySource`, `Page`, `SourceError`, `StateMapping`, `StateSignal`, `record_key`, `scoped_uid` | `gonzalo::ticket::*` |
+  | `gonzalo::GitHubSource`, `JiraSource`, `LinearSource`, `GitLabSource`, `AsanaSource` | `gonzalo::ticket::*` |
+  | `gonzalo::Person`, `RoleGrant`, `IdentityBinding`, `ChannelConfig`, `LinkToken`, `AuditEntry`, `AuditResult`, `Authenticator`, `BindingOrigin`, `Consumption`, `EmptyFollowSet`, `FleetActor`, `FleetKeyError`, `FleetRole`, `Follows`, `GrantScope`, `LinkSecret`, `LinkSecretError`, `NotifyPreset`, `RedeemError`, `VerifiedEmail` | `gonzalo::fleet::*` (already available there) |
+  | `gonzalo::CodeGraph`, `GraphStore`, `InMemoryGraphStore`, `Located`, `Reference`, `Symbol`, `SymbolKind`, `assemble`, `build_rust` | `gonzalo::graph::*` |
+  | `gonzalo::Embedder`, `Match`, `MemoryVectorIndex`, `VectorIndex` | `gonzalo::vector::*` |
+  | `gonzalo::Hit`, `KnowledgeStore`, `knowledge_text` | `gonzalo::knowledge::*` |
+
+  Unchanged at the root: `Record`, `RecordKey`, `RecordKind`, `Revision`,
+  `Body`, `Meta`, `Identity`, `ContentHash`, `KeyPrefix`, `Store`, `BlobStore`,
+  `AncestryStore`, `PutResult`, `DeleteResult`, `Conflict`, `CoreError`,
+  `Result`, `MergeClass`, `MergeOutcome`, `sync`, `sync_with_ancestry`, `merge`,
+  `collect`, `reset`, `reset_as`, `gc_blobs`, `now_ms`, the reports, and
+  `FsStore` / `GitStore` / `S3Store` / `ServerStore`.
+
 - **S3 listings stop paying a read per record.** Hiding tombstones from `list`
   cost a `GetObject` per key, because a tombstone lives at the deleted record's
   own object key and only its body says so; `reset` and `collect` inherited it.
