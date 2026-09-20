@@ -31,6 +31,18 @@ the patch version for fixes.
 
 ### Fixed
 
+- **S3 hardening, before any backend other than RustFS is qualified.** Four
+  fixes from the #203 review, none of which affected the pinned RustFS: an
+  ambiguous commit (the write applies, the response times out, the retry sees
+  `412`) no longer comes back as a `Conflict` for the caller's own write; a
+  `GetObject` that returns no ETag is now an error instead of an empty
+  `If-Match`, which a permissive server could read as "no condition" and turn
+  every compare-and-swap into a blind overwrite; a `409` retries after a
+  jittered, bounded delay rather than immediately, so a burst cannot spend all
+  eight attempts inside one in-flight window; and consumer `list` reads keys in
+  bounded batches instead of one at a time. The soak's bucket is now created
+  with the maintained AWS CLI image — MinIO stopped publishing `mc`, which had
+  already broken CI once. (#286)
 - **Git `pull` honours ancestor ordering, like `sync`.** For a record changed on
   both sides, pull went straight to comparing kinds and bodies, so a remote that
   had simply advanced past the local revision — the normal state after a peer
