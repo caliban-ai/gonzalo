@@ -60,6 +60,16 @@ impl S3Store {
         Self::new(client, bucket)
     }
 
+    /// An owned handle to the same bucket, for a spawned task. The client is a
+    /// cheap clone sharing one connection pool.
+    fn handle(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            cap: self.cap,
+        }
+    }
+
     async fn read(&self, key: &RecordKey) -> Result<Option<Record>> {
         Ok(self.read_with_etag(key).await?.map(|(rec, _)| rec))
     }
@@ -79,7 +89,19 @@ impl S3Store {
             .await
         {
             Ok(resp) => {
-                let etag = resp.e_tag().unwrap_or_default().to_string();
+                // A missing ETag used to default to `""`, which later went out
+                // as `If-Match: ""`. A server that omits the ETag and reads an
+                // empty `If-Match` as "no condition" would turn every
+                // compare-and-swap into a blind overwrite or delete, so refuse
+                // instead of writing unconditionally (gonzalo#286).
+                let etag = resp
+                    .e_tag()
+                    .ok_or_else(|| {
+                        CoreError::Backend(format!(
+                            "s3: GetObject for {obj} returned no ETag; conditional writes are unsafe against this backend"
+                        ))
+                    })?
+                    .to_string();
                 let data = resp
                     .body
                     .collect()
@@ -146,7 +168,7 @@ impl S3Store {
 
     /// Serialize `record` and `PutObject` it at its key under `pre`. A writer
     /// that changed the object after our read makes this a 412, reported as
-    /// [`WriteOutcome::PreconditionFailed`] instead of clobbering its write.
+    /// [`WriteOutcome::LostRace`] instead of clobbering its write.
     async fn put_record_if(&self, record: &Record, pre: Precondition) -> Result<WriteOutcome> {
         let bytes =
             serde_json::to_vec_pretty(record).map_err(|e| CoreError::Serde(e.to_string()))?;
@@ -164,10 +186,9 @@ impl S3Store {
             Ok(_) => Ok(WriteOutcome::Applied),
             Err(e) => {
                 let svc = e.into_service_error();
-                if is_lost_race(svc.code()) {
-                    Ok(WriteOutcome::PreconditionFailed)
-                } else {
-                    Err(CoreError::Backend(svc.to_string()))
+                match race_kind(svc.code()) {
+                    Some(kind) => Ok(WriteOutcome::LostRace(kind)),
+                    None => Err(CoreError::Backend(svc.to_string())),
                 }
             }
         }
@@ -187,10 +208,9 @@ impl S3Store {
             Ok(_) => Ok(WriteOutcome::Applied),
             Err(e) => {
                 let svc = e.into_service_error();
-                if is_lost_race(svc.code()) {
-                    Ok(WriteOutcome::PreconditionFailed)
-                } else {
-                    Err(CoreError::Backend(svc.to_string()))
+                match race_kind(svc.code()) {
+                    Some(kind) => Ok(WriteOutcome::LostRace(kind)),
+                    None => Err(CoreError::Backend(svc.to_string())),
                 }
             }
         }
@@ -210,15 +230,44 @@ impl S3Store {
         P: Fn(Option<&Record>) -> Result<Planned<T>> + Sync,
     {
         let plan = &plan;
+        // What the previous attempt sent, with the answer it would have
+        // returned. A conditional PutObject can apply on the server and still
+        // look like a failure — the response times out, the SDK retries, and
+        // the server answers 412 because the object now carries the new ETag.
+        // Without this, the re-read finds our own write and the planner calls
+        // it someone else's, returning a Conflict for a write that committed.
+        // `delete_as` and `purge` already converge here; this makes writes
+        // agree with them and with `MemStore` (gonzalo#286).
+        let pending: std::sync::Mutex<Option<(Record, T)>> = std::sync::Mutex::new(None);
+        let pending = &pending;
         retry_on_lost_race(key, move || async move {
             let current = self.read_with_etag(key).await?;
+
+            // Take the previous attempt's record before any await, so the lock
+            // is never held across one.
+            let previous = pending.lock().unwrap().take();
+            if let Some((sent, answer)) = previous
+                && own_write_landed(&sent, current.as_ref().map(|(rec, _)| rec))
+            {
+                return Ok(Step::Done(answer));
+            }
+
             let etag = current.as_ref().map(|(_, tag)| tag.as_str());
             let (outcome, answer) = match plan(current.as_ref().map(|(rec, _)| rec))? {
                 Planned::Finish(answer) => return Ok(Step::Done(answer)),
-                Planned::Put(record, answer) => (
-                    self.put_record_if(&record, precondition(etag)).await?,
-                    answer,
-                ),
+                Planned::Put(record, answer) => {
+                    let outcome = self.put_record_if(&record, precondition(etag)).await?;
+                    if let WriteOutcome::LostRace(_) = outcome {
+                        // Remember it, so the next attempt can recognise its own
+                        // write if this "failure" was really an ambiguous commit.
+                        *pending.lock().unwrap() = Some((record, answer));
+                        return Ok(match outcome {
+                            WriteOutcome::LostRace(kind) => Step::Retry(kind),
+                            WriteOutcome::Applied => unreachable!("checked above"),
+                        });
+                    }
+                    (outcome, answer)
+                }
                 Planned::Remove(answer) => {
                     // Planners only remove a record they were given, so an ETag
                     // was read. The empty fallback can never match; it would
@@ -229,7 +278,7 @@ impl S3Store {
             };
             Ok(match outcome {
                 WriteOutcome::Applied => Step::Done(answer),
-                WriteOutcome::PreconditionFailed => Step::Retry,
+                WriteOutcome::LostRace(kind) => Step::Retry(kind),
             })
         })
         .await
@@ -265,15 +314,27 @@ fn is_precondition_failed(code: Option<&str>) -> bool {
     matches!(code, Some("PreconditionFailed"))
 }
 
-/// Whether a conditional record write lost to a change made after our read:
-/// a failed precondition (412), a conflicting in-flight conditional write
-/// (409), or the object vanishing (a concurrent purge). Each re-reads and
-/// re-plans in `write_planned`.
-fn is_lost_race(code: Option<&str>) -> bool {
-    matches!(
-        code,
-        Some("PreconditionFailed" | "ConditionalRequestConflict" | "NoSuchKey")
-    )
+/// Why a conditional write did not apply. The kinds differ in what the caller
+/// should do next (gonzalo#286).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaceKind {
+    /// `412`: the object changed after our read, or `NoSuchKey`: it vanished to
+    /// a concurrent purge. Another writer already finished, so re-read and
+    /// re-plan straight away.
+    Settled,
+    /// `409 ConditionalRequestConflict`: AWS returns this while a conflicting
+    /// conditional write is still **in flight**. Retrying immediately can burn
+    /// every attempt inside one in-flight window, so back off first.
+    InFlight,
+}
+
+/// Classify a lost race by the S3 error code, or `None` if it isn't one.
+fn race_kind(code: Option<&str>) -> Option<RaceKind> {
+    match code {
+        Some("ConditionalRequestConflict") => Some(RaceKind::InFlight),
+        Some("PreconditionFailed" | "NoSuchKey") => Some(RaceKind::Settled),
+        _ => None,
+    }
 }
 
 /// Consumer view of a raw read: a tombstone reads as absent (spec §3.2).
@@ -348,12 +409,18 @@ fn purge_step(plan: PurgePlan) -> Planned<DeleteResult> {
 /// up on a key that other writers keep changing underneath it.
 const MAX_WRITE_ATTEMPTS: usize = 8;
 
+/// How many of consumer `list`'s per-key reads run at once. Hiding tombstones
+/// costs a `GetObject` per key (spec §8.4); doing them one at a time multiplied
+/// every key by a round trip. Bounded so a large collection cannot open an
+/// unbounded number of connections (gonzalo#286).
+const LIST_READ_CONCURRENCY: usize = 16;
+
 /// Result of one attempt: finished with an answer, or lost the race (412) and
 /// must re-read and re-plan.
 #[derive(Debug, PartialEq, Eq)]
 enum Step<T> {
     Done(T),
-    Retry,
+    Retry(RaceKind),
 }
 
 /// Run `attempt` until it finishes, at most [`MAX_WRITE_ATTEMPTS`] times. An
@@ -365,9 +432,19 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Step<T>>>,
 {
-    for _ in 0..MAX_WRITE_ATTEMPTS {
-        if let Step::Done(value) = attempt().await? {
-            return Ok(value);
+    for round in 0..MAX_WRITE_ATTEMPTS {
+        match attempt().await? {
+            Step::Done(value) => return Ok(value),
+            // A settled race (412, or the object vanished to a purge) means the
+            // other writer has finished: re-read and re-plan immediately.
+            Step::Retry(RaceKind::Settled) => {}
+            // A 409 means a conflicting conditional write is still in flight.
+            // Retrying straight away can burn every attempt inside that one
+            // window, so wait a little, with jitter so racing writers don't
+            // line up again (gonzalo#286).
+            Step::Retry(RaceKind::InFlight) => {
+                tokio::time::sleep(inflight_backoff(round)).await;
+            }
         }
     }
     Err(CoreError::Backend(format!(
@@ -375,12 +452,46 @@ where
     )))
 }
 
+/// Whether the record a previous attempt sent is what the store now holds, so
+/// that attempt's write applied after all (gonzalo#286).
+///
+/// A conditional `PutObject` can apply on the server and still look like a
+/// failure: the response times out, the SDK retries, and the server answers
+/// `412` because the object already carries the new ETag. Re-planning against
+/// that state reports a `Conflict` for the caller's own committed write.
+/// Comparing whole records is exact — two different writes never produce the
+/// same record, because the revision hashes the body and a rewrite of the same
+/// body at the same revision is the same record.
+fn own_write_landed(sent: &Record, current: Option<&Record>) -> bool {
+    current.is_some_and(|rec| rec == sent)
+}
+
+/// How long to wait before retrying after a `409 ConditionalRequestConflict`:
+/// a doubling delay from ~4 ms, capped, with jitter so two writers that
+/// collided do not wake together and collide again (gonzalo#286).
+///
+/// The jitter is derived from the clock rather than a random-number generator,
+/// which would be a dependency for a few bits of entropy that nothing depends
+/// on for correctness: a bad draw only costs another attempt.
+fn inflight_backoff(round: usize) -> std::time::Duration {
+    const BASE_MS: u64 = 4;
+    const CAP_MS: u64 = 250;
+    let step = BASE_MS.saturating_mul(1 << round.min(6)).min(CAP_MS);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % step.max(1))
+        .unwrap_or(0);
+    std::time::Duration::from_millis(step + jitter)
+}
+
 /// Result of one conditional S3 write: it applied, or its precondition failed
 /// (412) because a concurrent writer changed the object after our read.
 #[derive(Debug, PartialEq, Eq)]
 enum WriteOutcome {
     Applied,
-    PreconditionFailed,
+    /// The write did not apply because another writer got there first; the
+    /// kind says whether that writer has finished (gonzalo#286).
+    LostRace(RaceKind),
 }
 
 /// Decide the continuation token for the next `list_objects_v2` page, driving
@@ -410,11 +521,32 @@ impl gonzalo_core::Store for S3Store {
         // tracked as a follow-up (a kind marker in the key suffix, or a
         // per-collection tombstone index; both are layout changes needing their
         // own design). Don't optimise it here.
-        let mut out = Vec::new();
-        for key in self.list_keys(prefix).await? {
-            if listed_as_live(self.read(&key).await)? {
-                out.push(key);
+        //
+        // The reads do run concurrently, in bounded batches: one at a time
+        // multiplied every key's latency by the round trip, which is what made
+        // a large collection slow rather than merely expensive (gonzalo#286).
+        let keys = self.list_keys(prefix).await?;
+        let mut out = Vec::with_capacity(keys.len());
+        for batch in keys.chunks(LIST_READ_CONCURRENCY) {
+            let mut reads = tokio::task::JoinSet::new();
+            for (i, key) in batch.iter().enumerate() {
+                // A handle per task: the client is a cheap clone (it shares one
+                // connection pool), and a task needs to own what it reads.
+                let store = self.handle();
+                let key = key.clone();
+                reads.spawn(async move {
+                    let visible = listed_as_live(store.read(&key).await)?;
+                    Ok::<_, CoreError>((i, visible.then_some(key)))
+                });
             }
+            // Tasks finish in any order; sort by position so the listing a
+            // caller sees does not depend on which read returned first.
+            let mut found = Vec::with_capacity(batch.len());
+            while let Some(joined) = reads.join_next().await {
+                found.push(joined.map_err(|e| CoreError::Backend(e.to_string()))??);
+            }
+            found.sort_by_key(|(i, _)| *i);
+            out.extend(found.into_iter().filter_map(|(_, key)| key));
         }
         Ok(out)
     }
@@ -701,6 +833,44 @@ mod tests {
         tombstone_of(&live(key, payload), 1_000, DEFAULT_ANCESTOR_CAP, None)
     }
 
+    // ---- hardening before other S3 backends are qualified (#286) ----
+
+    #[test]
+    fn an_ambiguous_commit_is_recognised_as_our_own_write() {
+        // The write applied, the response timed out, the retry saw 412. The
+        // re-read returns exactly what we sent, so the attempt succeeded.
+        let k = RecordKey::new("ns", "col", "ambiguous");
+        let sent = live(&k, b"v1");
+        assert!(own_write_landed(&sent, Some(&sent)));
+
+        // Someone else's write, or nothing at all, is not ours.
+        assert!(!own_write_landed(&sent, Some(&live(&k, b"someone-else"))));
+        assert!(!own_write_landed(&sent, Some(&tomb(&k, b"v1"))));
+        assert!(!own_write_landed(&sent, None));
+    }
+
+    #[test]
+    fn inflight_backoff_grows_and_stays_bounded() {
+        // Each round waits at least as long as the one before, and never more
+        // than twice the cap, so eight attempts cannot stall a caller.
+        let mut previous = std::time::Duration::ZERO;
+        for round in 0..MAX_WRITE_ATTEMPTS {
+            let wait = inflight_backoff(round);
+            assert!(wait >= std::time::Duration::from_millis(4), "round {round}");
+            assert!(
+                wait < std::time::Duration::from_millis(500),
+                "round {round}"
+            );
+            if round > 0 {
+                assert!(
+                    wait >= previous / 2,
+                    "round {round} fell far below the previous wait"
+                );
+            }
+            previous = wait;
+        }
+    }
+
     fn conflict(key: &RecordKey) -> Box<Conflict> {
         Box::new(Conflict {
             key: key.clone(),
@@ -871,11 +1041,19 @@ mod tests {
 
     #[test]
     fn lost_race_covers_412_409_and_vanished_objects() {
-        assert!(is_lost_race(Some("PreconditionFailed")));
-        assert!(is_lost_race(Some("ConditionalRequestConflict")));
-        assert!(is_lost_race(Some("NoSuchKey")));
-        assert!(!is_lost_race(Some("AccessDenied")));
-        assert!(!is_lost_race(None));
+        // 409 is the one that must back off; the others are settled races
+        // the loop retries immediately (#286).
+        assert_eq!(
+            race_kind(Some("ConditionalRequestConflict")),
+            Some(RaceKind::InFlight)
+        );
+        assert_eq!(
+            race_kind(Some("PreconditionFailed")),
+            Some(RaceKind::Settled)
+        );
+        assert_eq!(race_kind(Some("NoSuchKey")), Some(RaceKind::Settled));
+        assert_eq!(race_kind(Some("AccessDenied")), None);
+        assert_eq!(race_kind(None), None);
     }
 
     // ---- lost-race retry loop ----
@@ -887,7 +1065,7 @@ mod tests {
         let calls_ref = &calls;
         let out: Result<()> = retry_on_lost_race(&k, move || async move {
             calls_ref.set(calls_ref.get() + 1);
-            Ok(Step::Retry)
+            Ok(Step::Retry(RaceKind::Settled))
         })
         .await;
         assert_eq!(calls.get(), MAX_WRITE_ATTEMPTS);
@@ -910,7 +1088,7 @@ mod tests {
         let out = retry_on_lost_race(&k, move || async move {
             calls_ref.set(calls_ref.get() + 1);
             if calls_ref.get() < MAX_WRITE_ATTEMPTS {
-                Ok(Step::Retry)
+                Ok(Step::Retry(RaceKind::Settled))
             } else {
                 Ok(Step::Done("landed"))
             }

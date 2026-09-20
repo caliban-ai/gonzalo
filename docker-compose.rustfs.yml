@@ -32,19 +32,26 @@ services:
   # One-shot: create the soak bucket over the compose network (works on both
   # Docker Desktop Mac and Linux CI — no host.docker.internal needed). Exits 0.
   createbucket:
-    # Docker Hub's `minio/mc` is no longer pullable ("pull access denied"), which
-    # silently broke CI. quay.io still serves the same image; pinned by tag AND
-    # digest (multi-arch: linux/amd64 + linux/arm64). Fallback if quay ever goes
-    # too: amazon/aws-cli with `aws s3api create-bucket`.
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    # Was `minio/mc`. Docker Hub stopped serving it ("pull access denied"),
+    # which silently broke CI; quay.io still had a copy, but MinIO has stopped
+    # publishing `mc` images at all, so that copy is a dead end too. The AWS CLI
+    # is maintained, multi-arch, and speaks plain S3, which is all this needs
+    # (gonzalo#286). Pinned by tag and digest.
+    image: amazon/aws-cli:2.36.9@sha256:00dee8ccaf669721f8163944ea9e6ac13183851b23d5b7a9868a608bc932cfdb
     depends_on:
       - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint:
       - sh
       - -c
       - >
-        until mc alias set r http://rustfs:9000 rustfsadmin rustfsadmin >/dev/null 2>&1; do sleep 1; done &&
-        mc mb -p r/soak && echo "gonzalo-soak: bucket ready"
+        until aws --endpoint-url http://rustfs:9000 s3api list-buckets >/dev/null 2>&1; do sleep 1; done &&
+        aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket soak >/dev/null 2>&1 || true;
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket soak &&
+        echo "gonzalo-soak: bucket ready"
     restart: "no"
 
 volumes:
