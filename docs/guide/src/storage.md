@@ -27,6 +27,26 @@ The core and `gonzalo-domain` (typed views for memory tiers, topics, sessions,
 checkpoints, tickets and [fleet access-control records](./fleet.md)) are
 always included.
 
+The surface is **grouped into modules** ([ADR 0026](./adr/0026-grouped-facade-surface.md)).
+The root holds the record and store core — `Record`, `RecordKey`, `Store`,
+`PutResult`, the operations (`sync`, `merge`, `collect`, `reset`, `gc_blobs`)
+and the substrates. Every domain type lives under the module naming its domain:
+
+| module | holds |
+|---|---|
+| `gonzalo::memory` | `MemoryTier`, `Topic` |
+| `gonzalo::session` | `Session`, `Turn` |
+| `gonzalo::checkpoint` | `Checkpoint` |
+| `gonzalo::codec` | `RecordCodec` |
+| `gonzalo::ticket` | the ticket records, plus the source layer and its connectors |
+| `gonzalo::fleet` | the fleet access-control records |
+| `gonzalo::graph`, `::vector`, `::knowledge` | the feature-gated capability layers |
+
+So a program with its own `State` or `Actor` keeps them: gonzalo's are
+`gonzalo::ticket::State` and `gonzalo::ticket::Actor`. Before 0.8.0 all of these
+were exported flat at the root; see the 0.8.0 changelog for the full old→new
+table.
+
 ## Choosing a substrate
 
 | substrate | good for | notes |
