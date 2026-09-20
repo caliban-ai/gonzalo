@@ -4,6 +4,9 @@
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
+
 use gonzalo_core::{
     BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
     KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, decode_segment,
@@ -20,6 +23,14 @@ pub struct S3Store {
     /// Maximum `Record::ancestors` length kept on every committed write
     /// (spec §3.9). Defaults to [`DEFAULT_ANCESTOR_CAP`].
     cap: usize,
+    /// Encoded `(namespace, collection)` pairs known to carry the marked flag
+    /// (ADR 0025), shared across [`handle`](S3Store::handle) clones.
+    ///
+    /// Only ever added to: the flag is set once and never cleared, so a cached
+    /// `true` cannot go stale. An *unmarked* collection is deliberately not
+    /// cached — it re-checks, which costs one `HeadObject` on a path that is
+    /// already paying a read per key.
+    marked: Arc<RwLock<BTreeSet<(String, String)>>>,
 }
 
 impl S3Store {
@@ -30,6 +41,7 @@ impl S3Store {
             client,
             bucket: bucket.into(),
             cap: DEFAULT_ANCESTOR_CAP,
+            marked: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -67,6 +79,8 @@ impl S3Store {
             client: self.client.clone(),
             bucket: self.bucket.clone(),
             cap: self.cap,
+            // The Arc, not the set: a handle must see what its parent learned.
+            marked: Arc::clone(&self.marked),
         }
     }
 
@@ -214,6 +228,66 @@ impl S3Store {
                 }
             }
         }
+    }
+
+    /// Whether `list` may treat an unmarked key in this collection as live —
+    /// true once the collection carries the marked flag (ADR 0025).
+    ///
+    /// A bucket written before markers existed has tombstones with no marker,
+    /// and trusting their absence there would resurrect deleted records. So
+    /// trust is earned per collection, by a pass that read every key and
+    /// backfilled what was missing.
+    pub async fn collection_marked(&self, namespace: &str, collection: &str) -> Result<bool> {
+        let pair = (
+            gonzalo_core::segment(namespace),
+            gonzalo_core::segment(collection),
+        );
+        if self.marked.read().unwrap().contains(&pair) {
+            return Ok(true);
+        }
+        let found = match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(marked_flag_key(namespace, collection))
+            .send()
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() {
+                    false
+                } else {
+                    return Err(CoreError::Backend(svc.to_string()));
+                }
+            }
+        };
+        if found {
+            self.marked.write().unwrap().insert(pair);
+        }
+        Ok(found)
+    }
+
+    /// Record that every tombstone in this collection carries a marker.
+    ///
+    /// Only for a caller that just read every key in the collection and wrote
+    /// the markers that were missing — the flag is what later listings trust
+    /// instead of reading.
+    pub async fn mark_collection(&self, namespace: &str, collection: &str) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(marked_flag_key(namespace, collection))
+            .body(b"1".to_vec().into())
+            .send()
+            .await
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
+        self.marked.write().unwrap().insert((
+            gonzalo_core::segment(namespace),
+            gonzalo_core::segment(collection),
+        ));
+        Ok(())
     }
 
     /// Write the zero-byte tombstone marker for `key` (ADR 0025).

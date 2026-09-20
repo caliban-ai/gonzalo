@@ -564,3 +564,18 @@ async fn replicating_a_tombstone_writes_a_marker() {
         "a replicated tombstone must be marked too"
     );
 }
+
+#[tokio::test]
+async fn the_marked_flag_is_per_collection_and_sticky() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    assert!(!store.collection_marked("ns", "col").await.unwrap());
+
+    store.mark_collection("ns", "col").await.unwrap();
+    assert!(store.collection_marked("ns", "col").await.unwrap());
+    // A sibling collection is untouched: trust is earned one collection at a
+    // time, because that is the granularity a listing can prove.
+    assert!(!store.collection_marked("ns", "other").await.unwrap());
+}
