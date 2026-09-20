@@ -69,7 +69,7 @@ writers settle rather than treating the run as a success.
 | command | does |
 |---|---|
 | `gonzalo index --root R --repo OWNER/NAME [--view V] <src>` | index a source tree into a view (`--view` defaults to `main`) |
-| `gonzalo gc --root R` | sweep code-graph slices no live view references |
+| `gonzalo gc --root R` | sweep blobs no record references |
 
 `index` flags:
 
@@ -82,9 +82,13 @@ writers settle rather than treating the run as a success.
 | `--include PATH` | index a path a built-in rule would skip, such as vendored code. Repeatable. Cannot override `.gitignore`. |
 | `--require-parse-worker` | fail instead of falling back to in-process parsing when no `gonzalo-parse-worker` is found |
 
-Slices are content-addressed and shared across views, so deleting a view's source
-does not free them. `gc` marks against every live view's manifest across all repos
-and reports `manifests`, `freed` and `retained`.
+Blobs are content-addressed and shared — across views, and between records with
+identical content — so deleting a view's source, or a record, does not free them.
+`gc` marks against every record in the store (record bodies, the blobs tombstones
+pin, and every view's manifest slices) and reports `scanned`, `freed` and
+`retained`. A deleted record's blob is pinned by its tombstone until `collect`
+removes it; [Deletion](./deletion.md#reclaiming-a-deleted-records-bytes) walks
+through the order.
 
 [The MCP server](./mcp.md#index) explains `index` output line by line, which languages
 are parsed, and how to keep a view fresh.

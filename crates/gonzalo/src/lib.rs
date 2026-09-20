@@ -146,9 +146,9 @@
 
 pub use gonzalo_core::{
     AncestryStore, BlobStore, Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult,
-    Identity, KeyPrefix, MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey, RecordKind,
-    ResetReport, Result, Revision, Store, SyncConflict, SyncReport, collect, merge, now_ms, reset,
-    reset_as, sync, sync_with_ancestry,
+    GcReport, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey,
+    RecordKind, ResetReport, Result, Revision, Store, SyncConflict, SyncReport, collect, gc_blobs,
+    merge, now_ms, reset, reset_as, sync, sync_with_ancestry,
 };
 
 pub use gonzalo_domain::{
@@ -227,6 +227,16 @@ mod facade_reexports {
     }
 
     #[test]
+    fn blob_gc_is_re_exported() {
+        // Reclaiming a deleted record's bytes needs `gc_blobs` as much as it
+        // needs `collect` — a tombstone pins its blob until it is collected
+        // (gonzalo#292), so a consumer reaching for one reaches for both.
+        let report = GcReport::default();
+        assert!(report.freed.is_empty());
+        assert_eq!(report.retained, 0);
+    }
+
+    #[test]
     #[allow(clippy::type_complexity)]
     fn fleet_records_are_re_exported() {
         let person = Person {
@@ -298,6 +308,7 @@ mod tests {
             key: key.clone(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         };
 
         assert!(matches!(

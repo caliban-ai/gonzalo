@@ -122,8 +122,10 @@ enum Commands {
         #[arg(long)]
         require_parse_worker: bool,
     },
-    /// Garbage-collect orphaned code-graph slices, marking against every live
-    /// view's manifest across all repos.
+    /// Garbage-collect unreferenced blobs, marking against every record in the
+    /// store: record bodies, the blobs tombstones pin, and graph-manifest
+    /// slices. A deleted record's blob is freed only once its tombstone has
+    /// been collected.
     Gc {
         /// Root directory of the fs store.
         #[arg(long, default_value = ".", value_parser = store_root)]
@@ -435,9 +437,9 @@ async fn main() -> Result<ExitCode> {
 
         Commands::Gc { root } => {
             let summary = gc(&root).await?;
-            println!("manifests: {}", summary.manifests);
-            println!("freed:     {}", summary.freed);
-            println!("retained:  {}", summary.retained);
+            println!("scanned:  {}", summary.scanned);
+            println!("freed:    {}", summary.freed);
+            println!("retained: {}", summary.retained);
         }
 
         Commands::Sync { a, b, ancestor_cap } => {

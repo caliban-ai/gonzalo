@@ -42,6 +42,7 @@ async fn seed(fs: &FsStore) {
         key: Manifest::key("r", "main"),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     };
     assert!(matches!(
         fs.put(record, None).await.unwrap(),

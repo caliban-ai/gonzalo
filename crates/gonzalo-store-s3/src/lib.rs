@@ -826,6 +826,7 @@ mod tests {
             links: Vec::new(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 

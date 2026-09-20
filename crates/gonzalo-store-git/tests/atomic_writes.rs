@@ -31,6 +31,7 @@ fn rec(key: &RecordKey, payload: &[u8], revision: Revision, parent: Option<Revis
         links: Vec::new(),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
     }
 }
 

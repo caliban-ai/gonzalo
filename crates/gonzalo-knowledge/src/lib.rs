@@ -391,6 +391,7 @@ mod tests {
             key: key.clone(),
             ancestors: Vec::new(),
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 

@@ -92,6 +92,7 @@ fn sample(key: RecordKey, payload: &[u8], revision: Revision, parent: Option<Rev
         links: Vec::new(),
         ancestors: Vec::new(),
         deleted_at: None,
+        deleted_blob: None,
         key,
     }
 }

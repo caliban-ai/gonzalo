@@ -101,6 +101,15 @@ pub fn tombstone_of(
         links: Vec::new(),
         ancestors,
         deleted_at: Some(now_ms),
+        // Pin the deleted record's blob, if it had one: the tombstone's own
+        // body is empty, so this is the only remaining reference, and blob
+        // collection keeps the bytes until the tombstone itself is collected
+        // (gonzalo#292). Two peers deleting the same revision still produce
+        // identical tombstones, since they pin the same hash.
+        deleted_blob: match &current.body {
+            Body::Blob { hash, .. } => Some(hash.clone()),
+            Body::Inline(_) => None,
+        },
     }
 }
 
@@ -180,6 +189,9 @@ pub fn plan_put(
                 };
                 record.parent = Some(t.revision.clone());
                 record.deleted_at = None;
+                // The recreated record is live and carries its own body, so it
+                // pins nothing on the tombstone's behalf (gonzalo#292).
+                record.deleted_blob = None;
                 // A recreation starts a new life at this key: the deleted
                 // record's `created` does not carry over.
                 record.meta.created = now_ms;
@@ -364,6 +376,7 @@ mod tests {
             links: Vec::new(),
             ancestors,
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 
@@ -535,6 +548,34 @@ mod tests {
         // The delete is the record's last update (#293).
         assert_eq!(t.meta.updated, 1_234);
         assert!(t.links.is_empty());
+        // An inline body has no blob to pin.
+        assert_eq!(t.deleted_blob, None);
+    }
+
+    #[test]
+    fn tombstone_of_pins_the_deleted_records_blob() {
+        // The tombstone's own body is empty, so this pin is the only remaining
+        // reference to the content — without it, blob GC would sweep bytes a
+        // peer can still resurrect the record from (gonzalo#292).
+        let mut cur = live(5, b"body", vec![]);
+        cur.body = Body::blob(b"the real content");
+
+        let t = tombstone_of(&cur, 1_234, 32, None);
+
+        assert_eq!(t.body, Body::Inline(Vec::new()));
+        assert_eq!(t.deleted_blob, Some(ContentHash::of(b"the real content")));
+    }
+
+    #[test]
+    fn independent_tombstones_of_a_blob_backed_record_are_identical() {
+        // The pin is a function of the deleted record, so two peers deleting
+        // the same revision still converge on byte-identical tombstones.
+        let mut cur = live(5, b"body", vec![]);
+        cur.body = Body::blob(b"content");
+        assert_eq!(
+            tombstone_of(&cur, 1, 32, None).deleted_blob,
+            tombstone_of(&cur, 999, 32, None).deleted_blob
+        );
     }
 
     #[test]
@@ -630,6 +671,9 @@ mod tests {
         assert_eq!(stored.deleted_at, None);
         assert_eq!(stored.ancestors.first(), Some(&t.revision));
         assert_eq!(stored.kind, RecordKind::Topic);
+        // The key is live again, so the old content stops being pinned: the
+        // recreated record's own body is what keeps a blob alive (gonzalo#292).
+        assert_eq!(stored.deleted_blob, None);
     }
 
     #[test]
@@ -888,6 +932,9 @@ pub fn reconciled_record(
         links,
         ancestors,
         deleted_at: None,
+        // A reconciled record is live, so it pins nothing: its own body is the
+        // reference that keeps a blob alive (gonzalo#292).
+        deleted_blob: None,
     }
 }
 
@@ -921,6 +968,7 @@ mod reconcile_tests {
             links: Vec::new(),
             ancestors,
             deleted_at: None,
+            deleted_blob: None,
         }
     }
 

@@ -97,6 +97,13 @@ large bodies. Blobs are keyed by content hash and written only if absent, so sto
 the same bytes twice is a no-op. Code-graph slices shared across views are stored
 this way ([ADR 0012](./adr/0012-code-graph-two-level-keying.md)).
 
+Because blobs are shared, nothing frees one implicitly — not deleting the record
+that holds it, and not collecting that record's tombstone, which pins the blob
+until it is collected. `gonzalo gc` sweeps what no record references, marking
+record bodies, tombstone pins and manifest slices alike
+([ADR 0024](./adr/0024-blob-garbage-collection.md)). [Deletion](./deletion.md#reclaiming-a-deleted-records-bytes)
+walks through the order.
+
 ## Vector search and embeddings
 
 `gonzalo-vector` defines the `Embedder` trait and an exact in-memory index,
