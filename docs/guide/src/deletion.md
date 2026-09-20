@@ -189,6 +189,12 @@ tombstone, the next sync copies it back. That's harmless (it's still a delete),
 but to reclaim space everywhere, run `collect` on every store with the same
 horizon.
 
+On an S3 store, collecting also makes listings cheaper. A tombstone there
+carries a marker object that `list` reads to resolve it, so the reads a listing
+does are bounded by the tombstones outstanding
+([ADR 0025](./adr/0025-s3-tombstone-markers.md)). Collecting removes both, and a
+collection with no tombstones left is listed without reading a single record.
+
 ## Choosing a collection horizon
 
 **This is the one decision in this page that can lose data.**

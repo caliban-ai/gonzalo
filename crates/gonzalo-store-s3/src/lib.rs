@@ -22,7 +22,10 @@ const BLOB_PREFIX: &str = "blobs/";
 #[derive(Default)]
 struct Listing {
     records: Vec<RecordKey>,
-    markers: BTreeSet<RecordKey>,
+    /// Marked keys, each with the ETag its marker carried in this listing.
+    /// Removing a marker is conditional on that ETag, so a marker rewritten
+    /// since is left alone (see `delete_marker_if_match`).
+    markers: BTreeMap<RecordKey, String>,
 }
 
 pub struct S3Store {
@@ -187,8 +190,9 @@ impl S3Store {
                     }
                 } else if let Some(key) = parse_marker_key(k)
                     && prefix.matches(&key)
+                    && let Some(etag) = obj.e_tag()
                 {
-                    out.markers.insert(key);
+                    out.markers.insert(key, etag.to_string());
                 }
             }
             match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
@@ -309,32 +313,59 @@ impl S3Store {
         Ok(())
     }
 
-    /// Write the zero-byte tombstone marker for `key` (ADR 0025).
+    /// Write the tombstone marker for `key` (ADR 0025).
     /// Unconditional: the marker carries no version, so writing one that
     /// already exists is a no-op rather than a race to lose.
-    async fn put_marker(&self, key: &RecordKey) -> Result<()> {
+    async fn put_marker(&self, key: &RecordKey, revision: &Revision) -> Result<()> {
+        // The body is the tombstone's revision, which makes each marker
+        // distinguishable from the next one written for the same key: a
+        // tombstone's counter always exceeds the record it replaced, so no two
+        // markers for a key ever share an ETag. `delete_marker_if_match` relies
+        // on that to tell "the marker I resolved" from "a marker written since".
+        let body = serde_json::to_vec(revision).map_err(|e| CoreError::Serde(e.to_string()))?;
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(marker_key(key))
-            .body(Vec::new().into())
+            .body(body.into())
             .send()
             .await
             .map(|_| ())
             .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
     }
 
-    /// Remove the marker for `key`. Idempotent: `DeleteObject` succeeds on an
-    /// absent key, so callers never have to check first.
-    async fn delete_marker(&self, key: &RecordKey) -> Result<()> {
-        self.client
+    /// Remove the marker for `key` only if it still carries `etag`.
+    ///
+    /// The conditional is what makes removal safe to do concurrently with a
+    /// delete. A listing resolves a marker to "the record is live" or "the
+    /// record is gone", then removes it — but between those two steps another
+    /// writer may have deleted the record, writing *its* marker first and the
+    /// tombstone after. An unconditional removal landing in that window would
+    /// strand a tombstone with no marker, which a flagged collection reads as
+    /// live. The new marker carries a different revision, so its ETag differs
+    /// and this removal turns into a no-op (412) instead.
+    async fn delete_marker_if_match(&self, key: &RecordKey, etag: &str) -> Result<()> {
+        match self
+            .client
             .delete_object()
             .bucket(&self.bucket)
             .key(marker_key(key))
+            .if_match(etag)
             .send()
             .await
-            .map(|_| ())
-            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc = e.into_service_error();
+                // A marker rewritten since the listing is not ours to remove,
+                // and one already gone needs no removing.
+                if race_kind(svc.code()).is_some() || svc.code() == Some("NoSuchKey") {
+                    Ok(())
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
     }
 
     /// Whether `key` currently carries a tombstone marker.
@@ -368,7 +399,8 @@ impl S3Store {
     /// cases of ADR 0025; production code always pairs the two writes.
     #[doc(hidden)]
     pub async fn write_marker_for_test(&self, key: &RecordKey) -> Result<()> {
-        self.put_marker(key).await
+        self.put_marker(key, &Revision::initial(b"stale marker"))
+            .await
     }
 
     /// Remove a marker while leaving its tombstone — the pre-ADR-0025 layout.
@@ -376,7 +408,14 @@ impl S3Store {
     /// from a record that is still deleted.
     #[doc(hidden)]
     pub async fn remove_marker_for_test(&self, key: &RecordKey) -> Result<()> {
-        self.delete_marker(key).await
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
     }
 
     /// Read `keys` in bounded-concurrency batches and report which are live.
@@ -385,7 +424,7 @@ impl S3Store {
     /// The reads run concurrently because one at a time multiplied every key's
     /// latency by a round trip, which is what made a large collection slow
     /// rather than merely expensive (gonzalo#286).
-    async fn read_liveness(&self, keys: &[RecordKey]) -> Result<BTreeMap<RecordKey, bool>> {
+    async fn read_liveness(&self, keys: &[RecordKey]) -> Result<BTreeMap<RecordKey, Liveness>> {
         let mut live = BTreeMap::new();
         for batch in keys.chunks(LIST_READ_CONCURRENCY) {
             let mut reads = tokio::task::JoinSet::new();
@@ -395,13 +434,13 @@ impl S3Store {
                 let store = self.handle();
                 let key = key.clone();
                 reads.spawn(async move {
-                    let visible = listed_as_live(store.read(&key).await)?;
-                    Ok::<_, CoreError>((key, visible))
+                    let liveness = listed_as_live(store.read(&key).await)?;
+                    Ok::<_, CoreError>((key, liveness))
                 });
             }
             while let Some(joined) = reads.join_next().await {
-                let (key, visible) = joined.map_err(|e| CoreError::Backend(e.to_string()))??;
-                live.insert(key, visible);
+                let (key, liveness) = joined.map_err(|e| CoreError::Backend(e.to_string()))??;
+                live.insert(key, liveness);
             }
         }
         Ok(live)
@@ -453,11 +492,8 @@ impl S3Store {
                     // which is the single state a flagged collection cannot
                     // survive — `list` would show the deleted record as live.
                     if record.is_tombstone() {
-                        self.put_marker(key).await?;
+                        self.put_marker(key, &record.revision).await?;
                     }
-                    let replaced_tombstone = current
-                        .as_ref()
-                        .is_some_and(|(rec, _)| rec.is_tombstone());
                     let outcome = self.put_record_if(&record, precondition(etag)).await?;
                     if let WriteOutcome::LostRace(_) = outcome {
                         // Remember it, so the next attempt can recognise its own
@@ -468,12 +504,14 @@ impl S3Store {
                             WriteOutcome::Applied => unreachable!("checked above"),
                         });
                     }
-                    // The key is live again, so nothing pins its marker. Only
-                    // on a recreation over a tombstone: a plain update never
-                    // had one to clear.
-                    if replaced_tombstone && !record.is_tombstone() {
-                        self.delete_marker(key).await?;
-                    }
+                    // A recreation leaves the old marker behind on purpose. It
+                    // is now stale — the key is live — which costs the next
+                    // listing one read and nothing else, and that listing
+                    // removes it under the ETag it saw. Removing it here
+                    // instead would race a concurrent delete: the other writer
+                    // puts its marker before its tombstone, and a removal
+                    // landing between the two would strand an unmarked
+                    // tombstone. Writers only ever add markers.
                     (outcome, answer)
                 }
                 Planned::Remove(answer) => {
@@ -481,12 +519,9 @@ impl S3Store {
                     // was read. The empty fallback can never match; it would
                     // just 412 and re-plan.
                     let tag = etag.unwrap_or_default().to_string();
-                    let outcome = self.delete_record_if_match(key, tag).await?;
-                    if let WriteOutcome::Applied = outcome {
-                        // Purge removed the record the marker pointed at.
-                        self.delete_marker(key).await?;
-                    }
-                    (outcome, answer)
+                    // Purge leaves the marker too, for the same reason, and the
+                    // next listing sweeps it as an orphan.
+                    (self.delete_record_if_match(key, tag).await?, answer)
                 }
             };
             Ok(match outcome {
@@ -555,6 +590,18 @@ fn visible(record: Option<Record>) -> Option<Record> {
     record.filter(|r| !r.is_tombstone())
 }
 
+/// What a read said about a key the listing turned up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Liveness {
+    /// Listed.
+    Live,
+    /// Hidden. Carries the tombstone's revision, which is what its marker
+    /// names (ADR 0025), so a pass that finds one unmarked can write it.
+    Tombstoned(Revision),
+    /// Hidden: purged between the listing and the read.
+    Absent,
+}
+
 /// Whether consumer `list` includes a key, given the raw read of its object.
 /// Tombstones and keys purged since the listing (NotFound) are excluded. An
 /// object that fails to decode stays listed, so `get` on that key surfaces the
@@ -562,10 +609,12 @@ fn visible(record: Option<Record>) -> Option<Record> {
 /// `list`: on s3 it may be transient, and listing a key that may be a
 /// tombstone would be wrong. fs and git differ: they keep every unreadable
 /// entry listed.
-fn listed_as_live(read: Result<Option<Record>>) -> Result<bool> {
+fn listed_as_live(read: Result<Option<Record>>) -> Result<Liveness> {
     match read {
-        Ok(record) => Ok(visible(record).is_some()),
-        Err(CoreError::Serde(_)) => Ok(true),
+        Ok(Some(record)) if record.is_tombstone() => Ok(Liveness::Tombstoned(record.revision)),
+        Ok(Some(_)) => Ok(Liveness::Live),
+        Ok(None) => Ok(Liveness::Absent),
+        Err(CoreError::Serde(_)) => Ok(Liveness::Live),
         Err(e) => Err(e),
     }
 }
@@ -748,7 +797,7 @@ impl gonzalo_core::Store for S3Store {
         // purged, one marker left behind by a purge that died between its two
         // deletes. Grouping on records alone would never visit it, so the
         // orphan would outlive every listing.
-        for marker in &listing.markers {
+        for marker in listing.markers.keys() {
             by_collection
                 .entry((marker.namespace.clone(), marker.collection.clone()))
                 .or_default();
@@ -762,7 +811,7 @@ impl gonzalo_core::Store for S3Store {
             // old layout left behind.
             let to_read: Vec<RecordKey> = if marked {
                 keys.iter()
-                    .filter(|k| listing.markers.contains(k))
+                    .filter(|k| listing.markers.contains_key(k))
                     .cloned()
                     .collect()
             } else {
@@ -774,35 +823,44 @@ impl gonzalo_core::Store for S3Store {
                 match live.get(key) {
                     // Not read: unmarked in a flagged collection, so live.
                     None => out.push(key.clone()),
-                    Some(true) => {
-                        if listing.markers.contains(key) {
-                            // Live but marked — the crash window. Heal it, so
-                            // the next listing doesn't pay for it again.
-                            self.delete_marker(key).await?;
+                    Some(Liveness::Live) => {
+                        if let Some(etag) = listing.markers.get(key) {
+                            // Live but marked — a marker left by a recreation,
+                            // or by a crash before the tombstone landed. Remove
+                            // it under the ETag this listing saw, so a delete
+                            // that has written a *new* marker since keeps it.
+                            self.delete_marker_if_match(key, etag).await?;
                         }
                         out.push(key.clone());
                     }
-                    Some(false) => {
-                        if !marked && !listing.markers.contains(key) {
+                    Some(Liveness::Tombstoned(revision)) => {
+                        if !listing.markers.contains_key(key) {
                             // A tombstone the old layout left unmarked. The
                             // pass that just proved it is the cheapest place to
                             // repair it.
-                            self.put_marker(key).await?;
+                            self.put_marker(key, revision).await?;
+                        }
+                    }
+                    Some(Liveness::Absent) => {
+                        // Purged between the listing and the read, so its
+                        // marker — if any — is now an orphan.
+                        if let Some(etag) = listing.markers.get(key) {
+                            self.delete_marker_if_match(key, etag).await?;
                         }
                     }
                 }
             }
 
-            // A marker whose record is not in the listing at all is an orphan
-            // from a purge that died between its two deletes.
+            // A marker whose record was not in the listing at all is an orphan
+            // left by a purge, which removes the record and never the marker.
             let listed: BTreeSet<&RecordKey> = keys.iter().collect();
-            for orphan in listing
+            for (orphan, etag) in listing
                 .markers
                 .iter()
-                .filter(|m| m.namespace == namespace && m.collection == collection)
-                .filter(|m| !listed.contains(m))
+                .filter(|(m, _)| m.namespace == namespace && m.collection == collection)
+                .filter(|(m, _)| !listed.contains(m))
             {
-                self.delete_marker(orphan).await?;
+                self.delete_marker_if_match(orphan, etag).await?;
             }
 
             if !marked {
@@ -1040,7 +1098,7 @@ const MARKER_SUFFIX: &str = ".tombstone";
 
 /// The marker object key for `key`: `namespace/collection/id.json.tombstone`.
 ///
-/// A zero-byte object here means "the record at this key may be a tombstone —
+/// An object here means "the record at this key may be a tombstone —
 /// read it to find out". Its *absence* is only meaningful in a collection
 /// carrying [`marked_flag_key`], since a bucket written before ADR 0025 has
 /// tombstones with no marker at all.
@@ -1274,10 +1332,19 @@ mod tests {
     #[test]
     fn list_filter_excludes_tombstones_and_vanished_keys() {
         let k = RecordKey::new("ns", "col", "listed");
-        assert!(listed_as_live(Ok(Some(live(&k, b"x")))).unwrap());
-        assert!(!listed_as_live(Ok(Some(tomb(&k, b"x")))).unwrap());
+        assert_eq!(
+            listed_as_live(Ok(Some(live(&k, b"x")))).unwrap(),
+            Liveness::Live
+        );
+        // A tombstone reports the revision its marker names, so a listing that
+        // finds one unmarked can repair it without a second read.
+        let t = tomb(&k, b"x");
+        assert_eq!(
+            listed_as_live(Ok(Some(t.clone()))).unwrap(),
+            Liveness::Tombstoned(t.revision)
+        );
         // Purged between the listing and the read.
-        assert!(!listed_as_live(Ok(None)).unwrap());
+        assert_eq!(listed_as_live(Ok(None)).unwrap(), Liveness::Absent);
     }
 
     #[test]
@@ -1285,7 +1352,10 @@ mod tests {
         // An object that fails to decode stays listed; `get` surfaces the error.
         // Any other read error fails the list (s3 rule; fs and git keep such
         // entries listed).
-        assert!(listed_as_live(Err(CoreError::Serde("bad json".into()))).unwrap());
+        assert_eq!(
+            listed_as_live(Err(CoreError::Serde("bad json".into()))).unwrap(),
+            Liveness::Live
+        );
         assert!(matches!(
             listed_as_live(Err(CoreError::Backend("503".into()))),
             Err(CoreError::Backend(_))

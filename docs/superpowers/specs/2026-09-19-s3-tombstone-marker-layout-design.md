@@ -43,33 +43,54 @@ therefore a layout change.
 
 ### 3.1 The marker
 
-Deleting a record additionally writes a **zero-byte marker object** beside it:
+Deleting a record additionally writes a small **marker object** beside it:
 
 ```
 ns/col/id.json             the record — a tombstone, unchanged in place
-ns/col/id.json.tombstone   the marker — zero bytes, presence is the signal
+ns/col/id.json.tombstone   the marker — presence is the signal
 ```
 
 The record object keeps its current meaning, so **every compare-and-swap stays a
 single conditional write on a single object.** The marker is a hint about that
 object, never a second source of truth.
 
-### 3.2 The invariant, and the ordering that buys it
+Its body is the tombstone's **revision**. A tombstone's counter always exceeds
+the record it replaced, so no two markers ever written for one key share a body,
+and therefore none share an ETag. §3.2 depends on that.
+
+### 3.2 The invariant, and who may break it
 
 > **A tombstone implies a marker.** A marker implies nothing.
 
-Enforced by ordering every marker write on the safe side of the record write:
+Two rules hold it:
 
-| Operation | Order |
+1. **The marker is written before the tombstone.** A crash between the two
+   leaves a marker for a record that is still live — stale, costing one read —
+   rather than a tombstone with no marker, which is the one state a flagged
+   collection cannot survive.
+2. **Writers never remove a marker. Only `list` does, and only conditionally.**
+
+The second rule is not fastidiousness. An unconditional removal is a live race,
+not merely a crash window: suppose a recreation removed the marker it replaced,
+while another writer deletes the same key, writing *its* marker first and its
+tombstone second. A removal landing between those two strands an unmarked
+tombstone — silently, on a healthy system, with no crash involved. Purge has the
+same shape. So a recreation and a purge both leave the marker behind, where it
+is merely stale, and `list` removes it with `If-Match` on the ETag from its own
+listing. A marker rewritten since carries a different revision and therefore a
+different ETag, so the removal turns into a no-op instead of an act of
+destruction.
+
+| Operation | What it does to the marker |
 |---|---|
 | delete / replicate a tombstone | `PUT` marker, **then** `PUT` tombstone (OCC) |
-| recreate over a tombstone | `PUT` live record (OCC), **then** `DELETE` marker |
-| purge | `DELETE` record, **then** `DELETE` marker |
+| recreate over a tombstone | nothing — the old marker is left stale |
+| purge | nothing — the marker is left orphaned |
+| `list` | removes stale and orphaned markers, `If-Match` on the listed ETag |
 
-Every crash window leaves a marker that is *stale* — present for a record that
-is live or absent — and never a tombstone that lacks one. A stale marker costs
-one `GetObject` to resolve and nothing else. This is the whole reason the
-marker is written first and removed last.
+Every window therefore leaves a marker that is *stale* — present for a record
+that is live or absent — and never a tombstone that lacks one. A stale marker
+costs one `GetObject` to resolve and nothing else.
 
 ### 3.3 Reading
 
@@ -79,9 +100,14 @@ already covers them, and no second traversal is needed.
 
 - A record key **with no marker** is live. No read.
 - A record key **with a marker** is read to resolve it: a tombstone is hidden; a
-  live record is listed **and its stale marker is deleted** (self-healing); an
-  absent record leaves an orphan marker, which is deleted.
-- A marker with no record key is an orphan; delete it.
+  live record is listed and its stale marker removed; an absent record — purged
+  between the listing and the read — has its orphan marker removed.
+- A marker with no record key in the listing is an orphan left by a purge;
+  remove it.
+
+Every removal is conditional on the ETag this listing saw (§3.2), so the layout
+heals itself without any pass being able to destroy a marker that a concurrent
+delete has just written.
 
 Steady-state cost: one listing pass plus one `GetObject` per *tombstone*, which
 `collect` bounds — instead of one per *record*, which nothing bounds.
@@ -139,10 +165,14 @@ encoded `(namespace, collection)`.
 
 ## 4. What this costs
 
-Per delete: one extra `PutObject` (zero bytes). Per recreation over a tombstone:
-one extra `DeleteObject`. Per purge: one extra `DeleteObject`. All are on write
-paths that already do a read-modify-write round trip, and none is conditional,
-so none can fail a compare-and-swap or retry loop.
+Per delete: one extra `PutObject`, a few dozen bytes. That is the whole write
+cost — a recreation and a purge add nothing, because neither removes a marker
+(§3.2). The extra write sits on a path that already does a read-modify-write
+round trip, and it is unconditional, so it cannot fail a compare-and-swap or
+disturb the retry loop.
+
+The removals `list` does are bounded by the markers it resolved, and each is one
+conditional `DeleteObject`.
 
 Mixed-version deployments are out of scope, as they already are: ADR 0021
 requires every binary that reads a store or runs sync to be upgraded together. A

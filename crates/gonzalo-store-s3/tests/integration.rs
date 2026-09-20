@@ -492,7 +492,9 @@ async fn delete_writes_a_marker_and_recreation_removes_it() {
         "a tombstone must carry a marker"
     );
 
-    // Recreating the key makes it live again, so nothing pins its marker.
+    // Recreating the key leaves the marker behind on purpose: writers only ever
+    // add markers, because removing one here would race a concurrent delete.
+    // The marker is now merely stale, and the next listing clears it.
     match store
         .put(
             sample(key.clone(), b"v2", Revision::initial(b"v2"), None),
@@ -505,8 +507,18 @@ async fn delete_writes_a_marker_and_recreation_removes_it() {
         PutResult::Conflict(c) => panic!("recreation conflicted: {c:?}"),
     }
     assert!(
+        store.marker_exists(&key).await.unwrap(),
+        "a recreation leaves the stale marker for the next listing"
+    );
+
+    assert_eq!(
+        store.list(&prefix("ns", "col")).await.unwrap(),
+        vec![key.clone()],
+        "the recreated record is listed"
+    );
+    assert!(
         !store.marker_exists(&key).await.unwrap(),
-        "a recreation clears the marker"
+        "and that listing cleared the stale marker"
     );
 }
 
@@ -530,9 +542,14 @@ async fn purge_removes_the_marker_with_the_tombstone() {
         store.purge(&key, tomb.revision).await.unwrap(),
         DeleteResult::Deleted
     );
+    // Purge removes the record and leaves the marker, for the same reason a
+    // recreation does: a removal here would race a concurrent delete. The
+    // orphan is swept by the next listing, under the ETag that listing saw.
+    assert!(store.marker_exists(&key).await.unwrap());
+    assert!(store.list(&prefix("ns", "col")).await.unwrap().is_empty());
     assert!(
         !store.marker_exists(&key).await.unwrap(),
-        "purge must not leave an orphan marker"
+        "the listing sweeps the orphan the purge left"
     );
 }
 

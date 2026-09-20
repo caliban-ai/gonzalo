@@ -34,18 +34,29 @@ in the spec.
 
 ## Decision
 
-**Deleting a record also writes a zero-byte marker at
-`namespace/collection/id.json.tombstone`.** The record object is untouched, so
-every compare-and-swap remains one conditional write on one object. The marker
-is a hint about that object, never a second source of truth.
+**Deleting a record also writes a marker at
+`namespace/collection/id.json.tombstone`, whose body is the tombstone's
+revision.** The record object is untouched, so every compare-and-swap remains
+one conditional write on one object. The marker is a hint about that object,
+never a second source of truth.
 
 The invariant is one-directional — **a tombstone implies a marker; a marker
-implies nothing** — and is bought by ordering each marker write on the safe side
-of the record write: the marker is created *before* a tombstone is written, and
-removed *after* a live record replaces one or a purge removes it. Every crash
-window therefore leaves a marker that is merely stale, never a tombstone that
-lacks one. A stale marker costs one `GetObject` to resolve, and `list` deletes
-the ones it finds, so the layout heals itself.
+implies nothing** — and two rules hold it. First, the marker is written *before*
+the tombstone, so a crash between them leaves a marker for a record that is
+still live rather than a tombstone with no marker. Second, **writers never
+remove a marker; only `list` does, and only with `If-Match` on the ETag it saw
+in its own listing.**
+
+The second rule is what makes concurrent removal safe, and the reason is not a
+crash but a race: if a recreation or a purge removed the marker it found, a
+concurrent delete — which writes its marker first and its tombstone second —
+could have that marker deleted out from under it, stranding an unmarked
+tombstone on a perfectly healthy system. So a recreation leaves its marker
+stale and a purge leaves its marker orphaned, and the next listing removes them
+conditionally. Because a tombstone's revision counter always exceeds the record
+it replaced, no two markers for a key share a body or an ETag, so a marker
+rewritten since the listing is left alone. A stale marker costs one `GetObject`
+to resolve and nothing else, and the layout heals itself.
 
 `list` makes one pass, sorts record keys from marker keys as it goes, and reads
 only marked keys. Steady-state cost falls from one `GetObject` per *record*,
@@ -68,12 +79,14 @@ what a reader may assume.
   recreation semantics and its replication surface are all unchanged. A bucket
   written by the previous version upgrades without an admin step and without any
   window in which a deleted record could reappear in a listing.
-- **Negative:** three write paths now touch two objects instead of one — one
-  extra zero-byte `PutObject` per delete, one extra `DeleteObject` per
-  recreation and per purge. None is conditional, so none can fail a
-  compare-and-swap, but each is a round trip that can fail on its own and leave
-  a stale marker behind. The first `list` of each collection after the upgrade
-  still pays the old cost, and a deployment whose collections are never fully
+- **Negative:** a delete now touches two objects instead of one, costing an
+  extra `PutObject` of a few dozen bytes. It is unconditional, so it cannot fail
+  a compare-and-swap, but it is a round trip that can fail on its own. Markers
+  accumulate wherever listings are rare, because only a listing removes them: a
+  workload that deletes and recreates the same keys without ever listing them
+  leaves a stale marker per key, each costing one read whenever a listing
+  finally happens. The first `list` of each collection after the upgrade still
+  pays the old cost, and a deployment whose collections are never fully
   enumerated never earns the flag and never gets faster.
 - **Neutral:** the layout is additive. Markers and the flag are invisible to
   `parse_object_key`, so an older reader ignores them entirely and behaves as it

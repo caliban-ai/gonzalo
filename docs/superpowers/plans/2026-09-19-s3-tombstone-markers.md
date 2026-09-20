@@ -831,3 +831,28 @@ git commit -m "docs(store-s3): document the marker layout and its listing cost (
 **Type consistency.** `marker_key`/`parse_marker_key`/`marked_flag_key` (Task 1) are used under those names in Tasks 2-4. `Listing { records, markers }` (Task 4) is the only new type. `collection_marked`/`mark_collection` (Task 3) match their call sites in Task 4. `read_liveness` returns `BTreeMap<RecordKey, bool>`, which Task 4's match arms read as `None`/`Some(true)`/`Some(false)`.
 
 **Known wrinkle, deliberately left in:** Task 4 Step 4 writes an orphan filter that Step 6 then simplifies. The two-step shape is intentional — the first version is what falls out of the match arms, and seeing it wrong once is cheaper than describing the right one abstractly. An implementer who writes Step 6's version directly should do so and skip Step 6.
+
+---
+
+## Deviation from this plan, found during Task 4
+
+Tasks 2 and 4 as written had a recreation and a purge remove the marker, and had
+`list` remove stale markers unconditionally. That is unsafe, and not only in a
+crash: a removal is a live race against a concurrent delete, which writes its
+marker first and its tombstone second. A removal landing between those two
+strands an unmarked tombstone on a healthy system — exactly the state the
+invariant forbids — and no test in this plan would have caught it.
+
+The implemented design therefore differs:
+
+- **Writers only ever add markers.** A recreation leaves the old marker stale; a
+  purge leaves it orphaned. Neither costs a round trip any more.
+- **Only `list` removes a marker**, with `If-Match` on the ETag it saw in its own
+  listing.
+- **The marker body is the tombstone's revision**, which is what makes that
+  conditional meaningful: a tombstone's counter always exceeds the record it
+  replaced, so no two markers for a key share an ETag, and a marker rewritten
+  since the listing is left alone.
+
+The spec and [ADR 0025](../../adr/0025-s3-tombstone-markers.md) were updated to
+match; they are the authority, not this plan.
