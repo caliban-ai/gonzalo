@@ -1,7 +1,7 @@
 use gonzalo_core::conformance::{run_store_conformance, run_tombstone_conformance};
 use gonzalo_core::{
-    BlobStore, Body, ContentHash, CoreError, DeleteResult, Identity, Meta, PutResult, Record,
-    RecordKey, RecordKind, Revision, Store,
+    BlobStore, Body, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, Meta, PutResult,
+    Record, RecordKey, RecordKind, Revision, Store,
 };
 use gonzalo_store_s3::S3Store;
 use std::collections::BTreeMap;
@@ -465,4 +465,267 @@ async fn purge_racing_recreation_never_removes_the_recreated_record() {
         .expect("a committed recreation must survive every purge");
     assert!(!raw.is_tombstone(), "the recreated record must be live");
     assert_eq!(raw.revision, committed[0]);
+}
+
+// ── tombstone markers (ADR 0025, gonzalo#294) ───────────────────────────────
+
+#[tokio::test]
+async fn delete_writes_a_marker_and_recreation_removes_it() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let key = RecordKey::new("ns", "col", "marked");
+
+    let rev = seed(&store, &key).await;
+    assert!(
+        !store.marker_exists(&key).await.unwrap(),
+        "a live record has no marker"
+    );
+
+    assert_eq!(
+        store.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    assert!(
+        store.marker_exists(&key).await.unwrap(),
+        "a tombstone must carry a marker"
+    );
+
+    // Recreating the key leaves the marker behind on purpose: writers only ever
+    // add markers, because removing one here would race a concurrent delete.
+    // The marker is now merely stale, and the next listing clears it.
+    match store
+        .put(
+            sample(key.clone(), b"v2", Revision::initial(b"v2"), None),
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        PutResult::Committed(_) => {}
+        PutResult::Conflict(c) => panic!("recreation conflicted: {c:?}"),
+    }
+    assert!(
+        store.marker_exists(&key).await.unwrap(),
+        "a recreation leaves the stale marker for the next listing"
+    );
+
+    assert_eq!(
+        store.list(&prefix("ns", "col")).await.unwrap(),
+        vec![key.clone()],
+        "the recreated record is listed"
+    );
+    assert!(
+        !store.marker_exists(&key).await.unwrap(),
+        "and that listing cleared the stale marker"
+    );
+}
+
+#[tokio::test]
+async fn purge_removes_the_marker_with_the_tombstone() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let key = RecordKey::new("ns", "col", "purged");
+
+    let rev = seed(&store, &key).await;
+    assert_eq!(
+        store.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store.get_raw(&key).await.unwrap().expect("tombstone");
+    assert!(store.marker_exists(&key).await.unwrap());
+
+    assert_eq!(
+        store.purge(&key, tomb.revision).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    // Purge removes the record and leaves the marker, for the same reason a
+    // recreation does: a removal here would race a concurrent delete. The
+    // orphan is swept by the next listing, under the ETag that listing saw.
+    assert!(store.marker_exists(&key).await.unwrap());
+    assert!(store.list(&prefix("ns", "col")).await.unwrap().is_empty());
+    assert!(
+        !store.marker_exists(&key).await.unwrap(),
+        "the listing sweeps the orphan the purge left"
+    );
+}
+
+#[tokio::test]
+async fn replicating_a_tombstone_writes_a_marker() {
+    // `put_raw` is the replication write. A tombstone arriving from a peer must
+    // be marked exactly like a locally-written one, or the receiving store's
+    // `list` would show the deleted record as live.
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let source = fresh_bucket_store(&endpoint).await;
+    let store = fresh_bucket_store(&endpoint).await;
+    let key = RecordKey::new("ns", "col", "replicated");
+
+    let rev = seed(&source, &key).await;
+    assert_eq!(
+        source.delete(&key, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = source.get_raw(&key).await.unwrap().expect("tombstone");
+
+    match store.put_raw(tomb, None).await.unwrap() {
+        PutResult::Committed(_) => {}
+        PutResult::Conflict(c) => panic!("replication conflicted: {c:?}"),
+    }
+    assert!(
+        store.marker_exists(&key).await.unwrap(),
+        "a replicated tombstone must be marked too"
+    );
+}
+
+#[tokio::test]
+async fn the_marked_flag_is_per_collection_and_sticky() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    assert!(!store.collection_marked("ns", "col").await.unwrap());
+
+    store.mark_collection("ns", "col").await.unwrap();
+    assert!(store.collection_marked("ns", "col").await.unwrap());
+    // A sibling collection is untouched: trust is earned one collection at a
+    // time, because that is the granularity a listing can prove.
+    assert!(!store.collection_marked("ns", "other").await.unwrap());
+}
+
+fn prefix(namespace: &str, collection: &str) -> KeyPrefix {
+    KeyPrefix {
+        namespace: Some(namespace.into()),
+        collection: Some(collection.into()),
+    }
+}
+
+#[tokio::test]
+async fn list_hides_a_tombstone_on_both_the_slow_and_fast_paths() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let live = RecordKey::new("ns", "col", "live");
+    let gone = RecordKey::new("ns", "col", "gone");
+    seed(&store, &live).await;
+    let rev = seed(&store, &gone).await;
+    assert_eq!(
+        store.delete(&gone, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    // First listing is the slow path: it reads every key, then flags.
+    assert_eq!(
+        store.list(&prefix("ns", "col")).await.unwrap(),
+        vec![live.clone()]
+    );
+    assert!(store.collection_marked("ns", "col").await.unwrap());
+
+    // Second listing takes the fast path and must agree.
+    assert_eq!(
+        store.list(&prefix("ns", "col")).await.unwrap(),
+        vec![live.clone()]
+    );
+
+    // list_raw is unchanged: replication still sees the tombstoned key.
+    let mut raw = store.list_raw(&prefix("ns", "col")).await.unwrap();
+    raw.sort();
+    assert_eq!(raw, vec![gone, live]);
+}
+
+#[tokio::test]
+async fn an_unflagged_collection_still_hides_tombstones_written_before_markers() {
+    // The upgrade case: a bucket written by 0.7.0 has tombstones with no
+    // marker and no flag. Trusting the missing marker here would resurrect a
+    // deleted record — the one outcome this layout must never produce.
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let live = RecordKey::new("ns", "col", "live");
+    let gone = RecordKey::new("ns", "col", "gone");
+    seed(&store, &live).await;
+    let rev = seed(&store, &gone).await;
+    assert_eq!(
+        store.delete(&gone, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    // Strip the marker to reproduce the old layout exactly.
+    store.remove_marker_for_test(&gone).await.unwrap();
+    assert!(!store.marker_exists(&gone).await.unwrap());
+
+    assert_eq!(
+        store.list(&prefix("ns", "col")).await.unwrap(),
+        vec![live.clone()]
+    );
+    // The pass that proved it also repaired it, so the next one is fast.
+    assert!(store.marker_exists(&gone).await.unwrap());
+    assert!(store.collection_marked("ns", "col").await.unwrap());
+    assert_eq!(store.list(&prefix("ns", "col")).await.unwrap(), vec![live]);
+}
+
+#[tokio::test]
+async fn a_stale_marker_neither_hides_a_live_record_nor_survives() {
+    // The crash window: the marker landed, the tombstone did not.
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let live = RecordKey::new("ns", "col", "live");
+    seed(&store, &live).await;
+    store.mark_collection("ns", "col").await.unwrap();
+    store.write_marker_for_test(&live).await.unwrap();
+
+    assert_eq!(
+        store.list(&prefix("ns", "col")).await.unwrap(),
+        vec![live.clone()]
+    );
+    assert!(
+        !store.marker_exists(&live).await.unwrap(),
+        "list heals the stale marker it resolved"
+    );
+}
+
+#[tokio::test]
+async fn an_orphan_marker_is_swept() {
+    // The other crash window: a purge removed the record but not its marker.
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let ghost = RecordKey::new("ns", "col", "ghost");
+    store.mark_collection("ns", "col").await.unwrap();
+    store.write_marker_for_test(&ghost).await.unwrap();
+
+    assert!(store.list(&prefix("ns", "col")).await.unwrap().is_empty());
+    assert!(!store.marker_exists(&ghost).await.unwrap());
+}
+
+#[tokio::test]
+async fn list_spanning_collections_flags_each_one_it_enumerated() {
+    let Some((endpoint, _)) = test_target() else {
+        return;
+    };
+    let store = fresh_bucket_store(&endpoint).await;
+    let a = RecordKey::new("ns", "a", "one");
+    let b = RecordKey::new("ns", "b", "two");
+    seed(&store, &a).await;
+    let rev = seed(&store, &b).await;
+    assert_eq!(
+        store.delete(&b, Some(rev)).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let ns_wide = KeyPrefix {
+        namespace: Some("ns".into()),
+        collection: None,
+    };
+    assert_eq!(store.list(&ns_wide).await.unwrap(), vec![a]);
+    assert!(store.collection_marked("ns", "a").await.unwrap());
+    assert!(store.collection_marked("ns", "b").await.unwrap());
 }

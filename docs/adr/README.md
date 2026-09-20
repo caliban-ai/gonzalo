@@ -45,10 +45,11 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted (local-only deletion superseded by [0021](0021-replicated-deletion-with-tombstones.md)) |
 | [0019](0019-s3-backend-qualification-rustfs.md) | Qualified S3 backend for HA: RustFS | accepted |
 | [0020](0020-rust-native-deliverables.md) | Rust-native deliverables; the daemon is the non-Rust boundary | accepted |
-| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted (blob GC follow-up settled by [0024](0024-blob-garbage-collection.md)) |
+| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted (blob GC follow-up settled by [0024](0024-blob-garbage-collection.md); S3 listing cost by [0025](0025-s3-tombstone-markers.md)) |
 | [0022](0022-fleet-access-control-records.md) | Fleet access-control records as a capability layer | accepted (channel config and `GrantScope::Repo` amended by [0023](0023-channel-config-fields.md)) |
 | [0023](0023-channel-config-fields.md) | Channel configuration fields, and workspaces instead of repos | accepted |
 | [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted |
+| [0025](0025-s3-tombstone-markers.md) | Sibling tombstone markers in the S3 layout | accepted |
 
 ## Adding a new ADR
 

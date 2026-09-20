@@ -4,6 +4,9 @@
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
+
 use gonzalo_core::{
     BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
     KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, decode_segment,
@@ -14,12 +17,31 @@ use gonzalo_core::{
 /// separate from record objects (`namespace/collection/id.json`).
 const BLOB_PREFIX: &str = "blobs/";
 
+/// What one `ListObjectsV2` traversal saw: the record keys under the prefix,
+/// and which of them carry a tombstone marker (ADR 0025).
+#[derive(Default)]
+struct Listing {
+    records: Vec<RecordKey>,
+    /// Marked keys, each with the ETag its marker carried in this listing.
+    /// Removing a marker is conditional on that ETag, so a marker rewritten
+    /// since is left alone (see `delete_marker_if_match`).
+    markers: BTreeMap<RecordKey, String>,
+}
+
 pub struct S3Store {
     client: Client,
     bucket: String,
     /// Maximum `Record::ancestors` length kept on every committed write
     /// (spec §3.9). Defaults to [`DEFAULT_ANCESTOR_CAP`].
     cap: usize,
+    /// Encoded `(namespace, collection)` pairs known to carry the marked flag
+    /// (ADR 0025), shared across [`handle`](S3Store::handle) clones.
+    ///
+    /// Only ever added to: the flag is set once and never cleared, so a cached
+    /// `true` cannot go stale. An *unmarked* collection is deliberately not
+    /// cached — it re-checks, which costs one `HeadObject` on a path that is
+    /// already paying a read per key.
+    marked: Arc<RwLock<BTreeSet<(String, String)>>>,
 }
 
 impl S3Store {
@@ -30,6 +52,7 @@ impl S3Store {
             client,
             bucket: bucket.into(),
             cap: DEFAULT_ANCESTOR_CAP,
+            marked: Arc::new(RwLock::new(BTreeSet::new())),
         }
     }
 
@@ -67,6 +90,8 @@ impl S3Store {
             client: self.client.clone(),
             bucket: self.bucket.clone(),
             cap: self.cap,
+            // The Arc, not the set: a handle must see what its parent learned.
+            marked: Arc::clone(&self.marked),
         }
     }
 
@@ -124,9 +149,16 @@ impl S3Store {
     }
 
     /// Every record key under `prefix`, tombstones included (the raw listing).
-    /// Paginates `ListObjectsV2` off the continuation token (see
-    /// [`next_continuation`]).
     async fn list_keys(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        Ok(self.list_objects(prefix).await?.records)
+    }
+
+    /// One `ListObjectsV2` traversal, sorting what it sees into record keys and
+    /// the keys that carry a tombstone marker (ADR 0025). Markers are siblings
+    /// of their records, so the same prefix covers both and no second traversal
+    /// is needed. Paginates off the continuation token (see
+    /// [`next_continuation`]).
+    async fn list_objects(&self, prefix: &KeyPrefix) -> Result<Listing> {
         let mut s3_prefix = String::new();
         if let Some(ns) = &prefix.namespace {
             s3_prefix.push_str(&gonzalo_core::segment(ns));
@@ -136,7 +168,7 @@ impl S3Store {
                 s3_prefix.push('/');
             }
         }
-        let mut out = Vec::new();
+        let mut out = Listing::default();
         let mut continuation: Option<String> = None;
         loop {
             let mut req = self.client.list_objects_v2().bucket(&self.bucket);
@@ -151,11 +183,16 @@ impl S3Store {
                 .await
                 .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
             for obj in resp.contents() {
-                if let Some(k) = obj.key()
-                    && let Some(key) = parse_object_key(k)
+                let Some(k) = obj.key() else { continue };
+                if let Some(key) = parse_object_key(k) {
+                    if prefix.matches(&key) {
+                        out.records.push(key);
+                    }
+                } else if let Some(key) = parse_marker_key(k)
                     && prefix.matches(&key)
+                    && let Some(etag) = obj.e_tag()
                 {
-                    out.push(key);
+                    out.markers.insert(key, etag.to_string());
                 }
             }
             match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
@@ -216,6 +253,199 @@ impl S3Store {
         }
     }
 
+    /// Whether `list` may treat an unmarked key in this collection as live —
+    /// true once the collection carries the marked flag (ADR 0025).
+    ///
+    /// A bucket written before markers existed has tombstones with no marker,
+    /// and trusting their absence there would resurrect deleted records. So
+    /// trust is earned per collection, by a pass that read every key and
+    /// backfilled what was missing.
+    pub async fn collection_marked(&self, namespace: &str, collection: &str) -> Result<bool> {
+        let pair = (
+            gonzalo_core::segment(namespace),
+            gonzalo_core::segment(collection),
+        );
+        if self.marked.read().unwrap().contains(&pair) {
+            return Ok(true);
+        }
+        let found = match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(marked_flag_key(namespace, collection))
+            .send()
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() {
+                    false
+                } else {
+                    return Err(CoreError::Backend(svc.to_string()));
+                }
+            }
+        };
+        if found {
+            self.marked.write().unwrap().insert(pair);
+        }
+        Ok(found)
+    }
+
+    /// Record that every tombstone in this collection carries a marker.
+    ///
+    /// Only for a caller that just read every key in the collection and wrote
+    /// the markers that were missing — the flag is what later listings trust
+    /// instead of reading.
+    pub async fn mark_collection(&self, namespace: &str, collection: &str) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(marked_flag_key(namespace, collection))
+            .body(b"1".to_vec().into())
+            .send()
+            .await
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
+        self.marked.write().unwrap().insert((
+            gonzalo_core::segment(namespace),
+            gonzalo_core::segment(collection),
+        ));
+        Ok(())
+    }
+
+    /// Write the tombstone marker for `key` (ADR 0025).
+    /// Unconditional: the marker carries no version, so writing one that
+    /// already exists is a no-op rather than a race to lose.
+    async fn put_marker(&self, key: &RecordKey, revision: &Revision) -> Result<()> {
+        // The body is the tombstone's revision, which makes each marker
+        // distinguishable from the next one written for the same key: a
+        // tombstone's counter always exceeds the record it replaced, so no two
+        // markers for a key ever share an ETag. `delete_marker_if_match` relies
+        // on that to tell "the marker I resolved" from "a marker written since".
+        let body = serde_json::to_vec(revision).map_err(|e| CoreError::Serde(e.to_string()))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .body(body.into())
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
+    }
+
+    /// Remove the marker for `key` only if it still carries `etag`.
+    ///
+    /// The conditional is what makes removal safe to do concurrently with a
+    /// delete. A listing resolves a marker to "the record is live" or "the
+    /// record is gone", then removes it — but between those two steps another
+    /// writer may have deleted the record, writing *its* marker first and the
+    /// tombstone after. An unconditional removal landing in that window would
+    /// strand a tombstone with no marker, which a flagged collection reads as
+    /// live. The new marker carries a different revision, so its ETag differs
+    /// and this removal turns into a no-op (412) instead.
+    async fn delete_marker_if_match(&self, key: &RecordKey, etag: &str) -> Result<()> {
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .if_match(etag)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let svc = e.into_service_error();
+                // A marker rewritten since the listing is not ours to remove,
+                // and one already gone needs no removing.
+                if race_kind(svc.code()).is_some() || svc.code() == Some("NoSuchKey") {
+                    Ok(())
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Whether `key` currently carries a tombstone marker.
+    ///
+    /// For inspecting the layout — tests and operational debugging. `list`
+    /// reads markers out of the listing it already made instead, which is the
+    /// entire point of putting them in the key space (ADR 0025).
+    pub async fn marker_exists(&self, key: &RecordKey) -> Result<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() {
+                    Ok(false)
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Write a marker for `key` without writing a tombstone — the state a
+    /// crash between the two leaves behind. Test seam for the stale-marker
+    /// cases of ADR 0025; production code always pairs the two writes.
+    #[doc(hidden)]
+    pub async fn write_marker_for_test(&self, key: &RecordKey) -> Result<()> {
+        self.put_marker(key, &Revision::initial(b"stale marker"))
+            .await
+    }
+
+    /// Remove a marker while leaving its tombstone — the pre-ADR-0025 layout.
+    /// Test seam for the upgrade case; nothing in production strips a marker
+    /// from a record that is still deleted.
+    #[doc(hidden)]
+    pub async fn remove_marker_for_test(&self, key: &RecordKey) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(marker_key(key))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))
+    }
+
+    /// Read `keys` in bounded-concurrency batches and report which are live.
+    /// A key absent from the map was not read.
+    ///
+    /// The reads run concurrently because one at a time multiplied every key's
+    /// latency by a round trip, which is what made a large collection slow
+    /// rather than merely expensive (gonzalo#286).
+    async fn read_liveness(&self, keys: &[RecordKey]) -> Result<BTreeMap<RecordKey, Liveness>> {
+        let mut live = BTreeMap::new();
+        for batch in keys.chunks(LIST_READ_CONCURRENCY) {
+            let mut reads = tokio::task::JoinSet::new();
+            for key in batch {
+                // A handle per task: the client is a cheap clone (it shares one
+                // connection pool), and a task needs to own what it reads.
+                let store = self.handle();
+                let key = key.clone();
+                reads.spawn(async move {
+                    let liveness = listed_as_live(store.read(&key).await)?;
+                    Ok::<_, CoreError>((key, liveness))
+                });
+            }
+            while let Some(joined) = reads.join_next().await {
+                let (key, liveness) = joined.map_err(|e| CoreError::Backend(e.to_string()))??;
+                live.insert(key, liveness);
+            }
+        }
+        Ok(live)
+    }
+
     /// The compare-and-swap loop behind every mutating method. Each attempt
     /// reads the object and its ETag, asks `plan` what to do given that exact
     /// record, and carries it out with a conditional write gated on the same
@@ -256,6 +486,14 @@ impl S3Store {
             let (outcome, answer) = match plan(current.as_ref().map(|(rec, _)| rec))? {
                 Planned::Finish(answer) => return Ok(Step::Done(answer)),
                 Planned::Put(record, answer) => {
+                    // The marker goes first (ADR 0025). A crash after this
+                    // leaves a stale marker, which costs one wasted read; a
+                    // crash after the tombstone would leave one *unmarked*,
+                    // which is the single state a flagged collection cannot
+                    // survive — `list` would show the deleted record as live.
+                    if record.is_tombstone() {
+                        self.put_marker(key, &record.revision).await?;
+                    }
                     let outcome = self.put_record_if(&record, precondition(etag)).await?;
                     if let WriteOutcome::LostRace(_) = outcome {
                         // Remember it, so the next attempt can recognise its own
@@ -266,6 +504,14 @@ impl S3Store {
                             WriteOutcome::Applied => unreachable!("checked above"),
                         });
                     }
+                    // A recreation leaves the old marker behind on purpose. It
+                    // is now stale — the key is live — which costs the next
+                    // listing one read and nothing else, and that listing
+                    // removes it under the ETag it saw. Removing it here
+                    // instead would race a concurrent delete: the other writer
+                    // puts its marker before its tombstone, and a removal
+                    // landing between the two would strand an unmarked
+                    // tombstone. Writers only ever add markers.
                     (outcome, answer)
                 }
                 Planned::Remove(answer) => {
@@ -273,6 +519,8 @@ impl S3Store {
                     // was read. The empty fallback can never match; it would
                     // just 412 and re-plan.
                     let tag = etag.unwrap_or_default().to_string();
+                    // Purge leaves the marker too, for the same reason, and the
+                    // next listing sweeps it as an orphan.
                     (self.delete_record_if_match(key, tag).await?, answer)
                 }
             };
@@ -342,6 +590,18 @@ fn visible(record: Option<Record>) -> Option<Record> {
     record.filter(|r| !r.is_tombstone())
 }
 
+/// What a read said about a key the listing turned up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Liveness {
+    /// Listed.
+    Live,
+    /// Hidden. Carries the tombstone's revision, which is what its marker
+    /// names (ADR 0025), so a pass that finds one unmarked can write it.
+    Tombstoned(Revision),
+    /// Hidden: purged between the listing and the read.
+    Absent,
+}
+
 /// Whether consumer `list` includes a key, given the raw read of its object.
 /// Tombstones and keys purged since the listing (NotFound) are excluded. An
 /// object that fails to decode stays listed, so `get` on that key surfaces the
@@ -349,10 +609,12 @@ fn visible(record: Option<Record>) -> Option<Record> {
 /// `list`: on s3 it may be transient, and listing a key that may be a
 /// tombstone would be wrong. fs and git differ: they keep every unreadable
 /// entry listed.
-fn listed_as_live(read: Result<Option<Record>>) -> Result<bool> {
+fn listed_as_live(read: Result<Option<Record>>) -> Result<Liveness> {
     match read {
-        Ok(record) => Ok(visible(record).is_some()),
-        Err(CoreError::Serde(_)) => Ok(true),
+        Ok(Some(record)) if record.is_tombstone() => Ok(Liveness::Tombstoned(record.revision)),
+        Ok(Some(_)) => Ok(Liveness::Live),
+        Ok(None) => Ok(Liveness::Absent),
+        Err(CoreError::Serde(_)) => Ok(Liveness::Live),
         Err(e) => Err(e),
     }
 }
@@ -514,40 +776,100 @@ impl gonzalo_core::Store for S3Store {
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
-        // Spec §8.4: a tombstone lives at the record's normal object key, so the
-        // listing alone can't tell it apart from a live record. Hiding tombstones
-        // costs one GetObject per key, on top of the ListObjectsV2 pages. That's
-        // expensive for large namespaces, but acceptable at current sizes and
-        // tracked as a follow-up (a kind marker in the key suffix, or a
-        // per-collection tombstone index; both are layout changes needing their
-        // own design). Don't optimise it here.
-        //
-        // The reads do run concurrently, in bounded batches: one at a time
-        // multiplied every key's latency by the round trip, which is what made
-        // a large collection slow rather than merely expensive (gonzalo#286).
-        let keys = self.list_keys(prefix).await?;
-        let mut out = Vec::with_capacity(keys.len());
-        for batch in keys.chunks(LIST_READ_CONCURRENCY) {
-            let mut reads = tokio::task::JoinSet::new();
-            for (i, key) in batch.iter().enumerate() {
-                // A handle per task: the client is a cheap clone (it shares one
-                // connection pool), and a task needs to own what it reads.
-                let store = self.handle();
-                let key = key.clone();
-                reads.spawn(async move {
-                    let visible = listed_as_live(store.read(&key).await)?;
-                    Ok::<_, CoreError>((i, visible.then_some(key)))
-                });
-            }
-            // Tasks finish in any order; sort by position so the listing a
-            // caller sees does not depend on which read returned first.
-            let mut found = Vec::with_capacity(batch.len());
-            while let Some(joined) = reads.join_next().await {
-                found.push(joined.map_err(|e| CoreError::Backend(e.to_string()))??);
-            }
-            found.sort_by_key(|(i, _)| *i);
-            out.extend(found.into_iter().filter_map(|(_, key)| key));
+        // A tombstone lives at the deleted record's own object key, so the
+        // listing cannot tell it from a live record by the record object alone.
+        // A marker beside it can (ADR 0025): one traversal classifies every
+        // key, and only marked keys are read — one read per *tombstone*, which
+        // `collect` bounds, instead of one per *record*, which nothing did.
+        let listing = self.list_objects(prefix).await?;
+
+        // Trust is earned per collection, because that is the granularity a
+        // pass can prove, so decide per collection. A pass spanning several
+        // enumerated each of them fully and may flag each of them.
+        let mut by_collection: BTreeMap<(String, String), Vec<RecordKey>> = BTreeMap::new();
+        for key in listing.records {
+            by_collection
+                .entry((key.namespace.clone(), key.collection.clone()))
+                .or_default()
+                .push(key);
         }
+        // A collection can hold markers and no records at all — every record
+        // purged, one marker left behind by a purge that died between its two
+        // deletes. Grouping on records alone would never visit it, so the
+        // orphan would outlive every listing.
+        for marker in listing.markers.keys() {
+            by_collection
+                .entry((marker.namespace.clone(), marker.collection.clone()))
+                .or_default();
+        }
+
+        let mut out = Vec::new();
+        for ((namespace, collection), keys) in by_collection {
+            let marked = self.collection_marked(&namespace, &collection).await?;
+            // Fast path: read only what a marker points at. Slow path: read
+            // every key, exactly as before markers existed, and repair what the
+            // old layout left behind.
+            let to_read: Vec<RecordKey> = if marked {
+                keys.iter()
+                    .filter(|k| listing.markers.contains_key(k))
+                    .cloned()
+                    .collect()
+            } else {
+                keys.clone()
+            };
+            let live = self.read_liveness(&to_read).await?;
+
+            for key in &keys {
+                match live.get(key) {
+                    // Not read: unmarked in a flagged collection, so live.
+                    None => out.push(key.clone()),
+                    Some(Liveness::Live) => {
+                        if let Some(etag) = listing.markers.get(key) {
+                            // Live but marked — a marker left by a recreation,
+                            // or by a crash before the tombstone landed. Remove
+                            // it under the ETag this listing saw, so a delete
+                            // that has written a *new* marker since keeps it.
+                            self.delete_marker_if_match(key, etag).await?;
+                        }
+                        out.push(key.clone());
+                    }
+                    Some(Liveness::Tombstoned(revision)) => {
+                        if !listing.markers.contains_key(key) {
+                            // A tombstone the old layout left unmarked. The
+                            // pass that just proved it is the cheapest place to
+                            // repair it.
+                            self.put_marker(key, revision).await?;
+                        }
+                    }
+                    Some(Liveness::Absent) => {
+                        // Purged between the listing and the read, so its
+                        // marker — if any — is now an orphan.
+                        if let Some(etag) = listing.markers.get(key) {
+                            self.delete_marker_if_match(key, etag).await?;
+                        }
+                    }
+                }
+            }
+
+            // A marker whose record was not in the listing at all is an orphan
+            // left by a purge, which removes the record and never the marker.
+            let listed: BTreeSet<&RecordKey> = keys.iter().collect();
+            for (orphan, etag) in listing
+                .markers
+                .iter()
+                .filter(|(m, _)| m.namespace == namespace && m.collection == collection)
+                .filter(|(m, _)| !listed.contains(m))
+            {
+                self.delete_marker_if_match(orphan, etag).await?;
+            }
+
+            if !marked {
+                self.mark_collection(&namespace, &collection).await?;
+            }
+        }
+        // One deterministic order for the whole listing, so what a caller sees
+        // never depends on which read returned first.
+        out.sort();
         Ok(out)
     }
 
@@ -769,9 +1091,79 @@ fn parse_object_key(s: &str) -> Option<RecordKey> {
     }
 }
 
+/// Suffix appended to a record's object key to form its tombstone marker
+/// (ADR 0025). `segment()` escapes `.`, so no encoded id can end in this and
+/// the two key spaces are disjoint by construction.
+const MARKER_SUFFIX: &str = ".tombstone";
+
+/// The marker object key for `key`: `namespace/collection/id.json.tombstone`.
+///
+/// An object here means "the record at this key may be a tombstone —
+/// read it to find out". Its *absence* is only meaningful in a collection
+/// carrying [`marked_flag_key`], since a bucket written before ADR 0025 has
+/// tombstones with no marker at all.
+fn marker_key(key: &RecordKey) -> String {
+    format!("{}{MARKER_SUFFIX}", object_key(key))
+}
+
+/// The record a marker object belongs to, or `None` if `s` is not a marker.
+fn parse_marker_key(s: &str) -> Option<RecordKey> {
+    parse_object_key(s.strip_suffix(MARKER_SUFFIX)?)
+}
+
+/// The per-collection flag object key. Its presence says every tombstone in
+/// this collection carries a marker, so `list` may treat an unmarked key as
+/// live. The name holds no `.` and does not end in `.json`, so
+/// [`parse_object_key`] can never produce it from a caller's record key.
+fn marked_flag_key(namespace: &str, collection: &str) -> String {
+    format!(
+        "{}/{}/_tombstone_markers",
+        gonzalo_core::segment(namespace),
+        gonzalo_core::segment(collection)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_key_is_the_record_key_plus_a_suffix() {
+        let k = RecordKey::new("ns", "col", "id");
+        assert_eq!(marker_key(&k), "ns/col/id.json.tombstone");
+        assert_eq!(parse_marker_key(&marker_key(&k)), Some(k));
+    }
+
+    #[test]
+    fn a_marker_key_is_not_a_record_key() {
+        // `segment()` escapes `.`, so no id can produce a key ending in
+        // `.json.tombstone` — the two key spaces are disjoint by construction.
+        let k = RecordKey::new("ns", "col", "id");
+        assert_eq!(parse_object_key(&marker_key(&k)), None);
+        for id in ["id.json.tombstone", "id.json", "a.b", "..", "50%"] {
+            let key = RecordKey::new("ns", "col", id);
+            assert_ne!(object_key(&key), marker_key(&k));
+            assert_eq!(parse_marker_key(&object_key(&key)), None);
+        }
+    }
+
+    #[test]
+    fn marked_flag_key_is_not_a_record_or_marker_key() {
+        let flag = marked_flag_key("ns", "col");
+        assert_eq!(flag, "ns/col/_tombstone_markers");
+        assert_eq!(parse_object_key(&flag), None);
+        assert_eq!(parse_marker_key(&flag), None);
+    }
+
+    #[test]
+    fn marked_flag_key_escapes_its_components() {
+        // Same encoding as record keys, so a namespace containing `/` cannot
+        // reach another collection's flag.
+        assert_eq!(
+            marked_flag_key("a/b", "c.d"),
+            "a%2Fb/c%2Ed/_tombstone_markers"
+        );
+    }
 
     #[test]
     fn parse_roundtrips_object_key() {
@@ -940,10 +1332,19 @@ mod tests {
     #[test]
     fn list_filter_excludes_tombstones_and_vanished_keys() {
         let k = RecordKey::new("ns", "col", "listed");
-        assert!(listed_as_live(Ok(Some(live(&k, b"x")))).unwrap());
-        assert!(!listed_as_live(Ok(Some(tomb(&k, b"x")))).unwrap());
+        assert_eq!(
+            listed_as_live(Ok(Some(live(&k, b"x")))).unwrap(),
+            Liveness::Live
+        );
+        // A tombstone reports the revision its marker names, so a listing that
+        // finds one unmarked can repair it without a second read.
+        let t = tomb(&k, b"x");
+        assert_eq!(
+            listed_as_live(Ok(Some(t.clone()))).unwrap(),
+            Liveness::Tombstoned(t.revision)
+        );
         // Purged between the listing and the read.
-        assert!(!listed_as_live(Ok(None)).unwrap());
+        assert_eq!(listed_as_live(Ok(None)).unwrap(), Liveness::Absent);
     }
 
     #[test]
@@ -951,7 +1352,10 @@ mod tests {
         // An object that fails to decode stays listed; `get` surfaces the error.
         // Any other read error fails the list (s3 rule; fs and git keep such
         // entries listed).
-        assert!(listed_as_live(Err(CoreError::Serde("bad json".into()))).unwrap());
+        assert_eq!(
+            listed_as_live(Err(CoreError::Serde("bad json".into()))).unwrap(),
+            Liveness::Live
+        );
         assert!(matches!(
             listed_as_live(Err(CoreError::Backend("503".into()))),
             Err(CoreError::Backend(_))

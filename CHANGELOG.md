@@ -40,6 +40,23 @@ the patch version for fixes.
   halves, for a caller that already knows its live set. See
   [ADR 0024](docs/adr/0024-blob-garbage-collection.md). (#292)
 
+### Changed
+
+- **S3 listings stop paying a read per record.** Hiding tombstones from `list`
+  cost a `GetObject` per key, because a tombstone lives at the deleted record's
+  own object key and only its body says so; `reset` and `collect` inherited it.
+  A delete now also writes a small marker beside the record, so one
+  `ListObjectsV2` pass classifies every key and only marked keys are read — one
+  read per *tombstone*, which `collect` bounds, instead of one per *record*,
+  which nothing did. Over RustFS with 500 live records and 200 tombstones, a
+  listing went from 700 reads (216 ms) to 200 (110 ms), and to none at all
+  (40 ms) once the tombstones were collected. The record object does not move,
+  so every compare-and-swap is still a single conditional write. A bucket
+  written by 0.7.0 upgrades itself: until a collection is flagged, `list` reads
+  every key exactly as before and backfills the missing markers as it goes, so
+  there is no admin step and no window where a deleted record could reappear.
+  See [ADR 0025](docs/adr/0025-s3-tombstone-markers.md). (#294)
+
 ### Fixed
 
 - **`gonzalo gc` no longer deletes live records' content.** The mark set was

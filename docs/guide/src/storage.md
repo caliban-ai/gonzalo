@@ -62,6 +62,23 @@ conformance case against it, not by reading its compatibility matrix.
 `scripts/rustfs-up.sh` starts a pinned single-node RustFS for local testing, and the
 `gonzalo-soak` crate runs replicas against it while killing them.
 
+### S3: what a listing costs
+
+A tombstone lives at the deleted record's own object key, so a listing can't tell
+it from a live record by the record alone. A delete therefore also writes a
+marker beside it, at `<object key>.tombstone`, and `list` makes one
+`ListObjectsV2` pass and reads only the keys a marker points at
+([ADR 0025](./adr/0025-s3-tombstone-markers.md)). The cost is one read per
+*tombstone*, which `collect` bounds — not one per record, which nothing bounds.
+`reset` and `collect` enumerate the same way and get the same reduction.
+
+A bucket written before markers existed upgrades itself. Until a collection
+carries the flag object `<namespace>/<collection>/_tombstone_markers`, `list`
+reads every key as it always did, writes the markers it finds missing, and then
+sets the flag. So the first listing of each collection after upgrading costs
+what it used to, every later one is cheap, and at no point can a deleted record
+reappear in a listing. There is nothing to run and nothing to remember.
+
 ## Concurrency and conflicts
 
 Writes are optimistic. `put(record, expected)` names the revision the caller believes
