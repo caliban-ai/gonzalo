@@ -24,6 +24,10 @@
 //! [`GonzaloMcp::dispatch`]) so it is unit-testable without an rmcp
 //! [`RequestContext`]; the trait methods are thin adapters over them.
 
+use gonzalo_core::{
+    Body, DeleteResult, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind,
+    Revision,
+};
 use gonzalo_graph::{Ranking, SymbolFilter, SymbolKind};
 use gonzalo_server::Service;
 use rmcp::handler::server::ServerHandler;
@@ -45,6 +49,11 @@ const MAX_DEFINED_IN: usize = 10;
 pub struct GonzaloMcp {
     service: Service,
     root: String,
+    /// Whether the record write tools (`record_put`, `record_delete`) are
+    /// exposed. Off by default: reading a store is one thing, mutating it is
+    /// another, and that decision belongs to whoever runs the server rather
+    /// than to the agent talking to it (#197).
+    writes: bool,
 }
 
 impl GonzaloMcp {
@@ -54,7 +63,20 @@ impl GonzaloMcp {
         Self {
             service,
             root: root.into(),
+            writes: false,
         }
+    }
+
+    /// Expose the record write tools. The advertised tool list changes with it,
+    /// so an agent never sees a tool it would not be allowed to call.
+    pub fn with_writes(mut self, writes: bool) -> Self {
+        self.writes = writes;
+        self
+    }
+
+    /// Whether this server exposes the record write tools.
+    pub fn writes_enabled(&self) -> bool {
+        self.writes
     }
 
     /// The backing service (used by the D1b graph tools).
@@ -65,8 +87,8 @@ impl GonzaloMcp {
     /// The tools this server advertises: a view-independent `status`, the
     /// per-symbol code-graph queries, and the whole-view aggregates — all the
     /// graph tools taking a `(repo, view_id)` view selector.
-    pub fn tools() -> Vec<Tool> {
-        vec![
+    pub fn tools(writes: bool) -> Vec<Tool> {
+        let mut tools = vec![
             Tool::new(
                 "status",
                 "Report that the gonzalo-mcp server is up and its configured store root.",
@@ -167,7 +189,39 @@ impl GonzaloMcp {
                  reported. Confirm every hit against the source before acting on it.",
                 unreferenced_schema(),
             ),
-        ]
+            Tool::new(
+                "record_get",
+                "Read one record by (namespace, collection, id). Returns the whole record: body, \
+                 kind, revision and provenance. A key that holds nothing — or holds a deleted \
+                 record — is an error naming the key, never an empty result.",
+                record_key_schema(),
+            ),
+            Tool::new(
+                "record_list",
+                "List record keys in a namespace, or in one collection of it. Deleted records are \
+                 not listed. Returns keys only; read one with `record_get`.",
+                record_list_schema(),
+            ),
+        ];
+        if writes {
+            tools.push(Tool::new(
+                "record_put",
+                "Write a record at (namespace, collection, id). Without `expected_revision` this \
+                 creates: it succeeds only if the key holds nothing, so it cannot silently \
+                 overwrite. To update, pass the `revision` that `record_get` returned. A write the \
+                 store refuses because the key moved on comes back as `committed: false` with the \
+                 record that is actually there — an outcome to act on, not an error.",
+                record_put_schema(),
+            ));
+            tools.push(Tool::new(
+                "record_delete",
+                "Delete the record at (namespace, collection, id). The delete replicates: it \
+                 leaves a tombstone that sync carries to other stores, so it is not local. \
+                 Deleting a key that holds nothing succeeds and changes nothing.",
+                record_key_schema(),
+            ));
+        }
+        tools
     }
 
     /// The `status` payload: server health, the configured store root, and how
@@ -237,6 +291,16 @@ impl GonzaloMcp {
             return self.aggregate(name, &repo, &view, &arguments).await;
         }
 
+        // The record tools address a store key rather than a view (#197). The
+        // write pair is dispatched only when this server was started with
+        // writes enabled; otherwise it falls through to `method_not_found`,
+        // which is what an unadvertised tool should be.
+        if matches!(name, "record_get" | "record_list")
+            || (self.writes && matches!(name, "record_put" | "record_delete"))
+        {
+            return self.record_tool(name, &arguments).await;
+        }
+
         // An unknown tool is `method_not_found` regardless of arguments — decided
         // before parsing the view selector so it isn't masked by a missing-arg
         // error.
@@ -278,6 +342,125 @@ impl GonzaloMcp {
             "node" => self.node(&repo, &view, &sym).await,
             // Unreachable: the known-tool guard above already returned for any
             // other name.
+            _ => Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>()),
+        }
+    }
+
+    /// The record tools: read, list, write and delete records by key (#197).
+    ///
+    /// These answer from the `Store` rather than the code graph, so they work
+    /// against whatever the server was pointed at — a local fs root or a running
+    /// daemon.
+    async fn record_tool(
+        &self,
+        name: &str,
+        arguments: &Option<Map<String, Value>>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match name {
+            "record_list" => {
+                let namespace = match str_arg(arguments, "namespace") {
+                    Ok(ns) => ns,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let collection = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("collection"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let prefix = KeyPrefix {
+                    namespace: Some(namespace),
+                    collection,
+                };
+                match self.service.list(&prefix).await {
+                    // Keys as strings: `namespace/collection/id` is the form the
+                    // rest of the surface prints, and it round-trips into the
+                    // other record tools' three arguments.
+                    Ok(keys) => {
+                        let keys: Vec<String> = keys.iter().map(RecordKey::to_string).collect();
+                        self.result(Ok(serde_json::json!({ "keys": keys })))
+                    }
+                    Err(e) => Ok(tool_error(e.to_string())),
+                }
+            }
+            "record_get" => {
+                let key = match record_key_args(arguments) {
+                    Ok(k) => k,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                match self.service.get(&key).await {
+                    // Absent is an error, not an empty answer, for the same
+                    // reason an unknown view is (#210): an agent reads nothing
+                    // as "there is nothing there" rather than "you asked wrong".
+                    Ok(None) => Ok(tool_error(format!("no record at {key}"))),
+                    Ok(Some(record)) => self.result(Ok(record)),
+                    Err(e) => Ok(tool_error(e.to_string())),
+                }
+            }
+            "record_put" => {
+                let key = match record_key_args(arguments) {
+                    Ok(k) => k,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let body = match str_arg(arguments, "body") {
+                    Ok(b) => b,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let kind = match kind_arg(arguments) {
+                    Ok(k) => k,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let expected = match expected_revision_arg(arguments) {
+                    Ok(rev) => rev,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                let meta = Meta::new(Identity::new("gonzalo-mcp"), "mcp");
+                let record = match &expected {
+                    // An update follows the revision the caller read, so the
+                    // parent chain stays intact; a create starts a new one.
+                    Some(rev) => Record {
+                        parent: Some(rev.clone()),
+                        ..Record::create(key.clone(), kind, Body::Inline(body.into_bytes()), meta)
+                    },
+                    None => {
+                        Record::create(key.clone(), kind, Body::Inline(body.into_bytes()), meta)
+                    }
+                };
+                match self.service.put(record, expected).await {
+                    // A conflict is a normal OCC outcome, so it is data the
+                    // agent can act on — the current record comes back with it.
+                    Ok(PutResult::Committed(revision)) => self.result(Ok(serde_json::json!({
+                        "committed": true,
+                        "key": key.to_string(),
+                        "revision": revision,
+                    }))),
+                    Ok(PutResult::Conflict(conflict)) => self.result(Ok(serde_json::json!({
+                        "committed": false,
+                        "key": key.to_string(),
+                        "reason": "the key moved on since the revision this write expected",
+                        "current": conflict.current,
+                    }))),
+                    Err(e) => Ok(tool_error(e.to_string())),
+                }
+            }
+            "record_delete" => {
+                let key = match record_key_args(arguments) {
+                    Ok(k) => k,
+                    Err(msg) => return Ok(tool_error(msg)),
+                };
+                match self.service.delete_as(&key, None, None).await {
+                    Ok(DeleteResult::Deleted) => self.result(Ok(serde_json::json!({
+                        "deleted": true,
+                        "key": key.to_string(),
+                    }))),
+                    Ok(DeleteResult::Conflict(conflict)) => self.result(Ok(serde_json::json!({
+                        "deleted": false,
+                        "key": key.to_string(),
+                        "current": conflict.current,
+                    }))),
+                    Err(e) => Ok(tool_error(e.to_string())),
+                }
+            }
+            // Unreachable: the caller matched the name before dispatching here.
             _ => Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -722,6 +905,114 @@ fn status_schema() -> Arc<Map<String, Value>> {
     Arc::new(schema.as_object().expect("object schema").clone())
 }
 
+/// Input schema for the tools that address one record: the three key parts.
+fn record_key_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "namespace": { "type": "string", "description": "record namespace, e.g. memory" },
+            "collection": { "type": "string", "description": "collection within the namespace, e.g. topics" },
+            "id": { "type": "string", "description": "record id within the collection" }
+        },
+        "required": ["namespace", "collection", "id"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
+/// Input schema for `record_list`: a namespace, optionally narrowed to one
+/// collection.
+fn record_list_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "namespace": { "type": "string", "description": "record namespace to list" },
+            "collection": {
+                "type": "string",
+                "description": "optional collection to narrow the listing to"
+            }
+        },
+        "required": ["namespace"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
+/// Input schema for `record_put`: the key, the body, the kind, and the
+/// optimistic-concurrency revision.
+fn record_put_schema() -> Arc<Map<String, Value>> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "namespace": { "type": "string", "description": "record namespace" },
+            "collection": { "type": "string", "description": "collection within the namespace" },
+            "id": { "type": "string", "description": "record id within the collection" },
+            "body": { "type": "string", "description": "the record body, stored verbatim" },
+            "kind": {
+                "type": "string",
+                "description": "record kind, exactly as `record_get` reports it. Defaults to \
+                                Topic. `Tombstone` is not writable — delete with `record_delete`.",
+                "enum": [
+                    "MemoryTier", "Topic", "Session", "Checkpoint", "Ticket", "TicketEvent",
+                    "GraphManifest", "Person", "IdentityBinding", "RoleGrant", "ChannelConfig",
+                    "LinkToken", "AuditEntry"
+                ]
+            },
+            "expected_revision": {
+                "type": "object",
+                "description": "the revision this write expects to replace — pass back the \
+                                `revision` object exactly as `record_get` returned it. Omit to \
+                                create a record that does not exist yet."
+            }
+        },
+        "required": ["namespace", "collection", "id", "body"],
+        "additionalProperties": false
+    });
+    Arc::new(schema.as_object().expect("object schema").clone())
+}
+
+/// The `(namespace, collection, id)` a record tool addresses.
+fn record_key_args(arguments: &Option<Map<String, Value>>) -> Result<RecordKey, String> {
+    Ok(RecordKey::new(
+        str_arg(arguments, "namespace")?,
+        str_arg(arguments, "collection")?,
+        str_arg(arguments, "id")?,
+    ))
+}
+
+/// The `kind` a `record_put` writes, defaulting to `topic`.
+///
+/// An unknown kind is refused rather than defaulted: silently storing a record
+/// under the wrong kind would change how it merges during sync, which is not
+/// something to guess at on the caller's behalf.
+fn kind_arg(arguments: &Option<Map<String, Value>>) -> Result<RecordKind, String> {
+    let Some(raw) = arguments
+        .as_ref()
+        .and_then(|m| m.get("kind"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(RecordKind::Topic);
+    };
+    serde_json::from_value(Value::String(raw.to_string()))
+        .map_err(|_| format!("unknown record kind '{raw}'"))
+}
+
+/// The optional `expected_revision` a `record_put` carries, as `record_get`
+/// reported it. Absent means "create": the write applies only to an empty key.
+fn expected_revision_arg(
+    arguments: &Option<Map<String, Value>>,
+) -> Result<Option<Revision>, String> {
+    let Some(raw) = arguments.as_ref().and_then(|m| m.get("expected_revision")) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(raw.clone())
+        .map(Some)
+        .map_err(|e| format!("expected_revision is not a revision: {e}"))
+}
+
 /// Extract a required string argument by key.
 fn str_arg(arguments: &Option<Map<String, Value>>, key: &str) -> Result<String, String> {
     arguments
@@ -868,7 +1159,7 @@ impl ServerHandler for GonzaloMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        Ok(ListToolsResult::with_all_items(Self::tools()))
+        Ok(ListToolsResult::with_all_items(Self::tools(self.writes)))
     }
 
     async fn call_tool(
@@ -974,7 +1265,7 @@ mod tests {
 
     #[test]
     fn advertises_status_and_the_graph_tools() {
-        let names: Vec<String> = GonzaloMcp::tools()
+        let names: Vec<String> = GonzaloMcp::tools(false)
             .iter()
             .map(|t| t.name.to_string())
             .collect();
@@ -994,6 +1285,8 @@ mod tests {
                 "list",
                 "views",
                 "unreferenced",
+                "record_get",
+                "record_list",
             ]
         );
     }
@@ -1413,7 +1706,7 @@ mod tests {
 
     #[test]
     fn unreferenced_tool_description_states_the_heuristic_blind_spot() {
-        let tool = GonzaloMcp::tools()
+        let tool = GonzaloMcp::tools(false)
             .into_iter()
             .find(|t| t.name == "unreferenced")
             .expect("unreferenced is advertised");
@@ -1724,5 +2017,210 @@ mod tests {
         let v = call("callees", serde_json::json!({ "name": "main" })).await;
         assert_eq!(v["callees"], serde_json::json!(["helper"]));
         assert!(v["module_callers"].is_null(), "{v}");
+    }
+
+    // ---- record tools (#197) ----------------------------------------------
+
+    /// A server over an empty store, with the store handle so a test can seed
+    /// records directly and assert what the tools did to them.
+    fn record_server(writes: bool) -> (GonzaloMcp, Arc<FsStore>) {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let server =
+            GonzaloMcp::new(Service::new(fs.clone(), fs.clone()), "test-root").with_writes(writes);
+        (server, fs)
+    }
+
+    fn topic(key: RecordKey, payload: &[u8]) -> Record {
+        let body = Body::Inline(payload.to_vec());
+        Record {
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            kind: RecordKind::Topic,
+            meta: Meta {
+                author: Identity::new("tester"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            key,
+            ancestors: Vec::new(),
+            deleted_at: None,
+            deleted_blob: None,
+        }
+    }
+
+    /// Seed a record, asserting the write committed rather than conflicted.
+    async fn put_ok(fs: &FsStore, record: Record) -> Revision {
+        match fs.put(record, None).await.unwrap() {
+            PutResult::Committed(rev) => rev,
+            PutResult::Conflict(c) => panic!("unexpected conflict: {c:?}"),
+        }
+    }
+
+    fn record_args(extra: Value) -> Option<Map<String, Value>> {
+        Some(extra.as_object().expect("object").clone())
+    }
+
+    #[test]
+    fn write_tools_are_advertised_only_when_writes_are_enabled() {
+        // An agent must never see a tool it cannot call, so the advertised list
+        // is the mode: read-only by default, writes on request (#197).
+        let read_only: Vec<String> = GonzaloMcp::tools(false)
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(read_only.contains(&"record_get".to_string()));
+        assert!(read_only.contains(&"record_list".to_string()));
+        assert!(!read_only.contains(&"record_put".to_string()));
+        assert!(!read_only.contains(&"record_delete".to_string()));
+
+        let writable: Vec<String> = GonzaloMcp::tools(true)
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for tool in ["record_get", "record_list", "record_put", "record_delete"] {
+            assert!(writable.contains(&tool.to_string()), "missing {tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_get_returns_the_stored_record() {
+        let (server, fs) = record_server(false);
+        let key = RecordKey::new("memory", "topics", "rust");
+        put_ok(&fs, topic(key.clone(), b"{\"note\":1}")).await;
+
+        let result = server
+            .dispatch(
+                "record_get",
+                record_args(
+                    serde_json::json!({"namespace": "memory", "collection": "topics", "id": "rust"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let v: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["key"]["id"], "rust");
+        assert_eq!(v["kind"], "Topic");
+    }
+
+    #[tokio::test]
+    async fn record_get_of_an_absent_key_is_an_error_not_an_empty_result() {
+        // Same rule the view selector follows (#210): an agent reads an empty
+        // answer as "there is nothing there", which is not what a typo means.
+        let (server, _fs) = record_server(false);
+        let result = server
+            .dispatch(
+                "record_get",
+                record_args(
+                    serde_json::json!({"namespace": "memory", "collection": "topics", "id": "nope"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("memory/topics/nope"));
+    }
+
+    #[tokio::test]
+    async fn record_list_lists_a_collection_and_hides_tombstones() {
+        let (server, fs) = record_server(false);
+        let kept = RecordKey::new("memory", "topics", "kept");
+        let gone = RecordKey::new("memory", "topics", "gone");
+        put_ok(&fs, topic(kept.clone(), b"a")).await;
+        let rev = put_ok(&fs, topic(gone.clone(), b"b")).await;
+        assert_eq!(
+            fs.delete(&gone, Some(rev)).await.unwrap(),
+            DeleteResult::Deleted
+        );
+
+        let result = server
+            .dispatch(
+                "record_list",
+                record_args(serde_json::json!({"namespace": "memory", "collection": "topics"})),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["keys"], serde_json::json!(["memory/topics/kept"]));
+    }
+
+    #[tokio::test]
+    async fn write_tools_are_unavailable_in_read_only_mode() {
+        let (server, _fs) = record_server(false);
+        for tool in ["record_put", "record_delete"] {
+            let err = server
+                .dispatch(
+                    tool,
+                    record_args(serde_json::json!({
+                        "namespace": "memory", "collection": "topics", "id": "x",
+                        "kind": "Topic", "body": "{}"
+                    })),
+                )
+                .await;
+            assert!(err.is_err(), "{tool} must not be callable read-only");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_put_creates_then_conflicts_without_the_current_revision() {
+        let (server, fs) = record_server(true);
+        let result = server
+            .dispatch(
+                "record_put",
+                record_args(serde_json::json!({
+                    "namespace": "memory", "collection": "topics", "id": "new",
+                    "kind": "Topic", "body": "hello"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let v: Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["committed"], true);
+
+        let key = RecordKey::new("memory", "topics", "new");
+        let stored = fs.get(&key).await.unwrap().expect("stored");
+        assert_eq!(stored.body.bytes(), b"hello");
+
+        // A second create over a live record is a conflict, reported as data
+        // rather than an error: it is a normal OCC outcome the agent can act on.
+        let again = server
+            .dispatch(
+                "record_put",
+                record_args(serde_json::json!({
+                    "namespace": "memory", "collection": "topics", "id": "new",
+                    "kind": "Topic", "body": "clobber"
+                })),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&result_text(&again)).unwrap();
+        assert_eq!(v["committed"], false);
+        assert_eq!(fs.get(&key).await.unwrap().unwrap().body.bytes(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn record_delete_removes_the_record() {
+        let (server, fs) = record_server(true);
+        let key = RecordKey::new("memory", "topics", "bye");
+        put_ok(&fs, topic(key.clone(), b"a")).await;
+
+        let result = server
+            .dispatch(
+                "record_delete",
+                record_args(
+                    serde_json::json!({"namespace": "memory", "collection": "topics", "id": "bye"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        assert_eq!(fs.get(&key).await.unwrap(), None);
+        // The tombstone is still there for replication.
+        assert!(fs.get_raw(&key).await.unwrap().unwrap().is_tombstone());
     }
 }

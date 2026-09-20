@@ -177,6 +177,40 @@ claude mcp add gonzalo --env GONZALO_ROOT=/Users/you/.gonzalo -- gonzalo-mcp
 Restarting or reconnecting the MCP client respawns the server process, which is how a
 newly installed binary's tools become visible — a full client restart is not needed.
 
+### Writes are opt-in
+
+`record_get` and `record_list` are always available. `record_put` and
+`record_delete` are exposed only when the server is started with
+`--allow-writes` (or `GONZALO_MCP_ALLOW_WRITES=1`), and when it is not, they are
+absent from the advertised tool list — an agent never sees a tool it would not
+be allowed to call. Mutating a store is the operator's decision, not the agent's:
+
+```sh
+claude mcp add gonzalo --env GONZALO_ROOT=~/.gonzalo -- gonzalo-mcp --allow-writes
+```
+
+### Against a running daemon
+
+Point the server at a `gonzalod` instead of a local directory, and records come
+from that shared store ([ADR 0007](./adr/0007-dual-transport-daemon.md)):
+
+```sh
+claude mcp add gonzalo \
+  --env GONZALO_DAEMON=http://gonzalo.internal:8080 \
+  --env GONZALO_TOKEN=… \
+  -- gonzalo-mcp
+```
+
+`--daemon <url>` does the same for a client that passes arguments rather than
+environment. `GONZALO_TOKEN` is sent as a bearer token when the daemon requires
+one; what the token is scoped to decides what the tools can reach, so a
+read-only token and a read-only server are two independent locks.
+
+In daemon mode there is no local graph root: views are assembled from
+content-addressed slices fetched over the daemon, so the code-graph tools work
+against whatever that store holds. `status` reports the daemon URL as its
+`root`.
+
 ## Verify
 
 ```
@@ -240,6 +274,21 @@ matters because an agent reads `[]` as "nothing calls this" and reports it as fa
 |---|---|
 | `diff` | symbols and references added/removed from `view_a` to `view_b` |
 
+**Records** — the store itself, not the code graph. No view selector; these
+address a record by `namespace`, `collection` and `id`.
+
+| tool | answers |
+|---|---|
+| `record_get` | read one record: body, kind, revision, provenance |
+| `record_list` | the keys in a namespace, or in one collection of it |
+| `record_put` | write a record — **only when the server allows writes** |
+| `record_delete` | delete a record — **only when the server allows writes** |
+
+A key that holds nothing is an *error* naming the key, not an empty result, for
+the same reason an unknown view is: an agent reads nothing as "there is nothing
+there" rather than "you asked the wrong question". Deleted records are hidden
+from both `record_get` and `record_list`.
+
 `diff` is the most useful tool here for reviewing work: point it at a branch view and
 a main view and it reports what changed *structurally*, which is a different and often
 better question than what a textual diff shows.
@@ -261,6 +310,14 @@ Every tool except `status` and `views` selects a view with `repo` and `view_id`
 | `top` | `by` (required): `fan_in`, `fan_out` or `definitions`; `limit` (default 20) |
 | `list` | `path_prefix`, `kind`, `name_contains`, `limit` (default 100) |
 | `unreferenced` | `path_prefix`, `kind`, `name_contains`, `exclude_tests`, `limit` (default 100) |
+
+The record tools take no view selector:
+
+| tool | parameters |
+|---|---|
+| `record_get`, `record_delete` | `namespace`, `collection`, `id` (all required) |
+| `record_list` | `namespace` (required); `collection` to narrow it |
+| `record_put` | `namespace`, `collection`, `id`, `body` (all required); `kind` (default `Topic`); `expected_revision` |
 
 `kind` is one of `function`, `struct`, `enum`, `trait`, `impl`, `module`, `const`,
 `static`, `type_alias`, `class` or `interface`.
