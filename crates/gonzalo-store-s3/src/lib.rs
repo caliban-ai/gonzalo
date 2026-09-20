@@ -769,9 +769,79 @@ fn parse_object_key(s: &str) -> Option<RecordKey> {
     }
 }
 
+/// Suffix appended to a record's object key to form its tombstone marker
+/// (ADR 0025). `segment()` escapes `.`, so no encoded id can end in this and
+/// the two key spaces are disjoint by construction.
+const MARKER_SUFFIX: &str = ".tombstone";
+
+/// The marker object key for `key`: `namespace/collection/id.json.tombstone`.
+///
+/// A zero-byte object here means "the record at this key may be a tombstone —
+/// read it to find out". Its *absence* is only meaningful in a collection
+/// carrying [`marked_flag_key`], since a bucket written before ADR 0025 has
+/// tombstones with no marker at all.
+fn marker_key(key: &RecordKey) -> String {
+    format!("{}{MARKER_SUFFIX}", object_key(key))
+}
+
+/// The record a marker object belongs to, or `None` if `s` is not a marker.
+fn parse_marker_key(s: &str) -> Option<RecordKey> {
+    parse_object_key(s.strip_suffix(MARKER_SUFFIX)?)
+}
+
+/// The per-collection flag object key. Its presence says every tombstone in
+/// this collection carries a marker, so `list` may treat an unmarked key as
+/// live. The name holds no `.` and does not end in `.json`, so
+/// [`parse_object_key`] can never produce it from a caller's record key.
+fn marked_flag_key(namespace: &str, collection: &str) -> String {
+    format!(
+        "{}/{}/_tombstone_markers",
+        gonzalo_core::segment(namespace),
+        gonzalo_core::segment(collection)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_key_is_the_record_key_plus_a_suffix() {
+        let k = RecordKey::new("ns", "col", "id");
+        assert_eq!(marker_key(&k), "ns/col/id.json.tombstone");
+        assert_eq!(parse_marker_key(&marker_key(&k)), Some(k));
+    }
+
+    #[test]
+    fn a_marker_key_is_not_a_record_key() {
+        // `segment()` escapes `.`, so no id can produce a key ending in
+        // `.json.tombstone` — the two key spaces are disjoint by construction.
+        let k = RecordKey::new("ns", "col", "id");
+        assert_eq!(parse_object_key(&marker_key(&k)), None);
+        for id in ["id.json.tombstone", "id.json", "a.b", "..", "50%"] {
+            let key = RecordKey::new("ns", "col", id);
+            assert_ne!(object_key(&key), marker_key(&k));
+            assert_eq!(parse_marker_key(&object_key(&key)), None);
+        }
+    }
+
+    #[test]
+    fn marked_flag_key_is_not_a_record_or_marker_key() {
+        let flag = marked_flag_key("ns", "col");
+        assert_eq!(flag, "ns/col/_tombstone_markers");
+        assert_eq!(parse_object_key(&flag), None);
+        assert_eq!(parse_marker_key(&flag), None);
+    }
+
+    #[test]
+    fn marked_flag_key_escapes_its_components() {
+        // Same encoding as record keys, so a namespace containing `/` cannot
+        // reach another collection's flag.
+        assert_eq!(
+            marked_flag_key("a/b", "c.d"),
+            "a%2Fb/c%2Ed/_tombstone_markers"
+        );
+    }
 
     #[test]
     fn parse_roundtrips_object_key() {
