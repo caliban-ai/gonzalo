@@ -1,0 +1,599 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "gonzalod HTTP/JSON API",
+    "version": "0.7.0",
+    "description": "The HTTP/JSON transport of the gonzalo daemon (ADR 0007). The gRPC transport carries the same types and is described by `gonzalo.proto`, published alongside this document.\n\nGenerate a client from this file rather than hand-maintaining one — gonzalo ships Rust deliverables only (ADR 0020), and this artifact exists so non-Rust consumers do not have to. Its operations are checked against the daemon's router by `served_operations_is_exactly_what_the_router_declares` and `openapi_document_matches_the_served_surface`, so it cannot silently drift from what is served.",
+    "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" }
+  },
+  "servers": [{ "url": "http://localhost:8080", "description": "a local gonzalod" }],
+  "security": [{ "bearerAuth": [] }],
+  "tags": [
+    { "name": "health", "description": "Liveness and readiness probes. Unauthenticated." },
+    { "name": "records", "description": "The consumer surface. Tombstones are hidden." },
+    { "name": "replication", "description": "The raw surface: tombstones visible, for sync (ADR 0021)." },
+    { "name": "blobs", "description": "Content-addressed bodies held out of line (ADR 0012)." },
+    { "name": "graph", "description": "Code-graph queries over an indexed view." },
+    { "name": "tickets", "description": "Importing an external ticket board into records." }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["health"],
+        "summary": "Liveness probe",
+        "description": "Always 200 while the process is serving. Unauthenticated.",
+        "security": [],
+        "responses": { "200": { "description": "the process is up" } }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": ["health"],
+        "summary": "Readiness probe",
+        "description": "200 once the backing store answers. Unauthenticated.",
+        "security": [],
+        "responses": {
+          "200": { "description": "the store is reachable" },
+          "503": { "description": "the store is not reachable" }
+        }
+      }
+    },
+    "/v1/records/{ns}/{col}/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Namespace" },
+        { "$ref": "#/components/parameters/Collection" },
+        { "$ref": "#/components/parameters/Id" }
+      ],
+      "get": {
+        "tags": ["records"],
+        "summary": "Read a record",
+        "description": "Requires `read` on the namespace. A deleted record is 404: tombstones are invisible here, and `/v1/raw/records/...` is the surface that shows them.",
+        "responses": {
+          "200": {
+            "description": "the record",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Record" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "description": "no record at this key, or it is deleted" }
+        }
+      },
+      "put": {
+        "tags": ["records"],
+        "summary": "Write a record",
+        "description": "Requires `write` on the namespace. `expected` is the revision this write replaces; omit it to create, which succeeds only if the key holds nothing. The body's `record.key` must agree with the path (400 otherwise, #158).",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PutBody" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "committed, or a conflict carrying the record that is actually stored",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PutOutcome" } } }
+          },
+          "400": { "description": "the body's key disagrees with the path" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" }
+        }
+      },
+      "delete": {
+        "tags": ["records"],
+        "summary": "Delete a record",
+        "description": "Requires `write` on the namespace. Writes a tombstone that replicates (ADR 0021); it is not a local erasure. Deleting an absent key succeeds and changes nothing.",
+        "requestBody": {
+          "required": false,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteBody" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "deleted, or a conflict carrying the current record",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteOutcome" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" }
+        }
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "tags": ["records"],
+        "summary": "List record keys",
+        "description": "Requires `read` on the namespace, or `read` on `*` when `namespace` is omitted. Tombstoned keys are not listed.",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamespaceQuery" },
+          { "$ref": "#/components/parameters/CollectionQuery" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the matching keys",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/RecordKey" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/raw/records/{ns}/{col}/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Namespace" },
+        { "$ref": "#/components/parameters/Collection" },
+        { "$ref": "#/components/parameters/Id" }
+      ],
+      "get": {
+        "tags": ["replication"],
+        "summary": "Read a record, tombstones included",
+        "description": "Requires `read` on the namespace. Absence is `200 {\"record\": null}`, never 404 — a 404 here means the daemon predates the replication routes, and a client must tell those apart without guessing.",
+        "responses": {
+          "200": {
+            "description": "the record, the tombstone, or null",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RawRecordBody" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "put": {
+        "tags": ["replication"],
+        "summary": "Replication write",
+        "description": "Requires `write` on the namespace. Stores the record verbatim and never re-stamps its revision. A non-admin caller's write is attributed to that caller, so nobody can plant a record in another's name through this route.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PutBody" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "committed, or a conflict",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PutOutcome" } } }
+          },
+          "400": { "description": "the body's key disagrees with the path" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" }
+        }
+      }
+    },
+    "/v1/raw/keys": {
+      "get": {
+        "tags": ["replication"],
+        "summary": "List record keys, tombstones included",
+        "description": "Requires `read` on the namespace, or `read` on `*` when `namespace` is omitted.",
+        "parameters": [
+          { "$ref": "#/components/parameters/NamespaceQuery" },
+          { "$ref": "#/components/parameters/CollectionQuery" }
+        ],
+        "responses": {
+          "200": {
+            "description": "the matching keys, tombstoned ones included",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/RecordKey" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/purge/{ns}/{col}/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Namespace" },
+        { "$ref": "#/components/parameters/Collection" },
+        { "$ref": "#/components/parameters/Id" }
+      ],
+      "post": {
+        "tags": ["replication"],
+        "summary": "Physically remove a tombstone",
+        "description": "**Admin only.** The one operation that can make a delete undoable across peers: removing a tombstone lets a peer that never saw the delete resurrect the record on its next sync. `expected` is required — purge is always conditional on the current revision, so a recreation landing mid-purge survives.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PurgeBody" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "purged, or a conflict",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteOutcome" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "the caller is not an admin" }
+        }
+      }
+    },
+    "/v1/tickets/sync": {
+      "post": {
+        "tags": ["tickets"],
+        "summary": "Import a ticket board into records",
+        "description": "Requires `write` on the `tickets` namespace. The body is a connector configuration; a misconfigured one comes back as 400 with the reason, since it is the caller's own input.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "A `gonzalo-ticket-config` connection: the provider, its credentials and the board to import.",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "what the sync imported",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          },
+          "400": { "description": "the connection configuration is invalid" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/graph/definitions": {
+      "get": {
+        "tags": ["graph"],
+        "summary": "Where a symbol is defined",
+        "parameters": [{ "$ref": "#/components/parameters/GraphQuery" }],
+        "responses": { "$ref": "#/components/responses/GraphAnswer" }
+      }
+    },
+    "/v1/graph/references": {
+      "get": {
+        "tags": ["graph"],
+        "summary": "Every reference to a symbol",
+        "parameters": [{ "$ref": "#/components/parameters/GraphQuery" }],
+        "responses": { "$ref": "#/components/responses/GraphAnswer" }
+      }
+    },
+    "/v1/graph/callers": {
+      "get": {
+        "tags": ["graph"],
+        "summary": "What calls a symbol",
+        "parameters": [{ "$ref": "#/components/parameters/GraphQuery" }],
+        "responses": { "$ref": "#/components/responses/GraphAnswer" }
+      }
+    },
+    "/v1/graph/callees": {
+      "get": {
+        "tags": ["graph"],
+        "summary": "What a symbol calls",
+        "parameters": [{ "$ref": "#/components/parameters/GraphQuery" }],
+        "responses": { "$ref": "#/components/responses/GraphAnswer" }
+      }
+    },
+    "/v1/graph/impact": {
+      "get": {
+        "tags": ["graph"],
+        "summary": "The transitive caller closure of a symbol",
+        "description": "Resolution-gated: edges it cannot attribute to a definition are not followed, so the answer under-reports rather than over-reports.",
+        "parameters": [{ "$ref": "#/components/parameters/GraphQuery" }],
+        "responses": { "$ref": "#/components/responses/GraphAnswer" }
+      }
+    },
+    "/v1/blobs": {
+      "get": {
+        "tags": ["blobs"],
+        "summary": "List stored blob hashes",
+        "description": "Requires `read` on the `_blobs` namespace.",
+        "responses": {
+          "200": {
+            "description": "every stored blob's hash",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ContentHash" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/blobs/{hash}": {
+      "parameters": [
+        {
+          "name": "hash",
+          "in": "path",
+          "required": true,
+          "description": "the content's blake3 hash, hex-encoded",
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "tags": ["blobs"],
+        "summary": "Read a blob",
+        "description": "Requires `read` on `_blobs`.",
+        "responses": {
+          "200": {
+            "description": "the bytes",
+            "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "description": "no blob with this hash" }
+        }
+      },
+      "put": {
+        "tags": ["blobs"],
+        "summary": "Store a blob",
+        "description": "Requires `write` on `_blobs`. Content-addressed and write-if-absent, so re-uploading identical bytes is a no-op. Bodies above the daemon's ceiling are rejected with 413.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+        },
+        "responses": {
+          "200": { "description": "stored, or already present" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "description": "the body exceeds the daemon's per-blob ceiling" }
+        }
+      },
+      "delete": {
+        "tags": ["blobs"],
+        "summary": "Delete a blob",
+        "description": "Requires `write` on `_blobs`. Idempotent. Blobs are shared by content, so deleting one a record still references leaves a dangling reference — see `gonzalo gc` (ADR 0024).",
+        "responses": {
+          "200": { "description": "deleted, or already absent" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A principal's token. What it is scoped to decides which namespaces the caller may read or write (ADR 0015). A daemon started without auth serves open and ignores this."
+      }
+    },
+    "parameters": {
+      "Namespace": { "name": "ns", "in": "path", "required": true, "schema": { "type": "string" } },
+      "Collection": { "name": "col", "in": "path", "required": true, "schema": { "type": "string" } },
+      "Id": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "NamespaceQuery": {
+        "name": "namespace",
+        "in": "query",
+        "required": false,
+        "description": "narrow the listing to one namespace; omitting it lists every namespace and requires `read` on `*`",
+        "schema": { "type": "string" }
+      },
+      "CollectionQuery": {
+        "name": "collection",
+        "in": "query",
+        "required": false,
+        "description": "narrow the listing to one collection of the namespace",
+        "schema": { "type": "string" }
+      },
+      "GraphQuery": {
+        "name": "repo",
+        "in": "query",
+        "required": true,
+        "description": "the repository of an indexed view. `view` and `name` are required alongside it: the view id, and the symbol to ask about. Requires `read` on the `repo` namespace.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "Unauthorized": { "description": "no bearer token, or one the daemon does not know" },
+      "Forbidden": { "description": "the principal's scopes do not cover this namespace" },
+      "PreconditionFailed": {
+        "description": "the expected revision is not the current one — for a conditional write over a deleted key, this is what a 404 would otherwise be ambiguous about"
+      },
+      "GraphAnswer": {
+        "description": "the query's answer",
+        "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+      }
+    },
+    "schemas": {
+      "ContentHash": {
+        "type": "string",
+        "description": "A blake3 hash, hex-encoded."
+      },
+      "RecordKey": {
+        "type": "object",
+        "required": ["namespace", "collection", "id"],
+        "properties": {
+          "namespace": { "type": "string" },
+          "collection": { "type": "string" },
+          "id": { "type": "string" }
+        }
+      },
+      "Revision": {
+        "type": "object",
+        "description": "A monotonic counter plus the body's content hash. Two writers have diverged when the pair differs.",
+        "required": ["counter", "hash"],
+        "properties": {
+          "counter": { "type": "integer", "format": "int64", "minimum": 0 },
+          "hash": { "$ref": "#/components/schemas/ContentHash" }
+        }
+      },
+      "Identity": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "display": { "type": ["string", "null"] }
+        }
+      },
+      "Meta": {
+        "type": "object",
+        "description": "Provenance. `created` and `updated` are epoch milliseconds stamped by the store, not by the caller.",
+        "required": ["author", "origin_system", "created", "updated", "labels"],
+        "properties": {
+          "author": { "$ref": "#/components/schemas/Identity" },
+          "origin_system": { "type": "string" },
+          "created": { "type": "integer", "format": "int64" },
+          "updated": { "type": "integer", "format": "int64" },
+          "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      },
+      "Body": {
+        "description": "Either bytes held in the record, or a reference to content held out of line in the blob store.",
+        "oneOf": [
+          {
+            "type": "object",
+            "title": "Inline",
+            "required": ["Inline"],
+            "properties": {
+              "Inline": {
+                "type": "array",
+                "description": "the raw bytes",
+                "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "title": "Blob",
+            "required": ["Blob"],
+            "properties": {
+              "Blob": {
+                "type": "object",
+                "required": ["hash", "len"],
+                "properties": {
+                  "hash": { "$ref": "#/components/schemas/ContentHash" },
+                  "len": { "type": "integer", "format": "int64", "minimum": 0 }
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "RecordKind": {
+        "type": "string",
+        "enum": [
+          "MemoryTier", "Topic", "Session", "Checkpoint", "Ticket", "TicketEvent", "GraphManifest",
+          "Person", "IdentityBinding", "RoleGrant", "ChannelConfig", "LinkToken", "AuditEntry",
+          "Tombstone"
+        ]
+      },
+      "Record": {
+        "type": "object",
+        "description": "The universal persisted unit: a body plus provenance at a key.",
+        "required": ["key", "kind", "revision", "body", "meta", "links"],
+        "properties": {
+          "key": { "$ref": "#/components/schemas/RecordKey" },
+          "kind": { "$ref": "#/components/schemas/RecordKind" },
+          "revision": { "$ref": "#/components/schemas/Revision" },
+          "parent": {
+            "description": "the revision this one followed, absent on a first write",
+            "oneOf": [{ "$ref": "#/components/schemas/Revision" }, { "type": "null" }]
+          },
+          "body": { "$ref": "#/components/schemas/Body" },
+          "meta": { "$ref": "#/components/schemas/Meta" },
+          "links": { "type": "array", "items": { "$ref": "#/components/schemas/RecordKey" } },
+          "ancestors": {
+            "type": "array",
+            "description": "bounded ancestry carried for three-way merge (ADR 0016)",
+            "items": { "$ref": "#/components/schemas/Revision" }
+          },
+          "deleted_at": {
+            "type": ["integer", "null"],
+            "format": "int64",
+            "description": "tombstones only: when the delete was stamped, in epoch milliseconds"
+          },
+          "deleted_blob": {
+            "description": "tombstones only: the blob the deleted body referenced. A tombstone pins its blob until collected (ADR 0024).",
+            "oneOf": [{ "$ref": "#/components/schemas/ContentHash" }, { "type": "null" }]
+          }
+        }
+      },
+      "Conflict": {
+        "type": "object",
+        "description": "A rejected write, carrying the record the store actually holds. A conflict is a normal outcome to act on, never an error.",
+        "required": ["key", "current"],
+        "properties": {
+          "key": { "$ref": "#/components/schemas/RecordKey" },
+          "current": { "$ref": "#/components/schemas/Record" }
+        }
+      },
+      "PutBody": {
+        "type": "object",
+        "required": ["record"],
+        "properties": {
+          "record": { "$ref": "#/components/schemas/Record" },
+          "expected": {
+            "description": "the revision this write replaces; null or absent means \"this key must not exist yet\"",
+            "oneOf": [{ "$ref": "#/components/schemas/Revision" }, { "type": "null" }]
+          }
+        }
+      },
+      "PutOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "title": "Committed",
+            "required": ["outcome", "revision"],
+            "properties": {
+              "outcome": { "type": "string", "const": "committed" },
+              "revision": { "$ref": "#/components/schemas/Revision" }
+            }
+          },
+          {
+            "type": "object",
+            "title": "Conflict",
+            "required": ["outcome", "conflict"],
+            "properties": {
+              "outcome": { "type": "string", "const": "conflict" },
+              "conflict": { "$ref": "#/components/schemas/Conflict" }
+            }
+          }
+        ]
+      },
+      "DeleteBody": {
+        "type": "object",
+        "properties": {
+          "expected": {
+            "description": "delete only if this is still the current revision",
+            "oneOf": [{ "$ref": "#/components/schemas/Revision" }, { "type": "null" }]
+          },
+          "author": {
+            "description": "the deleter a replicating or admin client names. Honoured only for an admin or an open daemon; any other caller is stamped as itself.",
+            "oneOf": [{ "$ref": "#/components/schemas/Identity" }, { "type": "null" }]
+          }
+        }
+      },
+      "DeleteOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "title": "Deleted",
+            "required": ["outcome"],
+            "properties": { "outcome": { "type": "string", "const": "deleted" } }
+          },
+          {
+            "type": "object",
+            "title": "Conflict",
+            "required": ["outcome", "conflict"],
+            "properties": {
+              "outcome": { "type": "string", "const": "conflict" },
+              "conflict": { "$ref": "#/components/schemas/Conflict" }
+            }
+          }
+        ]
+      },
+      "RawRecordBody": {
+        "type": "object",
+        "description": "The replication read's answer. Absence is an explicit null rather than a 404.",
+        "required": ["record"],
+        "properties": {
+          "record": {
+            "oneOf": [{ "$ref": "#/components/schemas/Record" }, { "type": "null" }]
+          }
+        }
+      },
+      "PurgeBody": {
+        "type": "object",
+        "required": ["expected"],
+        "properties": { "expected": { "$ref": "#/components/schemas/Revision" } }
+      }
+    }
+  }
+}

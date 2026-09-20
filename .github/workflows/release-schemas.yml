@@ -1,0 +1,80 @@
+name: release-schemas
+
+# Attach the schema artifacts to the GitHub Release (gonzalo#198).
+#
+# WHY THIS EXISTS: ADR 0007 says the daemon exists so non-Rust tools can share a
+# store, and ADR 0020 says gonzalo ships Rust deliverables only. Those two hold
+# together only if a non-Rust consumer can *generate* a client — which needs a
+# published description of the surface. `gonzalo-proto` ships its `.proto` to
+# crates.io, but a Python or TypeScript consumer has no reason to own a cargo
+# registry client, so both descriptions are attached to the Release where a
+# plain `curl` reaches them.
+#
+# These artifacts are checked against the daemon's router by the test suite
+# (`served_operations_is_exactly_what_the_router_declares` and
+# `openapi_document_matches_the_served_surface`), so a tag that would publish a
+# stale description fails CI before it gets here.
+#
+# Its own job rather than a step in release-binaries: that one builds on the
+# priciest runner class in the fleet, and copying two files has no business
+# waiting behind a macOS compile.
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-schemas-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # gh release upload
+
+jobs:
+  attach:
+    name: attach .proto and openapi.json
+    # Never run anywhere but the canonical public repo (as publish.yml).
+    if: github.repository == 'caliban-ai/gonzalo'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Stage the artifacts under their released names
+        run: |
+          mkdir -p dist
+          cp crates/gonzalo-proto/proto/gonzalo.proto "dist/gonzalo-$GITHUB_REF_NAME.proto"
+          cp docs/api/openapi.json "dist/gonzalo-openapi-$GITHUB_REF_NAME.json"
+
+      # Attach to the run before touching the Release, so the artifacts survive
+      # even if the Release never appears (as release-binaries does).
+      - uses: actions/upload-artifact@v6
+        with:
+          name: schemas
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Wait for the GitHub Release
+        # The runbook pushes the tag before creating the Release, so this job can
+        # start first. Poll rather than create it: the notes are curated from the
+        # changelog by a human, and a placeholder here would collide with that.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 40); do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "release $GITHUB_REF_NAME exists"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::release $GITHUB_REF_NAME was not created within 10 minutes. The schemas are attached to this run: gh run download ${{ github.run_id }}"
+          exit 1
+
+      - name: Attach to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/gonzalo-$GITHUB_REF_NAME.proto" \
+            "dist/gonzalo-openapi-$GITHUB_REF_NAME.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber

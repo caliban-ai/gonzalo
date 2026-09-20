@@ -52,6 +52,20 @@ the patch version for fixes.
   rather than answer from one machine's copy. An absent key is an error naming
   it, never an empty result, for the same reason an unknown view is. Vector and
   knowledge recall over MCP are tracked separately (#317). (#197)
+- **Published schema artifacts, so non-Rust clients are generated rather than
+  maintained.** Client SDKs are 🔴 in all three competitor matrices, each
+  suggesting the same fix: generate one from the daemon's schema. But
+  `gonzalo-proto` was an internal workspace crate and the HTTP/JSON surface had
+  no description at all, so the daemon's non-Rust promise (ADR 0007) was
+  unfulfilled at the packaging layer. Every release now attaches
+  `gonzalo-vX.Y.Z.proto` and `gonzalo-openapi-vX.Y.Z.json` to its GitHub
+  Release, and the OpenAPI document lives in-tree at `docs/api/openapi.json`.
+  They cannot drift: `SERVED_OPERATIONS` is checked against the router's own
+  source and against the document, in both directions, so an operation added
+  without describing it fails CI and so does one described but not served. The
+  guide gains a [Generating a client](docs/guide/src/clients.md) chapter with a
+  worked Python example. No client code in any other language enters this repo
+  (ADR 0020). (#198)
 
 ### Changed
 

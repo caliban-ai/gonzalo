@@ -25,6 +25,37 @@ use std::sync::Arc;
 /// principal is granted blob access by listing `_blobs` in its read/write set.
 const BLOB_NS: &str = "_blobs";
 
+/// Every `(METHOD, path)` the daemon serves, in the path-template form the
+/// published OpenAPI document uses (gonzalo#198).
+///
+/// This is the list the schema artifact is checked against, in both directions:
+/// a route added here but not to `docs/api/openapi.json` fails a test, and so
+/// does one documented but not served. It exists because a generated client is
+/// only as good as the description it was generated from, and a description
+/// nothing checks drifts silently.
+pub const SERVED_OPERATIONS: &[(&str, &str)] = &[
+    ("GET", "/healthz"),
+    ("GET", "/readyz"),
+    ("GET", "/v1/records/{ns}/{col}/{id}"),
+    ("PUT", "/v1/records/{ns}/{col}/{id}"),
+    ("DELETE", "/v1/records/{ns}/{col}/{id}"),
+    ("GET", "/v1/keys"),
+    ("GET", "/v1/raw/records/{ns}/{col}/{id}"),
+    ("PUT", "/v1/raw/records/{ns}/{col}/{id}"),
+    ("GET", "/v1/raw/keys"),
+    ("POST", "/v1/purge/{ns}/{col}/{id}"),
+    ("POST", "/v1/tickets/sync"),
+    ("GET", "/v1/graph/definitions"),
+    ("GET", "/v1/graph/references"),
+    ("GET", "/v1/graph/callers"),
+    ("GET", "/v1/graph/callees"),
+    ("GET", "/v1/graph/impact"),
+    ("GET", "/v1/blobs"),
+    ("GET", "/v1/blobs/{hash}"),
+    ("PUT", "/v1/blobs/{hash}"),
+    ("DELETE", "/v1/blobs/{hash}"),
+];
+
 /// Build the axum router. `auth` governs per-namespace authorization (ADR 0015);
 /// `Auth::Disabled` serves open. The middleware authenticates every non-probe
 /// request (bearer → [`Principal`], or `401`) and hands the principal to the
@@ -597,8 +628,164 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use gonzalo_core::{CoreError, Record, Result as CoreResult, Revision, Store};
     use gonzalo_store_fs::FsStore;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
     use tower::ServiceExt; // oneshot
+
+    // ---- published schema artifacts (#198) --------------------------------
+
+    /// [`SERVED_OPERATIONS`] is exactly what `router()` declares.
+    ///
+    /// Both directions matter. An entry with no route would put an operation in
+    /// the published OpenAPI document that the daemon does not serve — a
+    /// generated client calling a 404. A route with no entry would serve
+    /// something the document never describes, which is how an API quietly
+    /// grows an undocumented corner.
+    #[test]
+    fn served_operations_is_exactly_what_the_router_declares() {
+        let declared: BTreeSet<(String, String)> = routes_in_router_source().into_iter().collect();
+        let listed: BTreeSet<(String, String)> = SERVED_OPERATIONS
+            .iter()
+            .map(|(m, p)| (m.to_string(), p.to_string()))
+            .collect();
+
+        let unrouted: Vec<_> = listed.difference(&declared).collect();
+        let unlisted: Vec<_> = declared.difference(&listed).collect();
+        assert!(
+            unrouted.is_empty(),
+            "in SERVED_OPERATIONS but not routed: {unrouted:?}"
+        );
+        assert!(
+            unlisted.is_empty(),
+            "routed but missing from SERVED_OPERATIONS: {unlisted:?}"
+        );
+    }
+
+    /// The published OpenAPI document describes exactly the served surface.
+    ///
+    /// This is the drift check the ticket asks CI for (#198): the artifact
+    /// consumers generate clients from cannot describe an operation the daemon
+    /// does not serve, or miss one it does.
+    #[test]
+    fn openapi_document_matches_the_served_surface() {
+        // Everything a path item may hold that is not an operation.
+        const NOT_OPERATIONS: &[&str] =
+            &["parameters", "summary", "description", "servers", "$ref"];
+
+        let spec: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/api/openapi.json"))
+                .expect("docs/api/openapi.json is valid JSON");
+
+        let mut documented = BTreeSet::new();
+        for (path, item) in spec["paths"].as_object().expect("paths object") {
+            for key in item.as_object().expect("path item object").keys() {
+                if NOT_OPERATIONS.contains(&key.as_str()) {
+                    continue;
+                }
+                documented.insert((key.to_uppercase(), path.clone()));
+            }
+        }
+        let served: BTreeSet<(String, String)> = SERVED_OPERATIONS
+            .iter()
+            .map(|(m, p)| (m.to_string(), p.to_string()))
+            .collect();
+
+        let undocumented: Vec<_> = served.difference(&documented).collect();
+        let unserved: Vec<_> = documented.difference(&served).collect();
+        assert!(
+            undocumented.is_empty(),
+            "served but absent from docs/api/openapi.json: {undocumented:?}"
+        );
+        assert!(
+            unserved.is_empty(),
+            "documented in docs/api/openapi.json but not served: {unserved:?}"
+        );
+    }
+
+    /// The `(METHOD, path)` pairs `router()` declares, parsed out of its source.
+    ///
+    /// axum exposes no way to enumerate a built `Router`, so the declaration
+    /// site is read instead. Only `router()`'s own body is parsed, and comment
+    /// lines are dropped — otherwise this reads the `.route(...)` written in
+    /// these very doc comments and reports routes nothing serves.
+    ///
+    /// Deliberately literal: it understands exactly the
+    /// `.route("path", get(h).put(h))` shape this file uses, so keep new routes
+    /// in that shape.
+    fn routes_in_router_source() -> Vec<(String, String)> {
+        let file = include_str!("http.rs");
+        let body_start = file
+            .find("pub fn router(")
+            .expect("router() is defined in this file");
+        // Stop before the tests, so this never parses its own examples.
+        let body_end = file[body_start..]
+            .find("#[cfg(test)]")
+            .map(|i| body_start + i)
+            .unwrap_or(file.len());
+        let body: String = file[body_start..body_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut out = Vec::new();
+        for (idx, _) in body.match_indices(".route(") {
+            let rest = &body[idx + ".route(".len()..];
+            let Some(open) = rest.find('"') else { continue };
+            let Some(close) = rest[open + 1..].find('"') else {
+                continue;
+            };
+            let path = &rest[open + 1..open + 1 + close];
+            // The handler chain runs to the closing paren of this `.route(`.
+            let mut depth = 1usize;
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let chain = &rest[..end];
+            for verb in ["get", "put", "delete", "post", "patch"] {
+                if chain.contains(&format!("{verb}(")) {
+                    out.push((verb.to_uppercase(), path.to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The parser is load-bearing, so prove it reads the shape it claims to.
+    #[test]
+    fn the_route_parser_reads_paths_and_every_chained_method() {
+        let found = routes_in_router_source();
+        assert!(
+            found.contains(&("GET".into(), "/healthz".into())),
+            "a single-method route"
+        );
+        // One `.route(...)` with three methods chained must yield all three.
+        for verb in ["GET", "PUT", "DELETE"] {
+            assert!(
+                found.contains(&(verb.into(), "/v1/records/{ns}/{col}/{id}".into())),
+                "{verb} on the records route"
+            );
+        }
+        assert!(
+            found.contains(&("POST".into(), "/v1/tickets/sync".into())),
+            "a fully-qualified axum::routing::post route"
+        );
+        assert!(
+            !found.iter().any(|(_, p)| p.is_empty() || p.contains('…')),
+            "the parser picked up prose rather than a route: {found:?}"
+        );
+    }
 
     /// A Service backed by a fresh filesystem store (reachable → ready).
     fn fs_service() -> (Service, TempDir) {
