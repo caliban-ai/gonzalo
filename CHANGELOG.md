@@ -39,6 +39,19 @@ the patch version for fixes.
   store and does its own listing; `sweep_blobs` and `live_blob_hashes` are the
   halves, for a caller that already knows its live set. See
   [ADR 0024](docs/adr/0024-blob-garbage-collection.md). (#292)
+- **Records over MCP, and an MCP server that can talk to a daemon.**
+  `gonzalo-mcp` exposed only the code graph, so an agent could ask what calls a
+  function but could not read the records the store exists to hold — the gap
+  both the Zep and Letta parity matrices meant by "no MCP surface", while their
+  rows wrongly claimed there was no MCP server at all. It now also exposes
+  `record_get` and `record_list`, with `record_put` and `record_delete` behind
+  `--allow-writes` (or `GONZALO_MCP_ALLOW_WRITES=1`) and absent from the
+  advertised tool list without it, so an agent never sees a tool it cannot call.
+  `GONZALO_DAEMON` (or `--daemon <url>`, with `GONZALO_TOKEN`) points the server
+  at a running `gonzalod` instead of a local directory, so it can share a store
+  rather than answer from one machine's copy. An absent key is an error naming
+  it, never an empty result, for the same reason an unknown view is. Vector and
+  knowledge recall over MCP are tracked separately (#317). (#197)
 
 ### Changed
 

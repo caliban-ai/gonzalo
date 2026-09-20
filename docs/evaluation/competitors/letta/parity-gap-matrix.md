@@ -28,7 +28,7 @@ out of scope for gonzalo's substrate layer, not a backlog item.
 |---|---|---|
 | Agent loop (reasoning + tool calls + multi-step) | 🔴 `by design` | Gonzalo runs no agent loop; it is storage only. A Letta-class agent would sit above it |
 | Built-in tool calling | 🔴 `by design` | Not a gonzalo concern |
-| MCP tool integration | 🔴 | No MCP surface today (candidate thin adapter over the daemon) |
+| MCP tool integration | 🟡 | `gonzalo-mcp` is a working stdio MCP server. It exposes the code graph and, since #197, the records themselves (`record_get`/`record_list`, plus `record_put`/`record_delete` when started with writes enabled), and can target a running `gonzalod` rather than a local directory. Vector and knowledge recall are not yet exposed over MCP (#317) |
 | Multi-agent / subagents | 🔴 `by design` | Orchestration is above the substrate |
 | Model-agnostic provider selection | 🔴 `by design` | No LLM in gonzalo's loop |
 
@@ -95,7 +95,7 @@ gonzalo's angle is the inverse of Letta's: **shared, multi-writer, conflict-awar
 backend-agnostic** persistence rather than turnkey per-agent state. The genuine
 convergence point is **git-backed memory**, which Letta Code adopted in 2026 and
 gonzalo has as a first-class substrate. The realistic backlog item here is an
-optional **MCP adapter** (A) — everything else is a deliberate boundary, not a
+the remaining **MCP recall surface** (A) — everything else is a deliberate boundary, not a
 gap. The **client SDK** rows in D are one of those boundaries: Rust
 deliverables only, with the daemon and its published schema as the non-Rust
 integration point (ADR 0020). The clean summary: gonzalo is a candidate
