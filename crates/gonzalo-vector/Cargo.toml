@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 gonzalo-core = { workspace = true }
 async-trait  = { workspace = true }
+tokio        = { workspace = true, features = ["rt"] }
 hnsw_rs = { version = "0.3.4", optional = true }
 
 [dev-dependencies]
