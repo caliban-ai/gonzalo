@@ -60,6 +60,13 @@ pub struct RecordVectorIndex<S> {
     /// **real** OCC conflict: without it, every commit would re-read the
     /// current record right before writing and could never lose a race.
     last_seen: tokio::sync::Mutex<Option<Record>>,
+    /// Serializes `commit` calls on this handle. `upsert`/`remove` take
+    /// `&self`, so without this two calls on the same handle could interleave
+    /// their reads of `last_seen` and each other's staged writes, including
+    /// the `Committed` arm setting `last_seen` back to an older revision than
+    /// a commit that finished first. Held for the whole of `commit`, never
+    /// across a `std::sync` guard.
+    commit_lock: tokio::sync::Mutex<()>,
 }
 
 impl<S> std::fmt::Debug for RecordVectorIndex<S> {
@@ -129,6 +136,7 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
             inner: MemoryVectorIndex::new(),
             meta: Meta::new(Identity::new("gonzalo-vector"), "gonzalo-vector"),
             last_seen: tokio::sync::Mutex::new(existing),
+            commit_lock: tokio::sync::Mutex::new(()),
         };
 
         if let Some(m) = manifest {
@@ -181,9 +189,11 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
     /// Load one shard from `manifest` into the in-memory index, replacing
     /// whatever that shard currently holds.
     ///
-    /// Kept for Task 6's single-shard reload after a conflicting write; that
-    /// path re-reads one shard at a time and gets nothing from the batch
-    /// concurrency `open_with_shards` uses.
+    /// Used by `commit`'s conflict path to bring memory in line with a shard
+    /// the winner changed since this handle last synced — one shard at a
+    /// time, since a conflict only ever needs to catch up on the handful of
+    /// shards that actually diverged, not the whole manifest the way
+    /// `open_with_shards`'s batch concurrency does.
     async fn hydrate_shard(&self, manifest: &VectorManifest, id: u16) -> Result<()> {
         let Some(hash) = manifest.entries.get(&id) else {
             return self.clear_shard(id).await;
@@ -218,17 +228,67 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
         self.inner.upsert_many(entries).await
     }
 
-    /// Apply `deltas` to memory, then persist every shard they touched.
+    /// What shard `id` would contain if `deltas` committed, computed from the
+    /// *currently committed* in-memory state without mutating it.
+    ///
+    /// Memory only ever reflects a committed manifest (see `commit`), so this
+    /// starts from what's already there for `id` and layers `deltas` on top of
+    /// a copy — never on `self.inner` itself. That is what lets a failed
+    /// commit (a `put_blob`/`put` error, or every attempt conflicting) leave
+    /// the handle serving exactly what the store has, with nothing it never
+    /// actually wrote.
+    fn stage_shard(&self, id: u16, deltas: &[Delta]) -> Vec<(RecordKey, Vec<f32>)> {
+        let mut staged: BTreeMap<RecordKey, Vec<f32>> = self
+            .inner
+            .collect_where(|k| shard_of(k, self.shards) == id)
+            .into_iter()
+            .collect();
+        for delta in deltas {
+            match delta {
+                Delta::Upsert(key, vector) if shard_of(key, self.shards) == id => {
+                    staged.insert(key.clone(), vector.clone());
+                }
+                Delta::Remove(key) if shard_of(key, self.shards) == id => {
+                    staged.remove(key);
+                }
+                _ => {}
+            }
+        }
+        staged.into_iter().collect()
+    }
+
+    /// Persist `deltas` as shard blobs plus an updated manifest, under OCC.
     ///
     /// The write is built from `self.last_seen` — what this handle last
     /// observed committed, not a fresh read of the store — so a second
     /// writer's stale view genuinely conflicts rather than quietly winning
-    /// because nothing raced it in the same instant. On a conflict the
-    /// winner's version of each touched shard is reloaded and the deltas
-    /// re-applied on top, so a lost race costs a retry rather than either
-    /// side's vectors. Shard blobs orphaned by a lost race are left for `gc`,
+    /// because nothing raced it in the same instant.
+    ///
+    /// Memory is never mutated ahead of a commit: each dirty shard is staged
+    /// from the committed state already in memory (`stage_shard`), and
+    /// `deltas` only land in `self.inner` once `store.put` reports
+    /// `Committed`. That keeps memory consistent with the store even when a
+    /// `put_blob`/`put` call errors or every attempt conflicts.
+    ///
+    /// On a conflict, every shard the winner changed *relative to what this
+    /// handle last knew* — not just the shards this commit itself touches —
+    /// is reloaded from the winner's blob into memory, because a shard this
+    /// commit didn't touch but the winner did would otherwise stay stale in
+    /// `self.inner` while `last_seen` claims memory is current; the next
+    /// staged write from that shard would then silently drop the winner's
+    /// vectors with no conflict to catch it. `dirty` is reloaded too even
+    /// when unchanged, since it costs nothing and removes the shard from
+    /// needing separate reasoning. This commit's own deltas are re-staged on
+    /// top on retry, so a lost race costs a retry rather than either side's
+    /// vectors. Shard blobs orphaned by a lost race are left for `gc`,
     /// exactly as the graph indexer does.
+    ///
+    /// `commit_lock` serializes this against any other `commit` on the same
+    /// handle, so `last_seen` can't be read by one call and clobbered by
+    /// another's `Committed` arm mid-flight.
     async fn commit(&self, deltas: Vec<Delta>) -> Result<()> {
+        let _commit_guard = self.commit_lock.lock().await;
+
         let mut dirty = BTreeSet::new();
         for delta in &deltas {
             let key = match delta {
@@ -236,20 +296,24 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
             };
             dirty.insert(shard_of(key, self.shards));
         }
-        self.apply(&deltas).await?;
 
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+            let base = self.last_seen.lock().await.clone();
+            let base_entries = match &base {
+                Some(record) => VectorManifest::from_body(&record.body)?.entries,
+                None => BTreeMap::new(),
+            };
+
             let mut blobs = BTreeMap::new();
             for &id in &dirty {
-                let entries = self.inner.collect_where(|k| shard_of(k, self.shards) == id);
+                let staged = self.stage_shard(id, &deltas);
                 let hash = self
                     .store
-                    .put_blob(&encode_shard(self.dim, &entries))
+                    .put_blob(&encode_shard(self.dim, &staged))
                     .await?;
                 blobs.insert(id, hash);
             }
 
-            let base = self.last_seen.lock().await.clone();
             let mut manifest = match &base {
                 Some(record) => VectorManifest::from_body(&record.body)?,
                 None => VectorManifest::new(&self.space, self.dim, self.shards.get()),
@@ -277,13 +341,16 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
 
             match self.store.put(record.clone(), expected).await? {
                 PutResult::Committed(_) => {
+                    self.apply(&deltas).await?;
                     *self.last_seen.lock().await = Some(record);
                     return Ok(());
                 }
                 PutResult::Conflict(_) if attempt < MAX_COMMIT_ATTEMPTS => {
                     // Someone else committed since we last synced with the
-                    // store. Take their version of each shard we touched,
-                    // then put our own deltas back on top and try again.
+                    // store. Bring memory in line with every shard the winner
+                    // changed relative to what we knew, plus every shard this
+                    // commit touches, then retry with our own deltas staged
+                    // back on top of the refreshed memory.
                     let winner = self.store.get(&self.key).await?.ok_or_else(|| {
                         CoreError::Backend(format!(
                             "vector index {}: manifest vanished mid-commit",
@@ -291,11 +358,19 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
                         ))
                     })?;
                     let winner_manifest = VectorManifest::from_body(&winner.body)?;
-                    for &id in &dirty {
+
+                    let mut to_hydrate = dirty.clone();
+                    let mut ids: BTreeSet<u16> = base_entries.keys().copied().collect();
+                    ids.extend(winner_manifest.entries.keys().copied());
+                    for id in ids {
+                        if base_entries.get(&id) != winner_manifest.entries.get(&id) {
+                            to_hydrate.insert(id);
+                        }
+                    }
+                    for id in to_hydrate {
                         self.hydrate_shard(&winner_manifest, id).await?;
                     }
                     *self.last_seen.lock().await = Some(winner);
-                    self.apply(&deltas).await?;
                 }
                 PutResult::Conflict(_) => {
                     return Err(CoreError::Backend(format!(
@@ -308,7 +383,8 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
         unreachable!("the loop returns on the final attempt")
     }
 
-    /// Apply deltas to the in-memory index only.
+    /// Apply deltas to the in-memory index only. Called only after a commit
+    /// that produced them has actually landed in the store — see `commit`.
     async fn apply(&self, deltas: &[Delta]) -> Result<()> {
         for delta in deltas {
             match delta {
@@ -429,6 +505,66 @@ mod tests {
             let result = self.inner.get_blob(hash).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             result
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+            self.inner.list_blobs().await
+        }
+
+        async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+            self.inner.delete_blob(hash).await
+        }
+    }
+
+    /// Wraps a real `FsStore` but fails every `put_blob`, so a commit's
+    /// shard-write step always errors. Used to prove a failed commit leaves
+    /// memory exactly matching the store: deltas must not have already landed
+    /// in `self.inner` when the write meant to persist them never lands.
+    struct FailingBlobStore {
+        inner: FsStore,
+    }
+
+    #[async_trait]
+    impl Store for FailingBlobStore {
+        async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            self.inner.put(record, expected).await
+        }
+        async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete_as(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+            author: Option<Identity>,
+        ) -> Result<DeleteResult> {
+            self.inner.delete_as(key, expected, author).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.inner.get_raw(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.list_raw(prefix).await
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            self.inner.put_raw(record, expected).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.inner.purge(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for FailingBlobStore {
+        async fn put_blob(&self, _content: &[u8]) -> Result<ContentHash> {
+            Err(CoreError::Backend("simulated blob store failure".into()))
+        }
+
+        async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+            self.inner.get_blob(hash).await
         }
 
         async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
@@ -674,19 +810,29 @@ mod tests {
 
     // Two handles on one index is the case OCC exists for: the loser must not
     // drop the winner's vector, nor its own.
+    //
+    // Forced to a single shard: with the default 256 shards `a` (shard 121)
+    // and `b` (shard 136) never contend for the same shard, so this can pass
+    // without the conflict path ever running at all — it would only be
+    // proving that two non-overlapping writes don't clobber each other, which
+    // is true of a design with no OCC whatsoever. Pinning both writers to one
+    // shard forces the actual collision.
     #[tokio::test]
     async fn a_concurrent_writer_loses_neither_sides_vectors() {
         let dir = tmp();
         let s = fs(&dir);
         let a = RecordKey::new("ns", "coll", "a");
         let b = RecordKey::new("ns", "coll", "b");
+        let one_shard = std::num::NonZeroU16::new(1).unwrap();
 
-        let one = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
-            .await
-            .unwrap();
-        let two = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
-            .await
-            .unwrap();
+        let one =
+            RecordVectorIndex::open_with_shards(fs(&dir), index_key(), "space-a", 3, one_shard)
+                .await
+                .unwrap();
+        let two =
+            RecordVectorIndex::open_with_shards(fs(&dir), index_key(), "space-a", 3, one_shard)
+                .await
+                .unwrap();
 
         one.upsert(a.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
         // `two` opened before that commit, so its manifest read is stale and
@@ -726,7 +872,7 @@ mod tests {
             RecordVectorIndex::open_with_shards(fs(&dir), index_key(), "space-a", 3, one_shard)
                 .await
                 .unwrap();
-        one.upsert(a, vec![1.0, 0.0, 0.0]).await.unwrap();
+        one.upsert(a.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
         two.upsert(b.clone(), vec![0.0, 1.0, 0.0]).await.unwrap();
 
         let before = s.list_blobs().await.unwrap().len();
@@ -741,15 +887,96 @@ mod tests {
         );
         assert!(after < before);
 
-        // The surviving index must still be intact and queryable afterwards.
+        // The surviving index must still be intact afterwards, holding both
+        // vectors — not just `b`. Under a design that reloads only the shards
+        // a commit itself touches (rather than every shard the winner
+        // changed), the winner's own vector is exactly what a lost race can
+        // silently drop, and asserting only `b` survives would miss that.
         let reopened = RecordVectorIndex::open(s, index_key(), "space-a", 3)
             .await
             .unwrap();
+        let mut got = reopened.keys(&KeyPrefix::default()).await.unwrap();
+        got.sort();
+        assert_eq!(got, vec![a, b.clone()]);
         let hits = reopened
             .query(&[0.0, 1.0, 0.0], 1, &KeyPrefix::default())
             .await
             .unwrap();
         assert_eq!(hits[0].key, b);
+    }
+
+    // Regression: a conflict reload that only catches up on the shards *this*
+    // commit touches is not enough. Fixed 256-shard keys, chosen so `a` and
+    // `c661` land in the same shard (121) while `b` lands in a different one
+    // (136) -- verified directly against `shard_of`, not assumed.
+    //
+    //   1. `one` and `two` both open the empty index (R0).
+    //   2. `one` commits `a` alone -- shard 121, manifest R1.
+    //   3. `two`'s commit of `b` (shard 136) conflicts against its stale R0
+    //      view. A reload that only refreshes `dirty` (136) leaves `two`'s
+    //      memory for shard 121 empty even though the winner (R1) already has
+    //      `a` there; a reload keyed off every shard the winner *changed*
+    //      catches shard 121 too.
+    //   4. `two` then commits `c661`, also shard 121. If step 3 left shard
+    //      121 stale (empty) in `two`'s memory, this re-serialises shard 121
+    //      as `{c661}` alone -- silently dropping `a` -- and commits clean,
+    //      because `two`'s cached revision (R2) is already current: no
+    //      conflict occurs to catch it.
+    #[tokio::test]
+    async fn a_conflict_reload_catches_up_shards_the_commit_itself_did_not_touch() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let a = RecordKey::new("ns", "coll", "a");
+        let b = RecordKey::new("ns", "coll", "b");
+        let c = RecordKey::new("ns", "coll", "c661");
+        assert_eq!(shard_of(&a, DEFAULT_SHARDS), shard_of(&c, DEFAULT_SHARDS));
+        assert_ne!(shard_of(&a, DEFAULT_SHARDS), shard_of(&b, DEFAULT_SHARDS));
+
+        let one = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+        let two = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        one.upsert(a.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
+        two.upsert(b.clone(), vec![0.0, 1.0, 0.0]).await.unwrap();
+        two.upsert(c.clone(), vec![0.0, 0.0, 1.0]).await.unwrap();
+
+        let reopened = RecordVectorIndex::open(s, index_key(), "space-a", 3)
+            .await
+            .unwrap();
+        let mut got = reopened.keys(&KeyPrefix::default()).await.unwrap();
+        got.sort();
+        let mut want = vec![a, b, c];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "a lost race must not silently drop a shard the losing commit didn't itself touch"
+        );
+    }
+
+    // A failed commit (here, every `put_blob` errors) must leave the handle's
+    // in-memory index exactly matching what the store actually has -- empty,
+    // in this case -- never serving a vector that was never persisted.
+    #[tokio::test]
+    async fn a_failed_commit_leaves_memory_matching_the_store() {
+        let dir = tmp();
+        let s = FailingBlobStore { inner: fs(&dir) };
+        let idx = RecordVectorIndex::open(s, index_key(), "space-a", 3)
+            .await
+            .unwrap();
+        let k = RecordKey::new("ns", "coll", "a");
+
+        let result = idx.upsert(k, vec![1.0, 0.0, 0.0]).await;
+        assert!(
+            result.is_err(),
+            "a failing put_blob must surface as an error"
+        );
+        assert!(
+            idx.keys(&KeyPrefix::default()).await.unwrap().is_empty(),
+            "a failed commit must not leave an uncommitted vector visible in memory"
+        );
     }
 
     #[tokio::test]
