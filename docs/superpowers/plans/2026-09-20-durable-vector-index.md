@@ -647,6 +647,18 @@ Add to `mod tests` in `crates/gonzalo-vector/src/index.rs`:
     }
 
     #[tokio::test]
+    async fn an_arc_delegates_every_method_including_upsert_many() {
+        use std::sync::Arc;
+        let idx: Arc<MemoryVectorIndex> = Arc::new(MemoryVectorIndex::new());
+        idx.upsert_many(vec![(RecordKey::new("ns", "c", "1"), vec![1.0])])
+            .await
+            .unwrap();
+        assert_eq!(idx.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+        idx.remove(&RecordKey::new("ns", "c", "1")).await.unwrap();
+        assert!(idx.keys(&KeyPrefix::default()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn upsert_many_inserts_every_item() {
         let idx = MemoryVectorIndex::new();
         idx.upsert_many(vec![
@@ -741,6 +753,35 @@ In `crates/gonzalo-vector/src/hnsw.rs`, add to `impl VectorIndex for HnswVectorI
     }
 ```
 
+Finally, in `crates/gonzalo-vector/src/lib.rs`, add a delegating impl for `Arc<T>`
+so one index can back two owners — a `KnowledgeStore` and a test, or two stores
+sharing an index. Without it, every sharing caller invents its own newtype:
+
+```rust
+#[async_trait]
+impl<T: VectorIndex + ?Sized> VectorIndex for std::sync::Arc<T> {
+    async fn upsert(&self, key: RecordKey, vector: Vec<f32>) -> Result<()> {
+        (**self).upsert(key, vector).await
+    }
+    async fn remove(&self, key: &RecordKey) -> Result<()> {
+        (**self).remove(key).await
+    }
+    async fn query(&self, query: &[f32], k: usize, filter: &KeyPrefix) -> Result<Vec<Match>> {
+        (**self).query(query, k, filter).await
+    }
+    async fn keys(&self, filter: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        (**self).keys(filter).await
+    }
+    async fn upsert_many(&self, items: Vec<(RecordKey, Vec<f32>)>) -> Result<()> {
+        (**self).upsert_many(items).await
+    }
+}
+```
+
+Note `upsert_many` is delegated explicitly: without it `Arc<RecordVectorIndex>`
+would silently fall back to the trait's looping default and commit once per
+vector, which is exactly what Task 7 exists to prevent.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p gonzalo-vector --all-features`
@@ -785,14 +826,18 @@ Create `crates/gonzalo-vector/src/record_index.rs` with only:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gonzalo_core::{BlobStore, Identity, Meta, Record, RecordKind};
+    use gonzalo_core::{BlobStore, Identity, Meta, Record, RecordKind, Store};
     use gonzalo_store_fs::FsStore;
     use tempfile::TempDir;
 
-    fn store() -> (TempDir, FsStore) {
-        let dir = TempDir::new().unwrap();
-        let store = FsStore::new(dir.path());
-        (dir, store)
+    fn tmp() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
+    /// A fresh handle onto the same directory. `FsStore` is not `Clone`, and a
+    /// second handle is what a restart actually looks like anyway.
+    fn fs(dir: &TempDir) -> FsStore {
+        FsStore::new(dir.path())
     }
 
     fn index_key() -> RecordKey {
@@ -801,14 +846,16 @@ mod tests {
 
     #[tokio::test]
     async fn opening_a_missing_index_starts_empty() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let idx = RecordVectorIndex::open(s, index_key(), "space-a", 3).await.unwrap();
         assert!(idx.keys(&KeyPrefix::default()).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn opening_hydrates_vectors_from_shard_blobs() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let k = RecordKey::new("ns", "coll", "a");
 
         // Hand-build a one-shard index so the load path is tested without
@@ -836,7 +883,8 @@ mod tests {
     // alone would let mismatched vectors score against each other forever.
     #[tokio::test]
     async fn opening_with_a_different_space_errors_naming_both() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let vm = VectorManifest::new("space-a", 3, DEFAULT_SHARDS);
         let rec = Record::create(
             index_key(),
@@ -856,7 +904,8 @@ mod tests {
 
     #[tokio::test]
     async fn opening_with_a_different_dim_errors_naming_both() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let vm = VectorManifest::new("space-a", 3, DEFAULT_SHARDS);
         let rec = Record::create(
             index_key(),
@@ -878,7 +927,8 @@ mod tests {
     // was lost. Opening short and quiet would turn that into missing search hits.
     #[tokio::test]
     async fn a_missing_shard_blob_is_a_loud_error() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let mut vm = VectorManifest::new("space-a", 3, DEFAULT_SHARDS);
         vm.entries.insert(7, gonzalo_core::ContentHash::of(b"never stored"));
         let rec = Record::create(
@@ -1110,10 +1160,11 @@ Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
     // The headline claim of the whole ticket.
     #[tokio::test]
     async fn vectors_survive_reopening_the_index() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let k = RecordKey::new("ns", "coll", "a");
 
-        let idx = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
         idx.upsert(k.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
         drop(idx);
 
@@ -1125,10 +1176,11 @@ Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
 
     #[tokio::test]
     async fn a_removed_vector_stays_removed_after_reopening() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let k = RecordKey::new("ns", "coll", "a");
 
-        let idx = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
         idx.upsert(k.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
         idx.remove(&k).await.unwrap();
         drop(idx);
@@ -1141,12 +1193,13 @@ Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
     // drop the winner's vector, nor its own.
     #[tokio::test]
     async fn a_concurrent_writer_loses_neither_sides_vectors() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let a = RecordKey::new("ns", "coll", "a");
         let b = RecordKey::new("ns", "coll", "b");
 
-        let one = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
-        let two = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
+        let one = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
+        let two = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
 
         one.upsert(a.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
         // `two` opened before that commit, so its manifest read is stale and
@@ -1163,12 +1216,13 @@ Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
     // it, so gc must reclaim it — and must not touch the shard that won.
     #[tokio::test]
     async fn a_shard_blob_orphaned_by_a_lost_race_is_reclaimed() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let a = RecordKey::new("ns", "coll", "a");
         let b = RecordKey::new("ns", "coll", "b");
 
-        let one = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
-        let two = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
+        let one = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
+        let two = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
         one.upsert(a, vec![1.0, 0.0, 0.0]).await.unwrap();
         two.upsert(b.clone(), vec![0.0, 1.0, 0.0]).await.unwrap();
 
@@ -1189,10 +1243,11 @@ Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
 
     #[tokio::test]
     async fn rewriting_identical_content_reuses_the_same_blob() {
-        let (_dir, s) = store();
+        let dir = tmp();
+        let s = fs(&dir);
         let k = RecordKey::new("ns", "coll", "a");
 
-        let idx = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
         idx.upsert(k.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
         let first = s.get(&index_key()).await.unwrap().unwrap();
 
@@ -1205,7 +1260,7 @@ Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
     }
 ```
 
-If `FsStore` is not `Clone`, wrap it: `let s = std::sync::Arc::new(FsStore::new(dir.path()));` and take `S: Store + BlobStore` by `Arc`. Check `gonzalo-store-fs/src/lib.rs` for a `#[derive(Clone)]` before writing these tests, and adjust the `store()` helper once for all of them rather than per test.
+`FsStore` is **not** `Clone` — verified, there is no derive on it at `crates/gonzalo-store-fs/src/lib.rs:26` — which is why the helpers above hand out a fresh `fs(&dir)` handle per "process" rather than cloning one. Do not add a `Clone` derive to `FsStore` to make these tests compile.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1367,8 +1422,9 @@ Add to `mod tests` in `record_index.rs`:
     // bulk load of 100k chunks would be 100k commits. One batch, one revision.
     #[tokio::test]
     async fn upsert_many_commits_the_manifest_once() {
-        let (_dir, s) = store();
-        let idx = RecordVectorIndex::open(s.clone(), index_key(), "space-a", 3).await.unwrap();
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3).await.unwrap();
 
         idx.upsert_many(
             (0..64)
@@ -1390,9 +1446,9 @@ Create `crates/gonzalo-vector/tests/durability.rs`:
 //! The ticket's acceptance criterion: an index of real size is written, dropped,
 //! reopened, and queried — with the reopen cost reported rather than assumed.
 
-use gonzalo_core::{KeyPrefix, RecordKey, VectorManifest, VectorIndex as _};
+use gonzalo_core::{KeyPrefix, RecordKey, VectorManifest};
 use gonzalo_store_fs::FsStore;
-use gonzalo_vector::RecordVectorIndex;
+use gonzalo_vector::{RecordVectorIndex, VectorIndex as _};
 use tempfile::TempDir;
 
 const N: usize = 10_000;
@@ -1414,7 +1470,7 @@ async fn ten_thousand_vectors_survive_a_reopen() {
 
     let probe = items[0].1.clone();
 
-    let idx = RecordVectorIndex::open(store.clone(), key.clone(), "acceptance-space", DIM)
+    let idx = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "acceptance-space", DIM)
         .await
         .unwrap();
     idx.upsert_many(items).await.unwrap();
@@ -1547,28 +1603,8 @@ Add to `mod tests` in `crates/gonzalo-knowledge/src/lib.rs`:
     }
 ```
 
-This needs `VectorIndex` implemented for `Arc<MemoryVectorIndex>` so one index can
-back two stores. If the blanket impl does not already exist, add it to
-`crates/gonzalo-vector/src/lib.rs` as part of this task — it is three lines of
-delegation per method and is the ordinary way to share an index:
-
-```rust
-#[async_trait]
-impl<T: VectorIndex + ?Sized> VectorIndex for std::sync::Arc<T> {
-    async fn upsert(&self, key: RecordKey, vector: Vec<f32>) -> Result<()> {
-        (**self).upsert(key, vector).await
-    }
-    async fn remove(&self, key: &RecordKey) -> Result<()> {
-        (**self).remove(key).await
-    }
-    async fn query(&self, query: &[f32], k: usize, filter: &KeyPrefix) -> Result<Vec<Match>> {
-        (**self).query(query, k, filter).await
-    }
-    async fn keys(&self, filter: &KeyPrefix) -> Result<Vec<RecordKey>> {
-        (**self).keys(filter).await
-    }
-}
-```
+This relies on `VectorIndex` being implemented for `Arc<T>`, which Task 4 added
+alongside the trait. Nothing new is needed here.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
