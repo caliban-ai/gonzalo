@@ -61,6 +61,30 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
         }
     }
 
+    /// Open over an index that may already hold vectors, rebuilding the chunk
+    /// counts from it.
+    ///
+    /// [`new`](Self::new) starts those counts empty, which is right for a fresh
+    /// in-memory index and wrong for a durable one: a re-ingest that shrinks a
+    /// record would not know how many chunks to remove, leaving orphans that
+    /// still match queries (#150). `KeyPrefix` cannot narrow below a collection,
+    /// so this scans once here rather than per ingest.
+    pub async fn open(store: S, index: V, embedder: E) -> Result<Self> {
+        let mut counts: std::collections::HashMap<gonzalo_core::RecordKey, usize> =
+            std::collections::HashMap::new();
+        for chunk in index.keys(&KeyPrefix::default()).await? {
+            let (parent, ordinal) = parent_key(&chunk);
+            let entry = counts.entry(parent).or_insert(0);
+            *entry = (*entry).max(ordinal + 1);
+        }
+        Ok(Self {
+            store,
+            index,
+            embedder,
+            chunk_counts: std::sync::Mutex::new(counts),
+        })
+    }
+
     /// Borrow the underlying store (e.g. to put records before ingesting them).
     pub fn store(&self) -> &S {
         &self.store
@@ -846,6 +870,61 @@ mod tests {
             std::collections::BTreeSet::from([live1, live2]),
             "only the live records should remain"
         );
+    }
+
+    // Re-ingesting a shrunk record must drop the chunks it no longer has — even
+    // when the counts were not built in this process. Before `open`, a restart
+    // resets them to zero and the orphans survive (#150, via #323).
+    #[tokio::test]
+    async fn counts_rebuilt_from_a_durable_index_still_drop_orphans() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(MemoryVectorIndex::default());
+        let key = RecordKey::new("ns", "coll", "doc");
+
+        // `chunk()` maps a Topic to one chunk per bullet, so bullet count is
+        // chunk count (crates/gonzalo-knowledge/src/lib.rs:250).
+        let three = Topic {
+            slug: "doc".into(),
+            bullets: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        };
+        put(
+            &FsStore::new(dir.path()),
+            record(&key, RecordKind::Topic, three.to_body().unwrap()),
+        )
+        .await;
+
+        // A first "process" ingests all three chunks.
+        let first = KnowledgeStore::new(FsStore::new(dir.path()), Arc::clone(&index), Bow);
+        assert!(first.ingest(&key).await.unwrap());
+        assert_eq!(index.keys(&KeyPrefix::default()).await.unwrap().len(), 3);
+        drop(first);
+
+        // The record shrinks to one bullet.
+        let one = Topic {
+            slug: "doc".into(),
+            bullets: vec!["alpha".into()],
+        };
+        let handle = FsStore::new(dir.path());
+        let existing = handle.get(&key).await.unwrap().unwrap();
+        let shrunk = existing.update(
+            one.to_body().unwrap(),
+            Meta::new(Identity::new("test"), "test"),
+        );
+        assert!(matches!(
+            handle.put(shrunk, Some(existing.revision)).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+
+        // A second "process" opens over the same durable index and re-ingests.
+        // Chunks 1 and 2 must go; with `new` instead of `open` they would stay.
+        let second = KnowledgeStore::open(FsStore::new(dir.path()), Arc::clone(&index), Bow)
+            .await
+            .unwrap();
+        assert!(second.ingest(&key).await.unwrap());
+
+        assert_eq!(index.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
     }
 
     #[cfg(feature = "graph")]
