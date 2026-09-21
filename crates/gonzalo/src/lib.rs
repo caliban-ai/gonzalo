@@ -226,10 +226,19 @@ pub mod ticket {
     pub use gonzalo_ticket_asana::AsanaSource;
 }
 
-/// Vector search: the `Embedder` trait and the indexes over it.
+/// Vector search: the `Embedder` trait, the indexes over it, and the durable
+/// index's manifest. `VectorManifest` lives in `gonzalo-core` rather than
+/// `gonzalo-vector` (ADR 0008's layering: `gonzalo gc`'s mark-set builder must
+/// parse it, and core cannot depend on a capability layer), but it is a
+/// vector-layer noun, so it is re-exported here rather than at the root — the
+/// same way the code-graph `Manifest` is not at the root either (ADR 0026).
 #[cfg(feature = "vector")]
 pub mod vector {
-    pub use gonzalo_vector::{Embedder, Match, MemoryVectorIndex, VectorIndex};
+    pub use gonzalo_core::VectorManifest;
+    pub use gonzalo_vector::{
+        DEFAULT_SHARDS, Embedder, Match, MemoryVectorIndex, RecordVectorIndex, VectorIndex,
+        shard_of,
+    };
 }
 
 /// The tree-sitter code graph.
@@ -371,6 +380,20 @@ mod facade_reexports {
     #[cfg(feature = "vector")]
     fn vector_lives_under_its_module() {
         let _: Option<(vector::Match, vector::MemoryVectorIndex)> = None;
+        let _ = vector::DEFAULT_SHARDS;
+        let _ = vector::shard_of;
+        let _: Option<vector::VectorManifest> = None;
+    }
+
+    // `RecordVectorIndex` needs a concrete `Store` to name, which only exists
+    // with `fs` enabled (the default). Split out so `vector` alone (were it
+    // ever built without `fs`) still exercises the rest of this module's shape.
+    #[test]
+    #[cfg(all(feature = "vector", feature = "fs"))]
+    fn vector_durable_index_lives_under_its_module() {
+        // A facade user with the `vector` feature must be able to reach the
+        // durable index (gonzalo#323 fix-round), not just the in-memory one.
+        let _: Option<vector::RecordVectorIndex<crate::FsStore>> = None;
     }
 
     #[test]

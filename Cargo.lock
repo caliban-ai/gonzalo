@@ -2327,7 +2327,9 @@ version = "0.7.0"
 dependencies = [
  "async-trait",
  "gonzalo-core",
+ "gonzalo-store-fs",
  "hnsw_rs",
+ "tempfile",
  "tokio",
 ]
 

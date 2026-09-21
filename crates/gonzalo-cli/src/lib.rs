@@ -872,11 +872,12 @@ pub struct GcSummary {
 ///
 /// Blobs are content-addressed and **shared** — identical content dedups across
 /// views and records alike — so GC marks against every record in the store at
-/// once. Three things keep a blob: a record whose body *is* the blob, a
-/// tombstone pinning the blob its record used to hold, and every slice a
-/// `graph-manifest` names (ADR 0012). Marking any one alone would delete the
-/// other two's content, so this scans raw (tombstones included) and unions all
-/// three via [`gonzalo_core::live_blob_hashes`].
+/// once. Four things keep a blob: a record whose body *is* the blob, a
+/// tombstone pinning the blob its record used to hold, every slice a
+/// `graph-manifest` names (ADR 0012), and every shard a `vector-manifest`
+/// names (ADR 0027). Marking any one alone would delete the other three's
+/// content, so this scans raw (tombstones included) and unions all four via
+/// [`gonzalo_core::live_blob_hashes`].
 ///
 /// Deleting a record therefore does not reclaim its bytes: the tombstone pins
 /// them until `collect` removes it past the horizon. Reclaiming is `delete`,

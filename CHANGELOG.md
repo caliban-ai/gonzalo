@@ -11,6 +11,42 @@ the patch version for fixes.
 
 ### Added
 
+- **Vectors now survive the process that built them.** A new
+  `RecordVectorIndex` persists a `VectorIndex` behind sharded,
+  content-addressed blobs named by a new `RecordKind::VectorManifest` record
+  (`MergeClass::Opaque`, since caller-supplied vectors can never be
+  re-derived the way a code-graph manifest can). `open(store, key, space,
+  dim)` declares an embedding space and dimension and errors naming both
+  values on a mismatch, at open and again on every OCC conflict, so two
+  handles racing to create the same missing index can't silently mix models.
+  Shard assignment (`shard_of`) and the default shard count
+  (`DEFAULT_SHARDS`, 256) now take `std::num::NonZeroU16`, so a zero shard
+  count is unrepresentable rather than a runtime panic waiting to happen.
+  `gonzalo gc` marks a vector manifest's shard blobs as live, the same way it
+  already marks a graph manifest's slices, so running GC against a store
+  holding a durable vector index is safe when no writer is mid-commit. A
+  sweep that lands between a write's shard upload and its manifest commit
+  deletes the new shard and leaves the index unopenable, and unlike a graph
+  slice the vectors cannot be regenerated, so do not run `gonzalo gc` while
+  vector writes are in flight. A durable index's writes commit under
+  optimistic concurrency, retrying up to 5 times on a conflict. Each commit is
+  checked against the manifest revision the writer's in-memory state came
+  from, so two writers on the same shard cannot silently overwrite each
+  other; and a conflict reloads every shard that changed, not only the ones
+  the write touched, so a writer that lost a race cannot later overwrite the
+  winner's vectors from stale memory. The `gonzalo` facade's `vector` module (behind the `vector`
+  feature) re-exports `RecordVectorIndex`, `DEFAULT_SHARDS`, `shard_of` and
+  `VectorManifest`, so a facade consumer can reach the durable index without
+  depending on `gonzalo-vector`/`gonzalo-core` directly. See [ADR
+  0027](docs/adr/0027-durable-vector-index.md). (#323)
+- **`KnowledgeStore::open` rebuilds chunk counts from a durable index.**
+  `KnowledgeStore.chunk_counts` only ever lived in memory, so a re-ingest of a
+  shrunk record after a restart used to leave its high-ordinal chunks behind
+  forever once the index itself became durable. `open(store, index,
+  embedder)` scans the index once via the new `VectorIndex::keys` (below) to
+  rebuild counts at construction; `KnowledgeStore::new` is unchanged and
+  still starts counts empty, which is correct for a fresh in-memory index.
+  (#323)
 - **Records carry their times.** `Meta.created` and `Meta.updated` were always
   `0`; the store now stamps both inside the same critical section that decides
   the write, exactly as it stamps a tombstone's `deleted_at`. `created` survives
@@ -69,6 +105,24 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: `VectorIndex` gains a required `keys` method.** There was no way
+  to enumerate an arbitrary index's contents, which is what `KnowledgeStore::open`
+  needs to rebuild derived state — its per-record chunk counts — after a
+  restart (`gonzalo gc` never calls `keys`; it marks a vector manifest's shard
+  blobs directly). `keys` has no default implementation and must be added by any
+  out-of-tree `VectorIndex` implementor. `upsert_many` was also added, but as
+  a default that loops over `upsert`, so it is not itself breaking —
+  `RecordVectorIndex` overrides it to batch a bulk load into one manifest
+  commit instead of one per vector, and the new `impl VectorIndex for Arc<T>`
+  forwards both methods (including `upsert_many`, explicitly, so a shared
+  `Arc` handle doesn't silently fall back to the looping default). See [ADR
+  0027](docs/adr/0027-durable-vector-index.md). (#323)
+- **`gonzalo-vector` now requires a tokio runtime.** `RecordVectorIndex::open`
+  reads shard blobs concurrently via `tokio::task::JoinSet::spawn`, which
+  panics outside a tokio runtime. `tokio` (feature `rt`) moved from a
+  dev-dependency to a real one. Every gonzalo binary already runs on tokio,
+  so nothing breaks today, but a future non-tokio consumer of `gonzalo-vector`
+  would need one to call `open`. (#323)
 - **BREAKING: the facade's surface is grouped into modules.** `gonzalo`
   re-exported 74 names flat, many of them ordinary nouns — `Actor`, `State`,
   `Provider`, `Container`, `Link`, `Topic`, `Session`, `Priority`, `Person` —

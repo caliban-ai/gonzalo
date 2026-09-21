@@ -45,9 +45,11 @@ pub struct KnowledgeStore<S, V, E> {
     index: V,
     embedder: E,
     /// Last-seen chunk count per record, so a re-ingest that shrinks a record
-    /// can remove the now-orphaned high-ordinal chunks from the index. Held
-    /// in-memory, matching the (currently in-memory) index's lifecycle — see the
-    /// design note in the module docs.
+    /// can remove the now-orphaned high-ordinal chunks from the index. Always
+    /// held in memory, so [`new`](Self::new) starts it empty — correct for a
+    /// fresh index with nothing indexed yet. [`open`](Self::open) rebuilds it
+    /// instead by scanning a durable index's existing keys, so counts survive
+    /// a restart even though this field itself does not.
     chunk_counts: std::sync::Mutex<std::collections::HashMap<gonzalo_core::RecordKey, usize>>,
 }
 
@@ -59,6 +61,30 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
             embedder,
             chunk_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Open over an index that may already hold vectors, rebuilding the chunk
+    /// counts from it.
+    ///
+    /// [`new`](Self::new) starts those counts empty, which is right for a fresh
+    /// in-memory index and wrong for a durable one: a re-ingest that shrinks a
+    /// record would not know how many chunks to remove, leaving orphans that
+    /// still match queries (#150). `KeyPrefix` cannot narrow below a collection,
+    /// so this scans once here rather than per ingest.
+    pub async fn open(store: S, index: V, embedder: E) -> Result<Self> {
+        let mut counts: std::collections::HashMap<gonzalo_core::RecordKey, usize> =
+            std::collections::HashMap::new();
+        for chunk in index.keys(&KeyPrefix::default()).await? {
+            let (parent, ordinal) = parent_key(&chunk);
+            let entry = counts.entry(parent).or_insert(0);
+            *entry = (*entry).max(ordinal + 1);
+        }
+        Ok(Self {
+            store,
+            index,
+            embedder,
+            chunk_counts: std::sync::Mutex::new(counts),
+        })
     }
 
     /// Borrow the underlying store (e.g. to put records before ingesting them).
@@ -279,6 +305,7 @@ pub fn chunk(record: &Record) -> Result<Option<Vec<String>>> {
         // semantic search (ADR 0022).
         RecordKind::Checkpoint
         | RecordKind::GraphManifest
+        | RecordKind::VectorManifest
         | RecordKind::Tombstone
         | RecordKind::Person
         | RecordKind::IdentityBinding
@@ -844,6 +871,121 @@ mod tests {
             keys,
             std::collections::BTreeSet::from([live1, live2]),
             "only the live records should remain"
+        );
+    }
+
+    // Re-ingesting a shrunk record must drop the chunks it no longer has — even
+    // when the counts were not built in this process. Before `open`, a restart
+    // resets them to zero and the orphans survive (#150, via #323).
+    #[tokio::test]
+    async fn counts_rebuilt_from_a_durable_index_still_drop_orphans() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(MemoryVectorIndex::default());
+        let key = RecordKey::new("ns", "coll", "doc");
+
+        // `chunk()` maps a Topic to one chunk per bullet, so bullet count is
+        // chunk count (crates/gonzalo-knowledge/src/lib.rs:250).
+        let three = Topic {
+            slug: "doc".into(),
+            bullets: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        };
+        put(
+            &FsStore::new(dir.path()),
+            record(&key, RecordKind::Topic, three.to_body().unwrap()),
+        )
+        .await;
+
+        // A first "process" ingests all three chunks.
+        let first = KnowledgeStore::new(FsStore::new(dir.path()), Arc::clone(&index), Bow);
+        assert!(first.ingest(&key).await.unwrap());
+        assert_eq!(index.keys(&KeyPrefix::default()).await.unwrap().len(), 3);
+        drop(first);
+
+        // The record shrinks to one bullet.
+        let one = Topic {
+            slug: "doc".into(),
+            bullets: vec!["alpha".into()],
+        };
+        let handle = FsStore::new(dir.path());
+        let existing = handle.get(&key).await.unwrap().unwrap();
+        let shrunk = existing.update(
+            one.to_body().unwrap(),
+            Meta::new(Identity::new("test"), "test"),
+        );
+        assert!(matches!(
+            handle.put(shrunk, Some(existing.revision)).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+
+        // A second "process" opens over the same durable index and re-ingests.
+        // Chunks 1 and 2 must go; with `new` instead of `open` they would stay.
+        let second = KnowledgeStore::open(FsStore::new(dir.path()), Arc::clone(&index), Bow)
+            .await
+            .unwrap();
+        assert!(second.ingest(&key).await.unwrap());
+
+        assert_eq!(index.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+    }
+
+    // F9 (#323 fix-round): a gap in stored ordinals must not undercount.
+    // `open` rebuilds each record's count as `max(ordinal + 1)` over its
+    // chunks, not the number of keys present, so ordinals {0, 2} (1 absent)
+    // must rebuild to 3. A gap like this is reachable in practice: `ingest`'s
+    // orphan-removal loop (`for ordinal in chunks.len()..old`) removes
+    // ordinals one at a time in ascending order, so a crash partway through
+    // can leave a lower ordinal removed while a higher one survives.
+    #[tokio::test]
+    async fn open_rebuilds_the_count_across_a_non_contiguous_ordinal_gap() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(MemoryVectorIndex::default());
+        let parent = RecordKey::new("ns", "coll", "doc");
+
+        // Ordinals {0, 2} present, 1 absent. `MemoryVectorIndex` enforces one
+        // dimension across everything it holds, so these must match what
+        // `Bow` (32) will later embed on re-ingest.
+        index
+            .upsert(chunk_key(&parent, 0), vec![1.0; 32])
+            .await
+            .unwrap();
+        index
+            .upsert(chunk_key(&parent, 2), vec![1.0; 32])
+            .await
+            .unwrap();
+
+        put(
+            &FsStore::new(dir.path()),
+            record(
+                &parent,
+                RecordKind::Topic,
+                Topic {
+                    slug: "doc".into(),
+                    bullets: vec!["only bullet".into()],
+                }
+                .to_body()
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        let ks = KnowledgeStore::open(FsStore::new(dir.path()), Arc::clone(&index), Bow)
+            .await
+            .unwrap();
+
+        // The record now has one chunk (ordinal 0). Re-ingesting must remove
+        // ordinals 1 and 2 as orphans -- reachable only if `open` rebuilt the
+        // count as 3 (the highest surviving ordinal + 1). A naive count of 2
+        // (the number of keys present) would leave ordinal 2's entry behind,
+        // since the removal loop would only run `1..2`.
+        assert!(ks.ingest(&parent).await.unwrap());
+
+        assert_eq!(
+            index.keys(&KeyPrefix::default()).await.unwrap().len(),
+            1,
+            "the gap-created ordinal-2 orphan must have been removed on re-ingest"
         );
     }
 

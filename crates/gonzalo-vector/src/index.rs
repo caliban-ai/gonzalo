@@ -70,6 +70,19 @@ impl MemoryVectorIndex {
         }
         Ok(())
     }
+
+    /// Entries whose key satisfies `pred`.
+    ///
+    /// Predicate-shaped rather than shard-shaped so sharding does not leak into
+    /// the in-memory index; a durable backend passes its own shard test here and
+    /// clones one shard rather than the whole index.
+    pub fn collect_where(&self, pred: impl Fn(&RecordKey) -> bool) -> Vec<(RecordKey, Vec<f32>)> {
+        let map = self.store.lock().expect("mutex poisoned");
+        map.iter()
+            .filter(|(key, _)| pred(key))
+            .map(|(key, vector)| (key.clone(), vector.clone()))
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -110,6 +123,11 @@ impl VectorIndex for MemoryVectorIndex {
 
         matches.truncate(k);
         Ok(matches)
+    }
+
+    async fn keys(&self, filter: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        let map = self.store.lock().expect("mutex poisoned");
+        Ok(map.keys().filter(|k| filter.matches(k)).cloned().collect())
     }
 }
 
@@ -417,5 +435,70 @@ mod tests {
             matches!(err, CoreError::Backend(ref msg) if msg.contains("dimension mismatch")),
             "unexpected error: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #323: keys, upsert_many, and collect_where
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn keys_lists_everything_under_the_filter() {
+        let idx = MemoryVectorIndex::new();
+        idx.upsert(RecordKey::new("ns", "a", "1"), vec![1.0])
+            .await
+            .unwrap();
+        idx.upsert(RecordKey::new("ns", "b", "2"), vec![2.0])
+            .await
+            .unwrap();
+
+        let all = idx.keys(&KeyPrefix::default()).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let only_a = idx
+            .keys(&KeyPrefix {
+                namespace: None,
+                collection: Some("a".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(only_a, vec![RecordKey::new("ns", "a", "1")]);
+    }
+
+    #[tokio::test]
+    async fn an_arc_delegates_every_method_including_upsert_many() {
+        use std::sync::Arc;
+        let idx: Arc<MemoryVectorIndex> = Arc::new(MemoryVectorIndex::new());
+        idx.upsert_many(vec![(RecordKey::new("ns", "c", "1"), vec![1.0])])
+            .await
+            .unwrap();
+        assert_eq!(idx.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+        idx.remove(&RecordKey::new("ns", "c", "1")).await.unwrap();
+        assert!(idx.keys(&KeyPrefix::default()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_many_inserts_every_item() {
+        let idx = MemoryVectorIndex::new();
+        idx.upsert_many(vec![
+            (RecordKey::new("ns", "c", "1"), vec![1.0]),
+            (RecordKey::new("ns", "c", "2"), vec![2.0]),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(idx.keys(&KeyPrefix::default()).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_where_returns_only_matching_entries() {
+        let idx = MemoryVectorIndex::new();
+        idx.upsert(RecordKey::new("ns", "c", "keep"), vec![1.0])
+            .await
+            .unwrap();
+        idx.upsert(RecordKey::new("ns", "c", "drop"), vec![2.0])
+            .await
+            .unwrap();
+
+        let got = idx.collect_where(|k| k.id == "keep");
+        assert_eq!(got, vec![(RecordKey::new("ns", "c", "keep"), vec![1.0])]);
     }
 }

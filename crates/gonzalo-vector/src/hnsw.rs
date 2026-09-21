@@ -212,6 +212,16 @@ impl VectorIndex for HnswVectorIndex {
         matches.truncate(k);
         Ok(matches)
     }
+
+    async fn keys(&self, filter: &KeyPrefix) -> Result<Vec<RecordKey>> {
+        let inner = self.inner.lock().expect("mutex poisoned");
+        Ok(inner
+            .key_to_id
+            .keys()
+            .filter(|k| filter.matches(k))
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]

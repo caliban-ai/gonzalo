@@ -1,12 +1,12 @@
 //! Mark-sweep garbage collection for blobs (ADR 0012, gonzalo#292).
 //!
 //! A blob is *live* iff some stored record still points at it: as a record's
-//! own [`Body::Blob`], as the blob a tombstone pins, or as a slice a graph
-//! manifest names. GC marks that union and sweeps every stored blob outside
-//! it. Liveness is derived from the records themselves rather than a maintained
-//! refcount, so it is self-correcting: a missed event can leave a blob briefly
-//! un-swept, never wrongly deleted, and never leaked forever the way a drifted
-//! refcount would.
+//! own [`Body::Blob`], as the blob a tombstone pins, as a slice a graph
+//! manifest names, or as a shard a vector manifest names. GC marks that union
+//! and sweeps every stored blob outside it. Liveness is derived from the
+//! records themselves rather than a maintained refcount, so it is
+//! self-correcting: a missed event can leave a blob briefly un-swept, never
+//! wrongly deleted, and never leaked forever the way a drifted refcount would.
 
 use crate::{BlobStore, Body, ContentHash, KeyPrefix, Manifest, Record, RecordKind, Result, Store};
 use std::collections::BTreeSet;
@@ -47,7 +47,7 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 /// The mark set: every blob hash these records still need. `records` must be
 /// the store's **raw** records, tombstones included.
 ///
-/// Three things reference a blob (gonzalo#292):
+/// Four things reference a blob (gonzalo#292, gonzalo#323):
 ///
 /// - a record whose body is a [`Body::Blob`] — the bytes are its content;
 /// - a tombstone's [`deleted_blob`](Record::deleted_blob). **A tombstone pins
@@ -57,9 +57,11 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 ///   long as the tombstone: collecting it past the horizon releases the blob to
 ///   the next sweep;
 /// - every slice a graph manifest names (ADR 0012) — blobs referenced from a
-///   record's *contents* rather than from its body.
+///   record's *contents* rather than from its body;
+/// - every shard a vector manifest names (ADR 0027) — the same
+///   contents-not-body reference, for a durable vector index's shard blobs.
 ///
-/// Marking any one of the three alone deletes the other two's blobs, so this
+/// Marking any one of the four alone deletes the other three's blobs, so this
 /// unions them from the records rather than from a caller's idea of liveness.
 pub fn live_blob_hashes<'a>(
     records: impl IntoIterator<Item = &'a Record>,
@@ -74,6 +76,16 @@ pub fn live_blob_hashes<'a>(
         }
         if record.kind == RecordKind::GraphManifest {
             live.extend(Manifest::from_body(&record.body)?.entries.into_values());
+        }
+        // A vector manifest's shards are live blobs. Without this the next sweep
+        // deletes every vector in the index while the manifest still names them,
+        // and — unlike a graph slice — they cannot be regenerated from source.
+        if record.kind == RecordKind::VectorManifest {
+            live.extend(
+                crate::VectorManifest::from_body(&record.body)?
+                    .entries
+                    .into_values(),
+            );
         }
     }
     Ok(live)
@@ -252,6 +264,57 @@ mod tests {
             Body::Inline(b"{[".to_vec()),
         );
         assert!(live_blob_hashes([&r]).is_err());
+    }
+
+    // Guard test, symmetric to
+    // `mark_set_reports_an_undecodable_manifest_rather_than_sweeping_it`
+    // above: silently treating an undecodable `VectorManifest` body as
+    // "references nothing" would sweep every shard it actually named. Passes
+    // against current code by design -- the `VectorManifest` arm already
+    // propagates `VectorManifest::from_body`'s error via `?` rather than
+    // swallowing it with `.ok()`; this guards against someone changing that
+    // later.
+    #[test]
+    fn mark_set_reports_an_undecodable_vector_manifest_rather_than_sweeping_it() {
+        let r = record(
+            "memories",
+            RecordKind::VectorManifest,
+            Body::Inline(b"not json at all".to_vec()),
+        );
+        assert!(live_blob_hashes([&r]).is_err());
+    }
+
+    // Red-first guard on real data loss: before the VectorManifest arm exists,
+    // the mark set misses every shard blob and a sweep deletes live vectors.
+    #[test]
+    fn live_set_includes_vector_manifest_shards() {
+        use crate::VectorManifest;
+
+        let mut vm = VectorManifest::new("bge-small-en-v1.5", 384, 256);
+        vm.entries.insert(0, h("shard-0"));
+        vm.entries.insert(9, h("shard-9"));
+
+        let rec = record("memories", RecordKind::VectorManifest, vm.to_body());
+
+        let live = live_blob_hashes([&rec]).unwrap();
+        assert!(live.contains(&h("shard-0")));
+        assert!(live.contains(&h("shard-9")));
+    }
+
+    #[test]
+    fn a_graph_manifest_and_a_vector_manifest_both_mark() {
+        use crate::VectorManifest;
+
+        let mut gm = Manifest::new();
+        gm.insert("src/lib.rs", h("slice"));
+        let graph = record("view", RecordKind::GraphManifest, gm.to_body());
+
+        let mut vm = VectorManifest::new("space", 8, 4);
+        vm.entries.insert(1, h("shard"));
+        let vector = record("memories", RecordKind::VectorManifest, vm.to_body());
+
+        let live = live_blob_hashes([&graph, &vector]).unwrap();
+        assert_eq!(live, BTreeSet::from([h("slice"), h("shard")]));
     }
 
     /// A `BlobStore` whose `list_blobs` returns a fixed, possibly-duplicated

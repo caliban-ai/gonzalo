@@ -149,3 +149,43 @@ for larger collections ([ADR 0014](./adr/0014-approximate-vector-index-backend.m
 `gonzalo-embed` provides a local CPU embedder built on Candle and all-MiniLM
 ([ADR 0013](./adr/0013-local-candle-embedder.md)). It is a separate crate, not a
 facade feature.
+
+### A durable vector index
+
+`RecordVectorIndex` persists vectors behind the same `VectorIndex` trait, so
+recall survives the process that built it — the working case is
+caller-supplied embeddings (an embedder gonzalo never runs, so it can never
+rebuild an index by re-embedding) ([ADR 0027](./adr/0027-durable-vector-index.md)).
+
+Vectors are bucketed into a fixed number of shards (256 by default), each one
+a content-addressed blob, named by a **vector manifest** record. A manifest
+records the embedding space, the dimension, the shard count, and which blob
+holds each shard's vectors — the same content-addressing the rest of gonzalo
+uses for blobs, so an unchanged shard costs nothing extra to rewrite.
+
+`open(store, key, space, dim)` **declares an embedding space and dimension**.
+Opening against a manifest whose stored space or dimension disagrees is an
+error naming both values: a swapped embedder is caught once, loudly, at
+startup, rather than producing silently wrong rankings on every query after.
+This is a declared value, not a verified one — gonzalo never sees the model
+that produced a vector, so it can catch configuration drift but not a caller
+that mislabels its vectors on purpose or by mistake.
+
+**One writer per index.** Optimistic concurrency detects a second writer and
+retries; it does not merge two writers' changes. A second writer's queries can
+be served from a shard it hasn't refreshed yet until it reopens, though a
+concurrent writer's actual commits are never silently lost — a conflict
+reloads every shard that changed and retries.
+
+`gonzalo gc` already treats a vector manifest's shard blobs as live, the same
+way it treats a code-graph manifest's slices, so running GC against a store
+holding a durable vector index is safe when no writer is mid-commit. A sweep
+that lands between a commit's shard-blob write and its manifest write can
+still delete the not-yet-referenced shard, which is unrecoverable for vectors
+since they cannot be regenerated the way graph slices can — see
+[ADR 0027](./adr/0027-durable-vector-index.md#consequences).
+
+The whole index loads into memory when opened — there is no partial or paged
+load — so this is the right shape for the thousands-to-~100k-chunk working
+set, not for scale beyond it; an external backend (#202) is the answer there,
+still behind the unchanged `VectorIndex` trait.
