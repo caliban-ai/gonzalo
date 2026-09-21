@@ -45,9 +45,11 @@ pub struct KnowledgeStore<S, V, E> {
     index: V,
     embedder: E,
     /// Last-seen chunk count per record, so a re-ingest that shrinks a record
-    /// can remove the now-orphaned high-ordinal chunks from the index. Held
-    /// in-memory, matching the (currently in-memory) index's lifecycle — see the
-    /// design note in the module docs.
+    /// can remove the now-orphaned high-ordinal chunks from the index. Always
+    /// held in memory, so [`new`](Self::new) starts it empty — correct for a
+    /// fresh index with nothing indexed yet. [`open`](Self::open) rebuilds it
+    /// instead by scanning a durable index's existing keys, so counts survive
+    /// a restart even though this field itself does not.
     chunk_counts: std::sync::Mutex<std::collections::HashMap<gonzalo_core::RecordKey, usize>>,
 }
 
@@ -925,6 +927,66 @@ mod tests {
         assert!(second.ingest(&key).await.unwrap());
 
         assert_eq!(index.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+    }
+
+    // F9 (#323 fix-round): a gap in stored ordinals must not undercount.
+    // `open` rebuilds each record's count as `max(ordinal + 1)` over its
+    // chunks, not the number of keys present, so ordinals {0, 2} (1 absent)
+    // must rebuild to 3. A gap like this is reachable in practice: `ingest`'s
+    // orphan-removal loop (`for ordinal in chunks.len()..old`) removes
+    // ordinals one at a time in ascending order, so a crash partway through
+    // can leave a lower ordinal removed while a higher one survives.
+    #[tokio::test]
+    async fn open_rebuilds_the_count_across_a_non_contiguous_ordinal_gap() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(MemoryVectorIndex::default());
+        let parent = RecordKey::new("ns", "coll", "doc");
+
+        // Ordinals {0, 2} present, 1 absent. `MemoryVectorIndex` enforces one
+        // dimension across everything it holds, so these must match what
+        // `Bow` (32) will later embed on re-ingest.
+        index
+            .upsert(chunk_key(&parent, 0), vec![1.0; 32])
+            .await
+            .unwrap();
+        index
+            .upsert(chunk_key(&parent, 2), vec![1.0; 32])
+            .await
+            .unwrap();
+
+        put(
+            &FsStore::new(dir.path()),
+            record(
+                &parent,
+                RecordKind::Topic,
+                Topic {
+                    slug: "doc".into(),
+                    bullets: vec!["only bullet".into()],
+                }
+                .to_body()
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        let ks = KnowledgeStore::open(FsStore::new(dir.path()), Arc::clone(&index), Bow)
+            .await
+            .unwrap();
+
+        // The record now has one chunk (ordinal 0). Re-ingesting must remove
+        // ordinals 1 and 2 as orphans -- reachable only if `open` rebuilt the
+        // count as 3 (the highest surviving ordinal + 1). A naive count of 2
+        // (the number of keys present) would leave ordinal 2's entry behind,
+        // since the removal loop would only run `1..2`.
+        assert!(ks.ingest(&parent).await.unwrap());
+
+        assert_eq!(
+            index.keys(&KeyPrefix::default()).await.unwrap().len(),
+            1,
+            "the gap-created ordinal-2 orphan must have been removed on re-ingest"
+        );
     }
 
     #[cfg(feature = "graph")]

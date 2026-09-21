@@ -55,7 +55,11 @@ impl VectorManifest {
 
     /// The collection segment every vector manifest is addressed under. A
     /// [`KeyPrefix`](crate::KeyPrefix) with this collection and no namespace
-    /// lists every index's manifest — the set GC must union to mark live shards.
+    /// lists every index's manifest. This is a naming convention for callers,
+    /// not the set GC unions: GC marks by
+    /// [`RecordKind::VectorManifest`](crate::RecordKind::VectorManifest) while
+    /// scanning every record regardless of collection, and a durable index's
+    /// `open` accepts a manifest [`key`](Self::key) under any namespace.
     pub fn collection() -> &'static str {
         MANIFEST_COLLECTION
     }

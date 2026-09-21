@@ -1,12 +1,12 @@
 //! Mark-sweep garbage collection for blobs (ADR 0012, gonzalo#292).
 //!
 //! A blob is *live* iff some stored record still points at it: as a record's
-//! own [`Body::Blob`], as the blob a tombstone pins, or as a slice a graph
-//! manifest names. GC marks that union and sweeps every stored blob outside
-//! it. Liveness is derived from the records themselves rather than a maintained
-//! refcount, so it is self-correcting: a missed event can leave a blob briefly
-//! un-swept, never wrongly deleted, and never leaked forever the way a drifted
-//! refcount would.
+//! own [`Body::Blob`], as the blob a tombstone pins, as a slice a graph
+//! manifest names, or as a shard a vector manifest names. GC marks that union
+//! and sweeps every stored blob outside it. Liveness is derived from the
+//! records themselves rather than a maintained refcount, so it is
+//! self-correcting: a missed event can leave a blob briefly un-swept, never
+//! wrongly deleted, and never leaked forever the way a drifted refcount would.
 
 use crate::{BlobStore, Body, ContentHash, KeyPrefix, Manifest, Record, RecordKind, Result, Store};
 use std::collections::BTreeSet;
@@ -47,7 +47,7 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 /// The mark set: every blob hash these records still need. `records` must be
 /// the store's **raw** records, tombstones included.
 ///
-/// Three things reference a blob (gonzalo#292):
+/// Four things reference a blob (gonzalo#292, gonzalo#323):
 ///
 /// - a record whose body is a [`Body::Blob`] — the bytes are its content;
 /// - a tombstone's [`deleted_blob`](Record::deleted_blob). **A tombstone pins
@@ -57,9 +57,11 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 ///   long as the tombstone: collecting it past the horizon releases the blob to
 ///   the next sweep;
 /// - every slice a graph manifest names (ADR 0012) — blobs referenced from a
-///   record's *contents* rather than from its body.
+///   record's *contents* rather than from its body;
+/// - every shard a vector manifest names (ADR 0027) — the same
+///   contents-not-body reference, for a durable vector index's shard blobs.
 ///
-/// Marking any one of the three alone deletes the other two's blobs, so this
+/// Marking any one of the four alone deletes the other three's blobs, so this
 /// unions them from the records rather than from a caller's idea of liveness.
 pub fn live_blob_hashes<'a>(
     records: impl IntoIterator<Item = &'a Record>,
@@ -260,6 +262,24 @@ mod tests {
             "view",
             RecordKind::GraphManifest,
             Body::Inline(b"{[".to_vec()),
+        );
+        assert!(live_blob_hashes([&r]).is_err());
+    }
+
+    // Guard test, symmetric to
+    // `mark_set_reports_an_undecodable_manifest_rather_than_sweeping_it`
+    // above: silently treating an undecodable `VectorManifest` body as
+    // "references nothing" would sweep every shard it actually named. Passes
+    // against current code by design -- the `VectorManifest` arm already
+    // propagates `VectorManifest::from_body`'s error via `?` rather than
+    // swallowing it with `.ok()`; this guards against someone changing that
+    // later.
+    #[test]
+    fn mark_set_reports_an_undecodable_vector_manifest_rather_than_sweeping_it() {
+        let r = record(
+            "memories",
+            RecordKind::VectorManifest,
+            Body::Inline(b"not json at all".to_vec()),
         );
         assert!(live_blob_hashes([&r]).is_err());
     }
