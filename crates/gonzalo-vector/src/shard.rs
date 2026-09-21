@@ -5,10 +5,14 @@
 //! unchanged shard content-addresses to the blob already stored.
 
 use gonzalo_core::{ContentHash, CoreError, RecordKey, Result};
+use std::num::NonZeroU16;
 
 /// Default number of shards for a new index. At ~100k chunks of 384 f32s this
 /// is ~600 KB per shard: 256 reads to open, one ~600 KB rewrite per upsert.
-pub const DEFAULT_SHARDS: u16 = 256;
+pub const DEFAULT_SHARDS: NonZeroU16 = match NonZeroU16::new(256) {
+    Some(n) => n,
+    None => panic!("256 is nonzero"),
+};
 
 const MAGIC: &[u8; 4] = b"GZVS";
 const VERSION: u8 = 1;
@@ -18,15 +22,11 @@ const VERSION: u8 = 1;
 /// Uses blake3 via [`ContentHash`] rather than [`std::hash::DefaultHasher`],
 /// whose output is explicitly not stable across releases — a drift there would
 /// silently strand every vector in every existing index.
-///
-/// # Panics
-/// Panics if `shards == 0`.
-pub fn shard_of(key: &RecordKey, shards: u16) -> u16 {
-    assert!(shards > 0, "shards must be > 0");
+pub fn shard_of(key: &RecordKey, shards: NonZeroU16) -> u16 {
     let s = format!("{}/{}/{}", key.namespace, key.collection, key.id);
     let hex = ContentHash::of(s.as_bytes()).0;
     let bits = u16::from_str_radix(&hex[..4], 16).expect("blake3 hex is 64 hex digits");
-    bits % shards
+    bits % shards.get()
 }
 
 /// Encode one shard. Entries are sorted by key, so identical contents always
@@ -72,9 +72,10 @@ pub fn decode_shard(bytes: &[u8]) -> Result<(usize, Vec<(RecordKey, Vec<f32>)>)>
     let count = r.u32()? as usize;
 
     // Cap the allocation by what the remaining input could actually contain.
-    // Each entry needs at least 4 bytes (lengths) + dim * 4 bytes (floats).
+    // Each entry needs at least 8 bytes (two u16-length fields for namespace and
+    // collection) + 4 bytes (id length) + dim * 4 bytes (floats).
     let remaining = bytes.len().saturating_sub(r.at);
-    let min_entry_size = 4_usize.saturating_add(dim.saturating_mul(4));
+    let min_entry_size = 8_usize.saturating_add(dim.saturating_mul(4));
     let max_count = remaining.checked_div(min_entry_size).unwrap_or(usize::MAX);
     if count > max_count {
         return Err(CoreError::Backend(
@@ -148,7 +149,8 @@ mod tests {
     #[test]
     fn shard_assignment_is_stable_across_calls() {
         let k = key("a");
-        assert_eq!(shard_of(&k, 256), shard_of(&k, 256));
+        let shards = NonZeroU16::new(256).unwrap();
+        assert_eq!(shard_of(&k, shards), shard_of(&k, shards));
     }
 
     // The assignment must not drift between releases, or every existing index
@@ -156,13 +158,14 @@ mod tests {
     // an accidental change to the hashing fail loudly here.
     #[test]
     fn shard_assignment_is_pinned_to_a_known_value() {
-        assert_eq!(shard_of(&key("a"), 256), 121);
+        assert_eq!(shard_of(&key("a"), NonZeroU16::new(256).unwrap()), 121);
     }
 
     #[test]
     fn shard_assignment_respects_the_shard_count() {
+        let shards = NonZeroU16::new(4).unwrap();
         for i in 0..100 {
-            assert!(shard_of(&key(&i.to_string()), 4) < 4);
+            assert!(shard_of(&key(&i.to_string()), shards) < 4);
         }
     }
 
@@ -241,13 +244,5 @@ mod tests {
         bytes.extend_from_slice(&(u32::MAX).to_le_bytes()); // dim = u32::MAX
         bytes.extend_from_slice(&(1u32).to_le_bytes()); // count = 1
         assert!(matches!(decode_shard(&bytes), Err(CoreError::Backend(_))));
-    }
-
-    #[test]
-    #[should_panic(expected = "shards must be > 0")]
-    fn shard_of_requires_nonzero_shard_count() {
-        // shard_of panics on zero shards with a clear message.
-        let k = key("a");
-        let _ = shard_of(&k, 0);
     }
 }
