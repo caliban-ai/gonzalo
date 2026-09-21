@@ -18,7 +18,11 @@ const VERSION: u8 = 1;
 /// Uses blake3 via [`ContentHash`] rather than [`std::hash::DefaultHasher`],
 /// whose output is explicitly not stable across releases — a drift there would
 /// silently strand every vector in every existing index.
+///
+/// # Panics
+/// Panics if `shards == 0`.
 pub fn shard_of(key: &RecordKey, shards: u16) -> u16 {
+    assert!(shards > 0, "shards must be > 0");
     let s = format!("{}/{}/{}", key.namespace, key.collection, key.id);
     let hex = ContentHash::of(s.as_bytes()).0;
     let bits = u16::from_str_radix(&hex[..4], 16).expect("blake3 hex is 64 hex digits");
@@ -49,6 +53,9 @@ pub fn encode_shard(dim: usize, entries: &[(RecordKey, Vec<f32>)]) -> Vec<u8> {
 }
 
 /// Decode one shard, returning its dimension and entries.
+///
+/// Rejects corrupted or truncated blobs as `CoreError::Backend`, including those
+/// with unbounded length fields that could cause allocation failures.
 #[allow(clippy::type_complexity)]
 pub fn decode_shard(bytes: &[u8]) -> Result<(usize, Vec<(RecordKey, Vec<f32>)>)> {
     let mut r = Reader { bytes, at: 0 };
@@ -64,14 +71,25 @@ pub fn decode_shard(bytes: &[u8]) -> Result<(usize, Vec<(RecordKey, Vec<f32>)>)>
     let dim = r.u32()? as usize;
     let count = r.u32()? as usize;
 
-    let mut entries = Vec::with_capacity(count);
+    // Cap the allocation by what the remaining input could actually contain.
+    // Each entry needs at least 4 bytes (lengths) + dim * 4 bytes (floats).
+    let remaining = bytes.len().saturating_sub(r.at);
+    let min_entry_size = 4_usize.saturating_add(dim.saturating_mul(4));
+    let max_count = remaining.checked_div(min_entry_size).unwrap_or(usize::MAX);
+    if count > max_count {
+        return Err(CoreError::Backend(
+            "vector shard: entry count exceeds remaining data".into(),
+        ));
+    }
+
+    let mut entries = Vec::new();
     for _ in 0..count {
         let namespace = r.str16()?;
         let collection = r.str16()?;
         let id_len = r.u32()? as usize;
         let id = String::from_utf8(r.take(id_len)?.to_vec())
             .map_err(|e| CoreError::Backend(format!("vector shard: bad utf8 in id: {e}")))?;
-        let mut vector = Vec::with_capacity(dim);
+        let mut vector = Vec::new();
         for _ in 0..dim {
             let b: [u8; 4] = r.take(4)?.try_into().expect("took exactly 4 bytes");
             vector.push(f32::from_le_bytes(b));
@@ -199,5 +217,37 @@ mod tests {
             decode_shard(truncated),
             Err(CoreError::Backend(_))
         ));
+    }
+
+    #[test]
+    fn decode_rejects_a_huge_entry_count() {
+        // A shard with count field set to u32::MAX but only a few actual bytes.
+        // Should reject this without attempting a multi-gigabyte allocation.
+        let mut bytes = vec![];
+        bytes.extend_from_slice(b"GZVS");
+        bytes.push(1); // version
+        bytes.extend_from_slice(&(1u32).to_le_bytes()); // dim = 1
+        bytes.extend_from_slice(&(u32::MAX).to_le_bytes()); // count = u32::MAX
+        assert!(matches!(decode_shard(&bytes), Err(CoreError::Backend(_))));
+    }
+
+    #[test]
+    fn decode_rejects_a_huge_dimension() {
+        // A shard with dim field set to u32::MAX but only a few actual bytes.
+        // Should reject this without attempting a multi-gigabyte allocation.
+        let mut bytes = vec![];
+        bytes.extend_from_slice(b"GZVS");
+        bytes.push(1); // version
+        bytes.extend_from_slice(&(u32::MAX).to_le_bytes()); // dim = u32::MAX
+        bytes.extend_from_slice(&(1u32).to_le_bytes()); // count = 1
+        assert!(matches!(decode_shard(&bytes), Err(CoreError::Backend(_))));
+    }
+
+    #[test]
+    #[should_panic(expected = "shards must be > 0")]
+    fn shard_of_requires_nonzero_shard_count() {
+        // shard_of panics on zero shards with a clear message.
+        let k = key("a");
+        let _ = shard_of(&k, 0);
     }
 }
