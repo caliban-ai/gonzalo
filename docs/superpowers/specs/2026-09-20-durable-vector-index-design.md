@@ -150,8 +150,11 @@ impl<S: Store + BlobStore> RecordVectorIndex<S> {
 impl<S: Store + BlobStore> VectorIndex for RecordVectorIndex<S> { /* … */ }
 ```
 
-Two additions to the `VectorIndex` trait, both with default implementations so
-`MemoryVectorIndex` and `HnswVectorIndex` keep compiling unchanged:
+Two additions to the `VectorIndex` trait. `upsert_many` gets a default so
+existing implementations keep compiling unchanged; `keys` cannot — there is no
+way to enumerate an arbitrary index — so it is required and implemented for each
+of the three in-tree implementations. A default returning an error would turn a
+compile-time gap into a runtime one.
 
 ```rust
 /// Insert or replace many vectors. The default loops over `upsert`;
