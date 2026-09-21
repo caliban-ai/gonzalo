@@ -363,10 +363,10 @@ Pure functions, no I/O, no store — everything here is unit-testable in isolati
 **Interfaces:**
 - Consumes: `gonzalo_core::{ContentHash, CoreError, RecordKey, Result}`.
 - Produces:
-  - `pub fn shard_of(key: &RecordKey, shards: u16) -> u16`
+  - `pub fn shard_of(key: &RecordKey, shards: NonZeroU16) -> u16`
   - `pub fn encode_shard(dim: usize, entries: &[(RecordKey, Vec<f32>)]) -> Vec<u8>`
   - `pub fn decode_shard(bytes: &[u8]) -> Result<(usize, Vec<(RecordKey, Vec<f32>)>)>` returning `(dim, entries)`
-  - `pub const DEFAULT_SHARDS: u16 = 256;`
+  - `pub const DEFAULT_SHARDS: NonZeroU16` (256)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -805,7 +805,7 @@ git commit -m "$(printf 'feat(vector): add upsert_many and keys to VectorIndex (
 
 **Interfaces:**
 - Consumes: `shard_of`, `decode_shard`, `DEFAULT_SHARDS` (Task 3); `VectorManifest` and `RecordKind::VectorManifest` (Task 1); `MemoryVectorIndex::collect_where` and the trait methods (Task 4).
-- Produces: `RecordVectorIndex<S>` with `open(store: S, key: RecordKey, space: &str, dim: usize) -> Result<Self>`, `open_with_shards(store, key, space, dim, shards)`, and `store(&self) -> &S`.
+- Produces: `RecordVectorIndex<S>` with `open(store: S, key: RecordKey, space: &str, dim: usize) -> Result<Self>`, `open_with_shards(store, key, space, dim, shards: NonZeroU16)`, and `store(&self) -> &S`.
 
 - [ ] **Step 1: Add the dev-dependencies**
 
@@ -976,6 +976,7 @@ use gonzalo_core::{
     Result, Store, VectorManifest,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU16;
 
 /// How many shard blobs to read at once when opening. Matches
 /// `LIST_READ_CONCURRENCY` in `gonzalo-store-s3`, which settled on 16 for the
@@ -997,7 +998,7 @@ pub struct RecordVectorIndex<S> {
     key: RecordKey,
     space: String,
     dim: usize,
-    shards: u16,
+    shards: NonZeroU16,
     inner: MemoryVectorIndex,
     meta: Meta,
 }
@@ -1020,7 +1021,7 @@ impl<S: Store + BlobStore> RecordVectorIndex<S> {
         key: RecordKey,
         space: &str,
         dim: usize,
-        shards: u16,
+        shards: NonZeroU16,
     ) -> Result<Self> {
         let existing = store.get(&key).await?;
         let (shards, manifest) = match &existing {
@@ -1039,7 +1040,14 @@ impl<S: Store + BlobStore> RecordVectorIndex<S> {
                         m.dim, dim
                     )));
                 }
-                (m.shards, Some(m))
+                // A stored shard count of zero means the manifest is corrupt.
+                // Surface it here rather than letting it reach `shard_of`.
+                let stored = NonZeroU16::new(m.shards).ok_or_else(|| {
+                    CoreError::Backend(format!(
+                        "vector index {key}: manifest declares 0 shards"
+                    ))
+                })?;
+                (stored, Some(m))
             }
         };
 
@@ -1299,7 +1307,7 @@ In `crates/gonzalo-vector/src/record_index.rs`, add to `impl<S: Store + BlobStor
             let existing = self.store.get(&self.key).await?;
             let mut manifest = match &existing {
                 Some(record) => VectorManifest::from_body(&record.body)?,
-                None => VectorManifest::new(&self.space, self.dim, self.shards),
+                None => VectorManifest::new(&self.space, self.dim, self.shards.get()),
             };
             for (id, hash) in &blobs {
                 manifest.entries.insert(*id, hash.clone());
