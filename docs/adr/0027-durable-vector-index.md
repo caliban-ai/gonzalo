@@ -235,48 +235,58 @@ correctly starts with empty counts.
 
 ## Consequences
 
-**Positive:**
-
-- Recall survives the process that built it — the entire point of the ticket.
-  An acceptance test (`crates/gonzalo-vector/tests/durability.rs`) writes
-  10,000 vectors, drops the handle, reopens, and queries. Measured reopen
-  time: **258 ms in a release build, 3.43 s in debug**, at **dimension 16**.
-  A real embedding is 384-dimensional — 24× the bytes per vector — so this
-  proves the path works at realistic *count* and understates its cost at
+- **Positive:** recall survives the process that built it — the entire point
+  of the ticket. An acceptance test (`crates/gonzalo-vector/tests/durability.rs`)
+  writes 10,000 vectors, drops the handle, reopens, and queries. Measured
+  reopen time: **258 ms in a release build, 3.43 s in debug**, at **dimension
+  16**. A real embedding is 384-dimensional — 24× the bytes per vector — so
+  this proves the path works at realistic *count* and understates its cost at
   realistic *width*; it is not the number to quote for opening a real
-  10,000-chunk index.
-- `gonzalo gc`'s mark set already covers vector shard blobs, so the existing
-  GC path needs no separate opt-in or follow-up to be safe against this
-  change.
-- An external vector backend (#202) still plugs in at the unchanged
+  10,000-chunk index. `gonzalo gc`'s mark set already covers vector shard
+  blobs, the same way it covers a graph manifest's slices, so running GC
+  against a store holding a durable vector index is safe **when no writer is
+  mid-commit** — see the commit-window gap below for the case where it is
+  not. An external vector backend (#202) still plugs in at the unchanged
   `VectorIndex` trait, without anything in this design standing in its way.
-
-**Negative:**
-
-- **One writer per index.** OCC detects a second writer and retries; it never
-  merges. A second writer's in-memory view of shards it hasn't touched can be
-  stale until it reopens for *reads* — writes are now safe against this, per
-  the write-path rules above, but a query can still be served from a
-  not-yet-refreshed shard.
-- **The whole index is held in memory once opened.** There is no partial or
-  paged load; opening an index means every one of its vectors lives in the
-  process's memory for as long as the handle does.
-- **`gonzalo-vector` now requires a tokio runtime.**
+- **Negative:** **one writer per index** — OCC detects a second writer and
+  retries; it never merges. A second writer's in-memory view of shards it
+  hasn't touched can be stale until it reopens for *reads* — writes are now
+  safe against this, per the write-path rules above, but a query can still be
+  served from a not-yet-refreshed shard. **The whole index is held in memory
+  once opened** — there is no partial or paged load; opening an index means
+  every one of its vectors lives in the process's memory for as long as the
+  handle does. **`gonzalo-vector` now requires a tokio runtime**:
   `RecordVectorIndex::open` uses `JoinSet::spawn`, which panics outside a
-  tokio runtime. `tokio` (feature `rt`) moved from a dev-dependency to a real
-  one. Every gonzalo binary already runs on tokio, so nothing breaks today —
+  tokio runtime; `tokio` (feature `rt`) moved from a dev-dependency to a real
+  one; every gonzalo binary already runs on tokio, so nothing breaks today,
   but a future non-tokio consumer of `gonzalo-vector` would break on `open`.
-- **The space tag records what a caller declared, not what is true.** It
-  catches configuration drift — a swapped embedder, a restored index, two
-  services disagreeing — but a caller that mislabels its vectors is
+  **The space tag records what a caller declared, not what is true** — it
+  catches configuration drift (a swapped embedder, a restored index, two
+  services disagreeing) but a caller that mislabels its vectors is
   undetectable, and dimension alone is too weak a check to catch most
-  mislabelings (see "The embedding-space tag" above).
-- **`keys` is a required trait method**, so this is a breaking `VectorIndex`
-  change for any out-of-tree implementor — there was no way to add it as a
-  default that means anything for an arbitrary index.
-- `upsert_many(vec![])` against an already-existing manifest still performs a
-  real commit that advances the revision counter with byte-identical shard
-  content, rather than being a no-op.
+  mislabelings (see "The embedding-space tag" above). **`keys` is a required
+  trait method**, so this is a breaking `VectorIndex` change for any
+  out-of-tree implementor — there was no way to add it as a default that
+  means anything for an arbitrary index. **`remove` of an absent key still
+  performs a real, no-op commit** that advances the revision counter with
+  byte-identical content; `upsert_many(vec![])` was closed instead (`commit`
+  now returns early when its delta batch is empty), but `remove` needs a
+  staged-vs-stored hash comparison inside `commit` to close the same way,
+  which is separate follow-up work, not this fix. **GC is not safe during a
+  commit**: `commit` writes a new shard's blob before it `put`s the manifest
+  that names it, so a sweep landing in that window sees the shard as
+  unreferenced and deletes it; the manifest then commits naming a blob that no
+  longer exists, and the next `open` fails with "shard N names blob … but it
+  is absent" — the whole index becomes unopenable. The graph indexer has the
+  same window, but its data can be rebuilt by re-parsing source; a vector
+  index's caller-supplied vectors cannot be regenerated, so this window is
+  **unrecoverable** for vectors. A grace period to close it in code is
+  tracked as follow-up, not part of this change. **Deleting a vector manifest
+  does not pin its shards**: a tombstone pins only `Body::Blob`, and a
+  manifest's body is inline, so `delete` followed by `gc` sweeps the shards
+  while the tombstone naming them still exists. **`sync` does not copy
+  blobs**, so an index synced to a peer opens there with a missing-blob
+  error — graph manifests share this same sync gap.
 
 ## Revisit if
 

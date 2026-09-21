@@ -249,8 +249,9 @@ retained: 41
 ```
 
 `gc` marks every blob the store still needs, from the records themselves: a
-record whose body *is* a blob, the blob a tombstone pins, and every code-graph
-slice a view's manifest names. Everything else is deleted.
+record whose body *is* a blob, the blob a tombstone pins, every code-graph
+slice a view's manifest names, and every shard a vector index's manifest
+names. Everything else is deleted.
 
 **A tombstone pins the blob of the record it replaced** (ADR 0024). A delete is
 replicated, not final: while the tombstone is around, a peer that never saw the

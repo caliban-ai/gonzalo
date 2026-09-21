@@ -179,7 +179,11 @@ reloads every shard that changed and retries.
 
 `gonzalo gc` already treats a vector manifest's shard blobs as live, the same
 way it treats a code-graph manifest's slices, so running GC against a store
-holding a durable vector index is safe with no separate opt-in.
+holding a durable vector index is safe when no writer is mid-commit. A sweep
+that lands between a commit's shard-blob write and its manifest write can
+still delete the not-yet-referenced shard, which is unrecoverable for vectors
+since they cannot be regenerated the way graph slices can — see
+[ADR 0027](./adr/0027-durable-vector-index.md#consequences).
 
 The whole index loads into memory when opened — there is no partial or paged
 load — so this is the right shape for the thousands-to-~100k-chunk working

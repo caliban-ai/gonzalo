@@ -28,7 +28,11 @@ the patch version for fixes.
   index's writes commit under optimistic concurrency, retrying up to 5 times
   on a conflict; a conflict reloads every shard that actually changed, not
   only the ones a given write touched, so a losing writer's own vectors are
-  never dropped. See [ADR 0027](docs/adr/0027-durable-vector-index.md). (#323)
+  never dropped. The `gonzalo` facade's `vector` module (behind the `vector`
+  feature) re-exports `RecordVectorIndex`, `DEFAULT_SHARDS`, `shard_of` and
+  `VectorManifest`, so a facade consumer can reach the durable index without
+  depending on `gonzalo-vector`/`gonzalo-core` directly. See [ADR
+  0027](docs/adr/0027-durable-vector-index.md). (#323)
 - **`KnowledgeStore::open` rebuilds chunk counts from a durable index.**
   `KnowledgeStore.chunk_counts` only ever lived in memory, so a re-ingest of a
   shrunk record after a restart used to leave its high-ordinal chunks behind
@@ -96,9 +100,10 @@ the patch version for fixes.
 ### Changed
 
 - **BREAKING: `VectorIndex` gains a required `keys` method.** There was no way
-  to enumerate an arbitrary index's contents, which the durable index needs
-  for `gonzalo gc` and `KnowledgeStore::open` to rebuild derived state after a
-  restart. `keys` has no default implementation and must be added by any
+  to enumerate an arbitrary index's contents, which is what `KnowledgeStore::open`
+  needs to rebuild derived state — its per-record chunk counts — after a
+  restart (`gonzalo gc` never calls `keys`; it marks a vector manifest's shard
+  blobs directly). `keys` has no default implementation and must be added by any
   out-of-tree `VectorIndex` implementor. `upsert_many` was also added, but as
   a default that loops over `upsert`, so it is not itself breaking —
   `RecordVectorIndex` overrides it to batch a bulk load into one manifest
