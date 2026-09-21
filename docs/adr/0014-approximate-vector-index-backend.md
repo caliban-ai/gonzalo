@@ -49,4 +49,5 @@ the exact default.
   neighbor or return `<k`; graph memory grows with churn until a rebuild.
 - **Revisit if:** deletion churn makes rebuilds too frequent, we need on-disk or
   distributed scale, or recall proves insufficient — at which point `usearch`
-  (native delete) or a served index backend should be reconsidered.
+  (native delete) or a served index backend should be reconsidered. (The
+  on-disk case is answered by [ADR 0027](0027-durable-vector-index.md).)

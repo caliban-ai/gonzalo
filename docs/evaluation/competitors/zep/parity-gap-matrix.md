@@ -26,7 +26,7 @@ out of scope for gonzalo's substrate layer, not a backlog item.
 | Capability | Gonzalo | Notes |
 |---|---|---|
 | Ingest data (`add_episode`) | 🟡 | Gonzalo takes typed record `put`s, not free-form episodes; there is no LLM ingestion that derives a graph from text |
-| Incremental updates (no full recompute) | ✅ | Writes are per-record; index layers (vector/graph) update incrementally, never rebuild the store (ADR 0008, 0012) |
+| Incremental updates (no full recompute) | ✅ | Writes are per-record; the code graph updates incrementally (ADR 0008, 0012), and vector search now has a durable index whose writes touch only the shards a change actually affects, never rebuilding the whole index (ADR 0027). Opening a durable vector index still loads it into memory in full — updates are per-shard, but there is no partial/paged load |
 | Hybrid search (semantic + keyword + graph) | 🟡 | Vector recall (ADR 0014) and a code graph (ADR 0012) exist as separate layers; no unified hybrid ranker |
 | Graph-distance reranking | 🔴 | No reranking stage |
 | Node / edge queries with custom types | 🟡 | Code-graph nodes/edges are queryable (ADR 0012); no user-defined conversational entity ontology |

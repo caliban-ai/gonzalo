@@ -327,3 +327,72 @@ shard layout is a measured number rather than a claim.
   the shard map needs genuine merge semantics.
 - A trustworthy way to bind a vector to its producing model appears, which would
   turn the declared-space guard into a verified one.
+
+## As built
+
+This section records where the shipped implementation departs from the design
+above. Where the two disagree, **this section is correct** — the "Write path"
+section above still describes the design as approved, before review found that
+it silently lost data. It is left unedited above for the historical record,
+not because it is still accurate. See [ADR 0027](../../adr/0027-durable-vector-index.md)
+for the full, self-contained account; this section only lists the deltas.
+
+- **The OCC `expected` revision is `last_seen` (the manifest revision this
+  handle's in-memory state was built from), not a fresh read taken just before
+  the `put`**, as "Write path" step 4 describes. A fresh read only proves the
+  store hadn't changed a moment ago; it says nothing about whether the shard
+  bytes about to be written were staged from memory that had already fallen
+  behind another writer's committed change. Under the fresh-read design, two
+  writers committing to the same shard could each have their `put` "succeed"
+  against a freshly-read `expected` while one of them silently overwrote the
+  other's vectors — no conflict, no error, just a missing vector. Found in
+  review, reproduced with a test pinning two handles to one shard, and fixed
+  before merge by basing `expected` on `last_seen` instead.
+- **On a conflict, the handle reloads every shard whose blob hash differs
+  between its own last-known manifest and the winner's, not only the shards
+  the losing commit itself touched**, as "Write path" step 5 describes.
+  Reloading only the touched shards leaves any other shard the winner changed
+  stale in memory while the handle's cached revision advances to the winner's
+  — the handle believes itself synced when it isn't. The next write that
+  happens to touch that stale shard commits cleanly (no conflict, since the
+  cached revision is already current) and silently drops the winner's vectors
+  in it. Also found in review, reproduced empirically, and fixed before merge.
+- **A conflict-time space/dim/shard-count check against the winning manifest**
+  was added; the design's "Space enforcement" section only describes the
+  check at `open`. Two handles can each `open` the same *missing* key — there
+  is no manifest yet to check either declared value against — and each can
+  declare a different embedding space or shard count. Without a second check
+  at conflict time, the losing handle would reload the winner's shards under
+  its own differing shard count (corrupting the manifest by computing
+  different shard ids for the same keys) or write into what is now a
+  different declared space, with nothing to catch either.
+- **The shard count is `std::num::NonZeroU16` in the API** (`shard_of`,
+  `DEFAULT_SHARDS`, `open_with_shards`), not the plain `u16` the design's data
+  model implies. The manifest's wire format still stores a plain `u16` (it's
+  deserialized data, and a non-zero invariant can't be encoded in a byte
+  format), so a stored `0` is instead caught explicitly at `open` and
+  surfaced as a corrupt-store error before it would otherwise reach
+  `shard_of`'s modulo.
+- **Opening reads shard blobs with genuine concurrency**, not the
+  chunked-but-sequential loop an earlier version of the code had (which
+  chunked reads into batches of 16 — the concurrency constant's name — but
+  `await`ed each read inside the chunk in turn). The shipped version spawns
+  each batch's reads on a `tokio::task::JoinSet` and joins them, with the
+  store held as `Arc<S>` so each task owns a cheap handle. A test
+  (`opening_reads_shard_blobs_concurrently`) observes more than one read in
+  flight at once, so the concurrency claim is checked rather than assumed —
+  the design's "Load path" section describes only the intent, not this
+  verification.
+- **Deltas are staged on a copy of each dirty shard and applied to
+  `self.inner` only after `store.put` reports `Committed`.** The design does
+  not call this out explicitly; it matters because it is what keeps memory
+  consistent with the store when a `put_blob`/`put` call errors or every
+  retry attempt conflicts — the handle never serves a vector the caller was
+  told failed to write.
+- **A handle-level `commit_lock` (`tokio::sync::Mutex<()>`) serializes
+  `commit` calls on the same handle.** Also not called out in the design.
+  `upsert`/`remove`/`upsert_many` all take `&self`, so without it two
+  concurrent calls on one handle could interleave their reads of `last_seen`
+  and each other's staged shard writes, including one call's `Committed` arm
+  setting `last_seen` back to an older revision than a commit that actually
+  finished after it.

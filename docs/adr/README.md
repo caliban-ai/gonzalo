@@ -38,7 +38,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0011](0011-knowledge-store-capability.md) | Knowledge store over the capability layers | accepted |
 | [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted (blob GC marking amended by [0024](0024-blob-garbage-collection.md)) |
 | [0013](0013-local-candle-embedder.md) | Local Candle embedder for real semantic embeddings | accepted |
-| [0014](0014-approximate-vector-index-backend.md) | Approximate vector index backend (hnsw_rs) | accepted |
+| [0014](0014-approximate-vector-index-backend.md) | Approximate vector index backend (hnsw_rs) | accepted (on-disk scale answered by [0027](0027-durable-vector-index.md)) |
 | [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted |
 | [0016](0016-threeway-merge-stored-ancestry.md) | 3-way merge with content-addressed stored ancestry | accepted |
 | [0017](0017-nonff-pull-content-merge.md) | Non-fast-forward git pull via content-aware merge | accepted |
@@ -51,6 +51,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted |
 | [0025](0025-s3-tombstone-markers.md) | Sibling tombstone markers in the S3 layout | accepted |
 | [0026](0026-grouped-facade-surface.md) | A grouped facade surface | accepted |
+| [0027](0027-durable-vector-index.md) | A durable vector index | accepted |
 
 ## Adding a new ADR
 
