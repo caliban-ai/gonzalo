@@ -31,7 +31,11 @@ pub fn shard_of(key: &RecordKey, shards: NonZeroU16) -> u16 {
 
 /// Encode one shard. Entries are sorted by key, so identical contents always
 /// produce identical bytes.
-pub fn encode_shard(dim: usize, entries: &[(RecordKey, Vec<f32>)]) -> Vec<u8> {
+///
+/// `pub(crate)`, not `pub`: this freezes the `GZVS` v1 on-disk format as a
+/// public contract, and nothing outside this crate has a reason to encode a
+/// shard directly — a caller works through [`crate::VectorIndex`].
+pub(crate) fn encode_shard(dim: usize, entries: &[(RecordKey, Vec<f32>)]) -> Vec<u8> {
     let mut sorted: Vec<&(RecordKey, Vec<f32>)> = entries.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -56,8 +60,12 @@ pub fn encode_shard(dim: usize, entries: &[(RecordKey, Vec<f32>)]) -> Vec<u8> {
 ///
 /// Rejects corrupted or truncated blobs as `CoreError::Backend`, including those
 /// with unbounded length fields that could cause allocation failures.
+///
+/// `pub(crate)` for the same reason as [`encode_shard`]: the format is not a
+/// public contract, and every caller of this crate goes through
+/// [`crate::VectorIndex`] instead.
 #[allow(clippy::type_complexity)]
-pub fn decode_shard(bytes: &[u8]) -> Result<(usize, Vec<(RecordKey, Vec<f32>)>)> {
+pub(crate) fn decode_shard(bytes: &[u8]) -> Result<(usize, Vec<(RecordKey, Vec<f32>)>)> {
     let mut r = Reader { bytes, at: 0 };
     if r.take(4)? != MAGIC {
         return Err(CoreError::Backend("vector shard: bad magic".into()));

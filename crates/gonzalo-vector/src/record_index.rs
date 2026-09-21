@@ -75,6 +75,36 @@ fn check_space_and_dim(
     Ok(())
 }
 
+/// `put_str16` in `shard.rs` writes a key's namespace and collection length
+/// prefix as a `u16` (the `id` uses a `u32` length and is unaffected). A
+/// namespace or collection longer than 64 KiB would silently truncate that
+/// prefix while the bytes themselves are written in full, so the shard fails
+/// to decode and the WHOLE index becomes unopenable — not just the one bad
+/// entry. Reject such a key up front, before anything is staged.
+fn check_key_len(key: &RecordKey) -> Result<()> {
+    if key.namespace.len() > u16::MAX as usize || key.collection.len() > u16::MAX as usize {
+        return Err(CoreError::Invalid(format!(
+            "vector index: key {key} has a namespace or collection longer than 64 KiB"
+        )));
+    }
+    Ok(())
+}
+
+/// A [`VectorIndex`] whose contents live in `store` rather than only in
+/// process memory (ADR 0027): vectors are bucketed into content-addressed
+/// shard blobs named by one [`VectorManifest`] record, so a query is served
+/// from an in-memory [`MemoryVectorIndex`] hydrated at [`open`](Self::open),
+/// and a write goes through to `store` under optimistic concurrency before it
+/// is reflected in memory.
+///
+/// **One writer per index.** A handle serializes its own `upsert`/`remove`/
+/// `upsert_many` calls, but a *second* handle on the same key is only
+/// detected, not merged: its commit conflicts and retries, reloading whatever
+/// the winner changed. A second handle's queries can still be served from a
+/// shard it hasn't refreshed until it reopens.
+///
+/// **Requires a tokio runtime.** [`open`](Self::open) reads shard blobs
+/// concurrently via `tokio::task::JoinSet::spawn`, which panics outside one.
 pub struct RecordVectorIndex<S> {
     store: Arc<S>,
     key: RecordKey,
@@ -307,6 +337,13 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
     /// handle, so `last_seen` can't be read by one call and clobbered by
     /// another's `Committed` arm mid-flight.
     async fn commit(&self, deltas: Vec<Delta>) -> Result<()> {
+        // An empty batch has nothing to persist. Without this, `upsert_many(vec![])`
+        // against an existing manifest still ran the whole commit loop and
+        // produced a real, no-op revision bump with byte-identical content.
+        if deltas.is_empty() {
+            return Ok(());
+        }
+
         let _commit_guard = self.commit_lock.lock().await;
 
         let mut dirty = BTreeSet::new();
@@ -464,6 +501,7 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
 #[async_trait]
 impl<S: Store + BlobStore + Send + Sync + 'static> VectorIndex for RecordVectorIndex<S> {
     async fn upsert(&self, key: RecordKey, vector: Vec<f32>) -> Result<()> {
+        check_key_len(&key)?;
         if vector.len() != self.dim {
             return Err(CoreError::Invalid(format!(
                 "vector index {}: expected dimension {}, got {}",
@@ -486,6 +524,7 @@ impl<S: Store + BlobStore + Send + Sync + 'static> VectorIndex for RecordVectorI
     /// store at all.
     async fn upsert_many(&self, items: Vec<(RecordKey, Vec<f32>)>) -> Result<()> {
         for (key, vector) in &items {
+            check_key_len(key)?;
             if vector.len() != self.dim {
                 return Err(CoreError::Invalid(format!(
                     "vector index {}: {key} has dimension {}, index is {}",
@@ -1264,5 +1303,116 @@ mod tests {
             "one batch through Arc<RecordVectorIndex<_>> must still be one revision"
         );
         assert_eq!(idx.keys(&KeyPrefix::default()).await.unwrap().len(), 64);
+    }
+
+    // F7 (#323 fix-round): `upsert_many` validates every vector's dimension
+    // before staging anything, so one bad entry anywhere in the batch must
+    // leave no trace at all -- not a partial commit of the good entries, and
+    // not even a manifest record for a previously-empty index.
+    #[tokio::test]
+    async fn upsert_many_with_a_bad_dimension_among_good_ones_commits_nothing() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        let good_a = RecordKey::new("ns", "coll", "a");
+        let bad = RecordKey::new("ns", "coll", "bad");
+        let good_b = RecordKey::new("ns", "coll", "b");
+
+        let err = idx
+            .upsert_many(vec![
+                (good_a, vec![1.0, 0.0, 0.0]),
+                (bad, vec![1.0, 0.0]), // wrong dimension: 2, index is 3
+                (good_b, vec![0.0, 1.0, 0.0]),
+            ])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dimension"), "error should name it: {err}");
+
+        assert!(
+            idx.keys(&KeyPrefix::default()).await.unwrap().is_empty(),
+            "a rejected batch must leave the in-memory index untouched"
+        );
+        assert!(
+            s.get(&index_key()).await.unwrap().is_none(),
+            "a rejected batch on a previously-empty index must not create a manifest"
+        );
+    }
+
+    // F8 (#323 fix-round): an empty batch must be a true no-op. Before
+    // `commit`'s early return, `upsert_many(vec![])` against an existing
+    // manifest still ran the full commit loop and produced a real revision
+    // bump with byte-identical shard content.
+    #[tokio::test]
+    async fn upsert_many_of_an_empty_batch_leaves_an_existing_manifests_revision_unchanged() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+        idx.upsert(RecordKey::new("ns", "coll", "a"), vec![1.0, 0.0, 0.0])
+            .await
+            .unwrap();
+
+        let before = s.get(&index_key()).await.unwrap().unwrap();
+        idx.upsert_many(vec![]).await.unwrap();
+        let after = s.get(&index_key()).await.unwrap().unwrap();
+
+        assert_eq!(
+            before.revision, after.revision,
+            "an empty batch must not advance the manifest's revision"
+        );
+    }
+
+    // F12 (#323 fix-round): `put_str16` in `shard.rs` writes a key's namespace
+    // and collection length prefix as a `u16`. A namespace over 64 KiB would
+    // silently truncate that prefix while its bytes are written in full,
+    // corrupting the shard so it fails to decode -- taking down the WHOLE
+    // index, not just the one bad entry. Reject it up front instead.
+    #[tokio::test]
+    async fn upsert_rejects_an_oversized_namespace_before_staging_anything() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        let huge_namespace = "n".repeat(u16::MAX as usize + 1);
+        let key = RecordKey::new(huge_namespace, "coll", "a");
+
+        let err = idx
+            .upsert(key, vec![1.0, 0.0, 0.0])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64 KiB"), "error should name the limit: {err}");
+        assert!(
+            s.get(&index_key()).await.unwrap().is_none(),
+            "a rejected key must not create a manifest"
+        );
+    }
+
+    // Same check, reached through `upsert_many` rather than `upsert`.
+    #[tokio::test]
+    async fn upsert_many_rejects_an_oversized_collection_before_staging_anything() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        let huge_collection = "c".repeat(u16::MAX as usize + 1);
+        let key = RecordKey::new("ns", huge_collection, "a");
+
+        let err = idx
+            .upsert_many(vec![(key, vec![1.0, 0.0, 0.0])])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64 KiB"), "error should name the limit: {err}");
+        assert!(s.get(&index_key()).await.unwrap().is_none());
     }
 }
