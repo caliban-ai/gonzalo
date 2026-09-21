@@ -10,6 +10,9 @@
 pub mod index;
 pub use index::MemoryVectorIndex;
 
+pub mod shard;
+pub use shard::{DEFAULT_SHARDS, shard_of};
+
 #[cfg(feature = "hnsw")]
 pub mod hnsw;
 #[cfg(feature = "hnsw")]
