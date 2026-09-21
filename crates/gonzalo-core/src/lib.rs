@@ -23,6 +23,9 @@ pub use tombstone::{
 pub mod manifest;
 pub use manifest::{Manifest, Reconciliation, desired_set};
 
+pub mod vector_manifest;
+pub use vector_manifest::VectorManifest;
+
 pub mod gc;
 pub use gc::{
     GcReport, gc_blobs, live_blob_hashes, live_slice_hashes, sweep_blobs, unreferenced_slices,

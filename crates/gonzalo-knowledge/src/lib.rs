@@ -279,6 +279,7 @@ pub fn chunk(record: &Record) -> Result<Option<Vec<String>>> {
         // semantic search (ADR 0022).
         RecordKind::Checkpoint
         | RecordKind::GraphManifest
+        | RecordKind::VectorManifest
         | RecordKind::Tombstone
         | RecordKind::Person
         | RecordKind::IdentityBinding

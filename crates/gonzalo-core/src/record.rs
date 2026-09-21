@@ -18,6 +18,12 @@ pub enum RecordKind {
     /// A per-view code-graph manifest: `(repo, view_id) -> { path -> content_hash }`.
     /// Regenerable from source; reconciled last-writer-wins. See ADR 0012.
     GraphManifest,
+    /// The manifest of a durable vector index: which shards exist, which blob
+    /// holds each, and the embedding space they are in. Unlike
+    /// [`GraphManifest`](Self::GraphManifest) it is **not** regenerable — with
+    /// caller-supplied embeddings gonzalo never sees the model — so it merges
+    /// [`Opaque`](MergeClass::Opaque). See ADR 0027.
+    VectorManifest,
     /// A human with fleet roles. Not ADR 0015's `Principal`, which is a gonzalo
     /// bearer token. See ADR 0022.
     Person,
@@ -76,6 +82,9 @@ impl RecordKind {
             // collision, which must surface rather than merge (ADR 0022).
             RecordKind::LinkToken | RecordKind::AuditEntry => MergeClass::Opaque,
             RecordKind::GraphManifest => MergeClass::Derived,
+            // Not regenerable: a lost side is lost vectors, so surface the
+            // divergence rather than resolving it silently.
+            RecordKind::VectorManifest => MergeClass::Opaque,
             // Sync and pull reconcile tombstones before any body merge runs;
             // the most conservative class guards a path that forgets to.
             RecordKind::Tombstone => MergeClass::Opaque,
