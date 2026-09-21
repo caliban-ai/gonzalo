@@ -44,6 +44,37 @@ fn missing_blob_error(key: &RecordKey, id: u16, hash: &ContentHash) -> CoreError
     ))
 }
 
+/// Errors if `manifest`'s embedding space or dimension disagree with `space`
+/// and `dim`, naming both values.
+///
+/// Shared between `open_with_shards` (checking an existing manifest at open)
+/// and `commit`'s conflict arm (checking the winner's manifest, which this
+/// handle may never have read at open — it could have opened a *missing*
+/// index that another handle, declaring a different space, raced to create).
+/// Without the second call site a swapped embedder only gets caught when both
+/// handles happen to open onto an already-existing manifest; two handles that
+/// both open a missing index skip the check entirely and mix spaces silently.
+fn check_space_and_dim(
+    key: &RecordKey,
+    manifest: &VectorManifest,
+    space: &str,
+    dim: usize,
+) -> Result<()> {
+    if manifest.space != space {
+        return Err(CoreError::Invalid(format!(
+            "vector index {key}: stored embedding space is {:?}, opened as {:?}",
+            manifest.space, space
+        )));
+    }
+    if manifest.dim != dim {
+        return Err(CoreError::Invalid(format!(
+            "vector index {key}: stored dimension is {}, opened as {}",
+            manifest.dim, dim
+        )));
+    }
+    Ok(())
+}
+
 pub struct RecordVectorIndex<S> {
     store: Arc<S>,
     key: RecordKey,
@@ -106,18 +137,7 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
             None => (shards, None),
             Some(record) => {
                 let m = VectorManifest::from_body(&record.body)?;
-                if m.space != space {
-                    return Err(CoreError::Invalid(format!(
-                        "vector index {key}: stored embedding space is {:?}, opened as {:?}",
-                        m.space, space
-                    )));
-                }
-                if m.dim != dim {
-                    return Err(CoreError::Invalid(format!(
-                        "vector index {key}: stored dimension is {}, opened as {}",
-                        m.dim, dim
-                    )));
-                }
+                check_space_and_dim(&key, &m, space, dim)?;
                 // A stored shard count of zero means the manifest is corrupt.
                 // Surface it here rather than letting it reach `shard_of`.
                 let stored = NonZeroU16::new(m.shards).ok_or_else(|| {
@@ -340,9 +360,18 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
             };
 
             match self.store.put(record.clone(), expected).await? {
-                PutResult::Committed(_) => {
+                PutResult::Committed(rev) => {
                     self.apply(&deltas).await?;
-                    *self.last_seen.lock().await = Some(record);
+                    // The store's returned revision is authoritative, not the
+                    // one we locally built and sent — it can re-stamp it (for
+                    // example, recreating a record over a tombstone). Caching
+                    // our own guess here instead would make the next commit's
+                    // `expected` mismatch the store for no real reason; it
+                    // would recover on the resulting conflict, but there's no
+                    // reason to pay for a conflict that isn't real.
+                    let mut committed = record;
+                    committed.revision = rev;
+                    *self.last_seen.lock().await = Some(committed);
                     return Ok(());
                 }
                 PutResult::Conflict(_) if attempt < MAX_COMMIT_ATTEMPTS => {
@@ -359,6 +388,30 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
                     })?;
                     let winner_manifest = VectorManifest::from_body(&winner.body)?;
 
+                    // The winner may be a manifest this handle never actually
+                    // checked: an `open` onto a *missing* index skips the
+                    // space/dim/shards check entirely (there's nothing to
+                    // check yet), so two handles can each open a missing
+                    // index declaring different embedding spaces, dimensions,
+                    // or shard counts and only discover the disagreement here,
+                    // once one of them has already committed. A handle whose
+                    // configuration disagrees with the committed index must
+                    // stop rather than reload and write into it — reloading a
+                    // shard under a different shard count would compute
+                    // different shard ids for the same keys than the winner
+                    // did, corrupting the manifest; writing a different space
+                    // is exactly the silent cross-space mixing the space tag
+                    // exists to prevent.
+                    check_space_and_dim(&self.key, &winner_manifest, &self.space, self.dim)?;
+                    if winner_manifest.shards != self.shards.get() {
+                        return Err(CoreError::Invalid(format!(
+                            "vector index {}: stored shard count is {}, opened as {}",
+                            self.key,
+                            winner_manifest.shards,
+                            self.shards.get()
+                        )));
+                    }
+
                     let mut to_hydrate = dirty.clone();
                     let mut ids: BTreeSet<u16> = base_entries.keys().copied().collect();
                     ids.extend(winner_manifest.entries.keys().copied());
@@ -367,6 +420,16 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
                             to_hydrate.insert(id);
                         }
                     }
+                    // If a `hydrate_shard` call below fails partway through,
+                    // memory ends up with some shards at the winner's state
+                    // and others still stale, while `last_seen` (set only
+                    // after the loop) stays at the old base. That's fine, not
+                    // a bug: the next commit will still use that same old
+                    // base, so it's guaranteed to conflict again and re-diff
+                    // against whatever the current manifest is at that point,
+                    // which recomputes the full set of shards that actually
+                    // differ — including the ones this attempt already
+                    // brought up to date, re-hydrated harmlessly.
                     for id in to_hydrate {
                         self.hydrate_shard(&winner_manifest, id).await?;
                     }
@@ -977,6 +1040,106 @@ mod tests {
             idx.keys(&KeyPrefix::default()).await.unwrap().is_empty(),
             "a failed commit must not leave an uncommitted vector visible in memory"
         );
+    }
+
+    // Two handles can each `open` a *missing* index -- there's no manifest yet
+    // to check `space`/`dim` against, so the check in `open_with_shards` never
+    // runs for either of them. If the conflict path doesn't check the winner's
+    // manifest either, the second handle's commit reloads and writes right
+    // into an index declaring a different embedding space, with nothing to
+    // catch it (dimensions match, so even the in-memory dimension check is
+    // silent).
+    #[tokio::test]
+    async fn a_conflicting_commit_refuses_to_join_a_different_embedding_space() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let a = RecordKey::new("ns", "coll", "a");
+        let b = RecordKey::new("ns", "coll", "b");
+
+        let one = RecordVectorIndex::open(fs(&dir), index_key(), "model-a", 3)
+            .await
+            .unwrap();
+        let two = RecordVectorIndex::open(fs(&dir), index_key(), "model-b", 3)
+            .await
+            .unwrap();
+
+        one.upsert(a.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
+        // `two` opened before that commit, so it conflicts -- and only then
+        // discovers the space disagreement.
+        let err = two
+            .upsert(b, vec![0.0, 1.0, 0.0])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("model-a"),
+            "winner's space missing from: {err}"
+        );
+        assert!(
+            err.contains("model-b"),
+            "this handle's space missing from: {err}"
+        );
+
+        // The refused write must not have landed: only `one`'s vector exists.
+        let reopened = RecordVectorIndex::open(s, index_key(), "model-a", 3)
+            .await
+            .unwrap();
+        assert_eq!(reopened.keys(&KeyPrefix::default()).await.unwrap(), vec![a]);
+    }
+
+    // Same hole, for shard count: two `open_with_shards` handles that both
+    // open a missing index each pick their own shard count, since there's no
+    // existing manifest to adopt one from. If a conflicting commit doesn't
+    // check the winner's shard count before reloading, it would compute shard
+    // ids for its own keys under its *own* shard count while the winner's
+    // blobs are addressed under a different one -- corrupting the manifest.
+    #[tokio::test]
+    async fn a_conflicting_commit_refuses_to_join_a_different_shard_count() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let a = RecordKey::new("ns", "coll", "a");
+        let b = RecordKey::new("ns", "coll", "b");
+
+        let one = RecordVectorIndex::open_with_shards(
+            fs(&dir),
+            index_key(),
+            "space-a",
+            3,
+            std::num::NonZeroU16::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+        let two = RecordVectorIndex::open_with_shards(
+            fs(&dir),
+            index_key(),
+            "space-a",
+            3,
+            std::num::NonZeroU16::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        one.upsert(a.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
+        let err = two
+            .upsert(b, vec![0.0, 1.0, 0.0])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains('4'),
+            "winner's shard count missing from: {err}"
+        );
+        assert!(
+            err.contains('8'),
+            "this handle's shard count missing from: {err}"
+        );
+
+        // The refused write must not have landed: only `one`'s vector exists.
+        // Reopening with `open` adopts the stored shard count (4).
+        let reopened = RecordVectorIndex::open(s, index_key(), "space-a", 3)
+            .await
+            .unwrap();
+        assert_eq!(reopened.keys(&KeyPrefix::default()).await.unwrap(), vec![a]);
     }
 
     #[tokio::test]
