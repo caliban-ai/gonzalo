@@ -75,6 +75,16 @@ pub fn live_blob_hashes<'a>(
         if record.kind == RecordKind::GraphManifest {
             live.extend(Manifest::from_body(&record.body)?.entries.into_values());
         }
+        // A vector manifest's shards are live blobs. Without this the next sweep
+        // deletes every vector in the index while the manifest still names them,
+        // and — unlike a graph slice — they cannot be regenerated from source.
+        if record.kind == RecordKind::VectorManifest {
+            live.extend(
+                crate::VectorManifest::from_body(&record.body)?
+                    .entries
+                    .into_values(),
+            );
+        }
     }
     Ok(live)
 }
@@ -252,6 +262,39 @@ mod tests {
             Body::Inline(b"{[".to_vec()),
         );
         assert!(live_blob_hashes([&r]).is_err());
+    }
+
+    // Red-first guard on real data loss: before the VectorManifest arm exists,
+    // the mark set misses every shard blob and a sweep deletes live vectors.
+    #[test]
+    fn live_set_includes_vector_manifest_shards() {
+        use crate::VectorManifest;
+
+        let mut vm = VectorManifest::new("bge-small-en-v1.5", 384, 256);
+        vm.entries.insert(0, h("shard-0"));
+        vm.entries.insert(9, h("shard-9"));
+
+        let rec = record("memories", RecordKind::VectorManifest, vm.to_body());
+
+        let live = live_blob_hashes([&rec]).unwrap();
+        assert!(live.contains(&h("shard-0")));
+        assert!(live.contains(&h("shard-9")));
+    }
+
+    #[test]
+    fn a_graph_manifest_and_a_vector_manifest_both_mark() {
+        use crate::VectorManifest;
+
+        let mut gm = Manifest::new();
+        gm.insert("src/lib.rs", h("slice"));
+        let graph = record("view", RecordKind::GraphManifest, gm.to_body());
+
+        let mut vm = VectorManifest::new("space", 8, 4);
+        vm.entries.insert(1, h("shard"));
+        let vector = record("memories", RecordKind::VectorManifest, vm.to_body());
+
+        let live = live_blob_hashes([&graph, &vector]).unwrap();
+        assert_eq!(live, BTreeSet::from([h("slice"), h("shard")]));
     }
 
     /// A `BlobStore` whose `list_blobs` returns a fixed, possibly-duplicated
