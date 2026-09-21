@@ -479,6 +479,31 @@ impl<S: Store + BlobStore + Send + Sync + 'static> VectorIndex for RecordVectorI
         self.commit(vec![Delta::Remove(key.clone())]).await
     }
 
+    /// Overrides the trait's looping default: one batch becomes one `commit`
+    /// call, so a bulk load stages every shard once and writes one manifest
+    /// revision instead of one per vector. Dimensions are validated up front,
+    /// before anything is staged, so a bad batch fails without touching the
+    /// store at all.
+    async fn upsert_many(&self, items: Vec<(RecordKey, Vec<f32>)>) -> Result<()> {
+        for (key, vector) in &items {
+            if vector.len() != self.dim {
+                return Err(CoreError::Invalid(format!(
+                    "vector index {}: {key} has dimension {}, index is {}",
+                    self.key,
+                    vector.len(),
+                    self.dim
+                )));
+            }
+        }
+        self.commit(
+            items
+                .into_iter()
+                .map(|(key, vector)| Delta::Upsert(key, vector))
+                .collect(),
+        )
+        .await
+    }
+
     async fn query(&self, query: &[f32], k: usize, filter: &KeyPrefix) -> Result<Vec<Match>> {
         self.inner.query(query, k, filter).await
     }
@@ -1163,5 +1188,81 @@ mod tests {
             a.entries, b.entries,
             "identical content should hash the same"
         );
+    }
+
+    // Committing once per vector would mean one manifest commit per vector, so a
+    // bulk load of 100k chunks would be 100k commits. One batch, one revision.
+    #[tokio::test]
+    async fn upsert_many_commits_the_manifest_once() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx = RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        idx.upsert_many(
+            (0..64)
+                .map(|i| {
+                    (
+                        RecordKey::new("ns", "coll", i.to_string()),
+                        vec![i as f32, 0.0, 0.0],
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        let record = s.get(&index_key()).await.unwrap().unwrap();
+        // `Record::create` stamps `Revision::initial`, whose counter is 0 (see
+        // `gonzalo_core::revision::Revision::initial`), so the *first* commit
+        // on a brand-new manifest lands at counter 0, not 1. What matters
+        // here is that there is exactly one commit for 64 upserts: a looping
+        // default would leave the counter at 63 (63 updates on top of the
+        // initial create), not 0.
+        assert_eq!(record.revision.counter, 0, "one batch must be one revision");
+        assert_eq!(idx.keys(&KeyPrefix::default()).await.unwrap().len(), 64);
+    }
+
+    // The `Arc<T>` delegation impl forwards `upsert_many` explicitly rather
+    // than inheriting the default -- but `MemoryVectorIndex` (the only other
+    // implementor) never overrides `upsert_many`, so before this override
+    // existed, forwarding and inheriting the trait default were behaviourally
+    // identical: both would loop over `upsert`. This is the first case where
+    // they diverge, so it's the only test that can actually catch someone
+    // later dropping the explicit forward from the `Arc` impl (which would
+    // silently fall back to the looping default and defeat the batching this
+    // task adds).
+    #[tokio::test]
+    async fn upsert_many_through_an_arc_still_commits_the_manifest_once() {
+        let dir = tmp();
+        let s = fs(&dir);
+        let idx: std::sync::Arc<RecordVectorIndex<FsStore>> = std::sync::Arc::new(
+            RecordVectorIndex::open(fs(&dir), index_key(), "space-a", 3)
+                .await
+                .unwrap(),
+        );
+
+        idx.upsert_many(
+            (0..64)
+                .map(|i| {
+                    (
+                        RecordKey::new("ns", "coll", i.to_string()),
+                        vec![i as f32, 0.0, 0.0],
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        let record = s.get(&index_key()).await.unwrap().unwrap();
+        // See `upsert_many_commits_the_manifest_once`: the first commit on a
+        // fresh manifest lands at counter 0 (`Revision::initial`), not 1.
+        assert_eq!(
+            record.revision.counter, 0,
+            "one batch through Arc<RecordVectorIndex<_>> must still be one revision"
+        );
+        assert_eq!(idx.keys(&KeyPrefix::default()).await.unwrap().len(), 64);
     }
 }
