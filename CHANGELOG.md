@@ -24,11 +24,17 @@ the patch version for fixes.
   count is unrepresentable rather than a runtime panic waiting to happen.
   `gonzalo gc` marks a vector manifest's shard blobs as live, the same way it
   already marks a graph manifest's slices, so running GC against a store
-  holding a durable vector index is safe with no separate opt-in. A durable
-  index's writes commit under optimistic concurrency, retrying up to 5 times
-  on a conflict; a conflict reloads every shard that actually changed, not
-  only the ones a given write touched, so a losing writer's own vectors are
-  never dropped. The `gonzalo` facade's `vector` module (behind the `vector`
+  holding a durable vector index is safe when no writer is mid-commit. A
+  sweep that lands between a write's shard upload and its manifest commit
+  deletes the new shard and leaves the index unopenable, and unlike a graph
+  slice the vectors cannot be regenerated, so do not run `gonzalo gc` while
+  vector writes are in flight. A durable index's writes commit under
+  optimistic concurrency, retrying up to 5 times on a conflict. Each commit is
+  checked against the manifest revision the writer's in-memory state came
+  from, so two writers on the same shard cannot silently overwrite each
+  other; and a conflict reloads every shard that changed, not only the ones
+  the write touched, so a writer that lost a race cannot later overwrite the
+  winner's vectors from stale memory. The `gonzalo` facade's `vector` module (behind the `vector`
   feature) re-exports `RecordVectorIndex`, `DEFAULT_SHARDS`, `shard_of` and
   `VectorManifest`, so a facade consumer can reach the durable index without
   depending on `gonzalo-vector`/`gonzalo-core` directly. See [ADR
