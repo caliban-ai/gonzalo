@@ -15,6 +15,8 @@ hnsw_rs = { version = "0.3.4", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+gonzalo-store-fs = { workspace = true }
+tempfile         = { workspace = true }
 
 [lints]
 workspace = true
