@@ -51,8 +51,8 @@ content, re-referencing the blob the first write orphaned.
    missing blob it newly referenced. Two windows remain (see "Known limits"):
    a writer that *crashes* between its commit and its re-check, and a live
    writer whose blob a sweep has already decided to delete. Closing either
-   needs durable leases (or a GC that re-marks before each delete), which is
-   deliberately out of scope (see "Rejected alternatives").
+   needs durable leases (a GC that re-marks before each delete only narrows it
+   further), which is deliberately out of scope (see "Rejected alternatives").
 2. **GC sweeps by blob age.** `list_blobs` reports each blob's modified time and
    the sweep deletes only unreferenced blobs at least `min_age` old.
 3. **Writers re-check after committing.** A writer confirms the blobs it newly
@@ -220,7 +220,7 @@ After a manifest commit succeeds, the writer asks `has_blob` for each hash it
 checked: they were referenced by both the previous manifest and the new one, so
 GC never saw them as garbage.
 
-This is what closes the dedup path. The age filter protects freshly uploaded
+This is what narrows the dedup path; it does not close it (see "Known limits"). The age filter protects freshly uploaded
 blobs; it cannot protect an old blob that a write newly references.
 
 **Vector index.** In `commit()`'s `Committed` arm, after `apply` and the
@@ -258,10 +258,12 @@ and nothing to explain why.
   re-check, sees the blob still present, and does nothing; GC then deletes it.
   No crash is involved. The re-check narrows the exposure from the whole
   upload-to-commit interval to GC's mark-to-delete interval; closing it needs
-  leases or a re-mark immediately before each delete.
+  leases. A re-mark immediately before each delete would only narrow it further:
+  a gap remains between the re-mark and the delete, and a filesystem cannot
+  delete conditionally and atomically.
 - **Clock skew beyond `min_age`** in the losing direction (GC host ahead of the
-  store) defeats the age filter. The writer re-check only partly covers this,
-  for the reason in the previous limit.
+  store) defeats the age filter. The writer re-check still covers a live
+  writer here, subject to the window above.
 - **A `ServerStore` `has_blob` downloads the blob.** Correct, but costs
   bandwidth per newly referenced blob on the daemon path.
 - **The #198 drift check compares paths and methods, not response schemas**, so
@@ -305,11 +307,12 @@ Four test fakes need the new `list_blobs` signature: `CountingStore` and
 
 - **ADR 0028**, amending **ADR 0024** (blob GC gains an age rule) and **ADR 0027**
   (whose "do not run `gonzalo gc` while vector writes are in flight" consequence
-  is now addressed for live writers). Both annotated on both sides; both stay
+  is narrowed for live writers, not closed). Both annotated on both sides; both stay
   `accepted`.
 - `docs/guide/src/deletion.md` — the age rule, `--min-age`, the deferred count.
 - `docs/guide/src/storage.md` — replace the don't-run-GC warning with the
-  residual crash window.
+  two residual windows: the writer crash, and a sweep that decided before a live
+  writer referenced the blob.
 - ADR 0027's negative consequence points at 0028 instead of telling operators to
   avoid GC.
 - `CHANGELOG.md` — both breaking changes (`list_blobs`; the `GET /v1/blobs`
@@ -318,7 +321,8 @@ Four test fakes need the new `list_blobs` signature: `CountingStore` and
 
 ## Out of scope
 
-- Durable leases, and therefore the writer-crash window.
+- Durable leases, and therefore both remaining windows (the writer crash, and a
+  sweep that decided before a live writer referenced the blob).
 - A daemon `HEAD /v1/blobs/{hash}` route to make `ServerStore::has_blob` cheap.
 - Freshening a blob's timestamp on re-put.
 - Whether a deleted `VectorManifest`'s tombstone should pin its shards (#325's
@@ -328,6 +332,8 @@ Four test fakes need the new `list_blobs` signature: `CountingStore` and
 
 - A writer's upload phase can exceed an hour, making the default `min_age` too
   short and the re-check the only line of defence.
-- The writer-crash window is observed in practice, which would justify leases.
+- Either remaining window is observed in practice (a writer crash between
+  commit and re-check, or a live writer losing a blob to a sweep that had
+  already decided), which would justify leases.
 - GC becomes something a daemon runs continuously rather than a CLI trigger, at
   which point the `ServerStore` cost and the skew question both get sharper.

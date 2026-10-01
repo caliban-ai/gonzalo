@@ -149,8 +149,10 @@ impl BlobEntry {
     /// disagreement.
     pub fn age(&self, now: SystemTime) -> Option<Duration> {
         let now_ms = match now.duration_since(std::time::UNIX_EPOCH) {
-            // Saturate toward the future: a wrapped value would read as very old,
-            // the one direction that deletes data.
+            // Unlike `from_system_time`, saturating here reads as very OLD: a
+            // `now` of `i64::MAX` makes every blob look ancient and collectable.
+            // That is a documented exception (ADR 0028), unreachable with a sane
+            // clock, and deliberate; do not change the arithmetic.
             Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
             Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
         };

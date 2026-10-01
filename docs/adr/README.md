@@ -51,7 +51,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted (sweep gains an age rule from [0028](0028-blob-gc-grace-period.md)) |
 | [0025](0025-s3-tombstone-markers.md) | Sibling tombstone markers in the S3 layout | accepted |
 | [0026](0026-grouped-facade-surface.md) | A grouped facade surface | accepted |
-| [0027](0027-durable-vector-index.md) | A durable vector index | accepted (GC-during-commit window addressed for live writers by [0028](0028-blob-gc-grace-period.md)) |
+| [0027](0027-durable-vector-index.md) | A durable vector index | accepted (GC-during-commit window narrowed for live writers by [0028](0028-blob-gc-grace-period.md)) |
 | [0028](0028-blob-gc-grace-period.md) | A grace period for blob garbage collection | accepted |
 
 ## Adding a new ADR

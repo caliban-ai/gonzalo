@@ -39,7 +39,7 @@ the patch version for fixes.
   holding a durable vector index is safe when no writer is mid-commit. A
   sweep that lands between a write's shard upload and its manifest commit
   used to delete the new shard and leave the index unopenable; see the
-  grace-period fix under Fixed for how that is now closed, and what remains.
+  grace-period fix under Fixed for how that is now narrowed, and what remains.
   A durable index's writes commit under
   optimistic concurrency, retrying up to 5 times on a conflict. Each commit is
   checked against the manifest revision the writer's in-memory state came

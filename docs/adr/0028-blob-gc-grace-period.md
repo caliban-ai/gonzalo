@@ -7,8 +7,10 @@
   every unreferenced blob regardless of age; this ADR adds an age rule to it.
   Its marking rules (what counts as live) are unchanged.
 - **Amends:** [ADR 0027](0027-durable-vector-index.md), whose consequence "GC is
-  not safe during a commit" is now addressed for live writers. What remains of
-  that consequence is a writer that crashes mid-commit, stated below.
+  not safe during a commit" is narrowed for live writers, not closed. Two
+  windows remain, both stated under Consequences below: a writer that crashes
+  mid-commit, and a sweep that has already decided to delete a blob a live
+  writer then references.
 
 Neither ADR is superseded; both stay `accepted`.
 
@@ -128,7 +130,8 @@ the store. It is both at once, so the skew tolerance *is* `min_age`: a GC host
 running **ahead** of the store is the direction that loses data, because it
 makes a fresh blob look old. Git's `gc.pruneExpire` uses two weeks for the same
 mechanism, but git has no writer re-check and so needs the margin to carry the
-whole guarantee. Here the re-check carries the old-blob case, and one hour is
+whole guarantee. Here the re-check narrows the old-blob case (it does not close it; see
+Consequences), so the margin need not carry the whole guarantee, and one hour is
 enough margin for upload and ordinary skew without leaving garbage for days.
 
 ### Alternatives rejected
@@ -171,9 +174,11 @@ enough margin for upload and ordinary skew without leaving garbage for days.
   crash is involved. This is the same flaw as the one that rules out freshening
   on re-put: GC deletes on a decision it already made. The re-check narrows the
   exposure from the whole upload-to-commit interval to GC's own mark-to-delete
-  interval; it does not remove it. Closing it entirely needs durable leases, or
-  a GC that re-marks immediately before each delete, and neither is part of
-  this change.
+  interval; it does not remove it. Only durable leases close it entirely. A GC
+  that re-marked immediately before each delete would narrow it further but not
+  close it, since a gap remains between the re-mark and the delete and the
+  filesystem substrate cannot delete conditionally and atomically. Neither is
+  part of this change.
 - **Negative:** **clock skew beyond `min_age`**, in the losing direction (GC host
   *ahead* of the store), defeats the age filter. `min_age` is the skew
   tolerance; it is not a separate setting, and lowering it for faster
@@ -201,8 +206,9 @@ enough margin for upload and ordinary skew without leaving garbage for days.
 
 - A writer's upload phase can exceed an hour, which makes the default
   `min_age` too short and leaves the re-check as the only defence.
-- The writer-crash window is observed in practice, which would justify
-  durable leases.
+- Either remaining window is observed in practice (a writer crash between
+  commit and re-check, or a live writer losing a blob to a sweep that had
+  already decided), which would justify durable leases.
 - GC becomes something a daemon runs continuously rather than a CLI trigger, at
   which point the `ServerStore` download cost and the clock-skew question both
   sharpen.

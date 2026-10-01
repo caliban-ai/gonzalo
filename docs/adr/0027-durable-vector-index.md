@@ -5,7 +5,7 @@
 - **Source:** [`docs/superpowers/specs/2026-09-20-durable-vector-index-design.md`](../superpowers/specs/2026-09-20-durable-vector-index-design.md)
   (see that spec's "As built" section for where the shipped code departs from
   it)
-- **Amended by:** [ADR 0028](0028-blob-gc-grace-period.md), which closes the
+- **Amended by:** [ADR 0028](0028-blob-gc-grace-period.md), which narrows the
   GC-during-commit window below for live writers.
 - **Amends:** [ADR 0014](0014-approximate-vector-index-backend.md), whose
   "Revisit if" named "on-disk or distributed scale" as a future trigger. This
@@ -280,7 +280,7 @@ correctly starts with empty counts.
   in that window used to see the shard as unreferenced and delete it, leaving a
   manifest that names an absent blob and an index the next `open` cannot read
   ("shard N names blob … but it is absent"). [ADR
-  0028](0028-blob-gc-grace-period.md) closes that for live writers: a sweep
+  0028](0028-blob-gc-grace-period.md) narrows that for live writers: a sweep
   skips blobs younger than `min_age` (one hour by default), and `commit`
   re-checks, after the manifest lands, any shard blob it newly referenced and
   re-uploads one that is missing. What remains, first, is a writer that **crashes**
