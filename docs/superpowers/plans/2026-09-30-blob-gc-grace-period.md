@@ -922,7 +922,9 @@ git commit -m "$(printf 'feat(store): cheap has_blob on fs and s3, with conforma
 
 **Interfaces:**
 - Consumes: `SweepPolicy`, `DEFAULT_MIN_AGE`, `gc_blobs_with`, `GcReport.deferred` (Task 2).
-- Produces: `GcSummary { scanned, freed, retained, deferred }`; `gc(root, min_age: Duration)`; `gonzalo gc --min-age <duration>`.
+- Produces: `GcSummary { scanned, freed, retained, deferred }`; `gonzalo gc --min-age <duration>`.
+
+**Already done by Task 2's fix round — do not redo it.** `gc(root: &Path, min_age: Duration)` already exists, already builds a `SweepPolicy` and calls `sweep_blobs_with`, and `min_age` is already threaded through `index_with_gc`, `index_with_gc_filtered`, `index_with_gc_filtered_worker`, `watch.rs` and `main.rs`, with production call sites passing `DEFAULT_MIN_AGE` and deliberately-garbage tests passing `Duration::ZERO`. Task 2 had to pull that forward because its new default policy broke four `gonzalo-cli` tests that only the signature change could fix honestly. What remains for this task: the `--min-age` **flag**, the `deferred` **field** on `GcSummary`, and **printing** it. Verify the threading is present before adding anything, and report if it is not.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -965,7 +967,7 @@ Expected: FAIL to compile — `gc` takes one argument and `GcSummary` has no `de
 
 - [ ] **Step 3: Thread `min_age` through**
 
-In `crates/gonzalo-cli/src/lib.rs`: add `pub deferred: usize` to `GcSummary`; change `pub async fn gc(root: &Path, min_age: Duration) -> Result<GcSummary>` to build a policy and call `sweep_blobs_with`:
+In `crates/gonzalo-cli/src/lib.rs`: add `pub deferred: usize` to `GcSummary` and populate it from the report. `gc` already takes `min_age` and already calls `sweep_blobs_with` (Task 2's fix round), so the only change to its body is carrying `report.deferred` into the summary:
 
 ```rust
     let report = gonzalo_core::sweep_blobs_with(
@@ -985,7 +987,7 @@ In `crates/gonzalo-cli/src/lib.rs`: add `pub deferred: usize` to `GcSummary`; ch
     })
 ```
 
-Thread `min_age` through `index_with_gc`, `index_with_gc_filtered`, `index_with_gc_filtered_worker` and `crates/gonzalo-cli/src/watch.rs`. Those pass `DEFAULT_MIN_AGE` from their callers rather than inventing a value, so `--watch --gc` is covered with no new flag.
+The `min_age` threading through `index_with_gc`, `index_with_gc_filtered`, `index_with_gc_filtered_worker` and `watch.rs` is already in place from Task 2's fix round, with production callers passing `DEFAULT_MIN_AGE` — so `--watch --gc` is already covered with no new flag. Confirm it rather than redoing it.
 
 - [ ] **Step 4: Add the flag and print the count**
 
