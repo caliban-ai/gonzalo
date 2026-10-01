@@ -486,6 +486,7 @@ git commit -m "$(printf 'feat(core)!: list_blobs reports each blob modified time
 
 **Files:**
 - Modify: `crates/gonzalo-core/src/gc.rs`, `crates/gonzalo-core/src/lib.rs`
+- Modify (migration, Step 4): `crates/gonzalo-store-fs/tests/blob_gc.rs` (**6** `gc_blobs` calls), `crates/gonzalo-vector/src/record_index.rs` (1 `gc_blobs` call in the orphan-reclaim test), and the 2 `sweep_blobs` calls in `gc.rs`'s own older tests
 
 **Interfaces:**
 - Consumes: `BlobEntry::age`, `BlobStore::list_blobs` (Task 1).
@@ -757,7 +758,7 @@ Factor `gc_blobs`'s record-marking half into `gc_blobs_with(store, policy)` and 
 
 These call sites assert a blob is freed right after being written, which the default policy now defers. Point each at `sweep_blobs_with` / `gc_blobs_with` with `SweepPolicy { min_age: Duration::ZERO, now: SystemTime::now() }`:
 
-- `crates/gonzalo-store-fs/tests/blob_gc.rs` (4 `gc_blobs` calls)
+- `crates/gonzalo-store-fs/tests/blob_gc.rs` (6 `gc_blobs` calls)
 - `crates/gonzalo-vector/src/record_index.rs` (the orphan-reclaim test's `gc_blobs`)
 - any `sweep_blobs` call in `crates/gonzalo-core/src/gc.rs`'s own older tests
 
@@ -915,7 +916,9 @@ git commit -m "$(printf 'feat(store): cheap has_blob on fs and s3, with conforma
 ### Task 4: The operator surface
 
 **Files:**
-- Modify: `crates/gonzalo-cli/src/lib.rs`, `crates/gonzalo-cli/src/main.rs`
+- Modify: `crates/gonzalo-cli/src/lib.rs`, `crates/gonzalo-cli/src/main.rs`, `crates/gonzalo-cli/src/watch.rs`
+
+`watch.rs` is not optional: it threads `min_age` through `index_with_gc`, and its own tests call `gc(root.path())` twice, so the signature change breaks it.
 
 **Interfaces:**
 - Consumes: `SweepPolicy`, `DEFAULT_MIN_AGE`, `gc_blobs_with`, `GcReport.deferred` (Task 2).
