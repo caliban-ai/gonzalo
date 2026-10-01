@@ -1003,7 +1003,15 @@ mod tests {
         two.upsert(b.clone(), vec![0.0, 1.0, 0.0]).await.unwrap();
 
         let before = s.list_blobs().await.unwrap().len();
-        let report = gonzalo_core::gc::gc_blobs(&s).await.unwrap();
+        let report = gonzalo_core::gc::gc_blobs_with(
+            &s,
+            gonzalo_core::SweepPolicy {
+                min_age: std::time::Duration::ZERO,
+                now: std::time::SystemTime::now(),
+            },
+        )
+        .await
+        .unwrap();
         let after = s.list_blobs().await.unwrap().len();
 
         // `GcReport.freed` is a Vec<ContentHash> of what was deleted, not a count
