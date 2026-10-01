@@ -866,6 +866,10 @@ pub struct GcSummary {
     pub freed: usize,
     /// Blobs kept because some record still references them.
     pub retained: usize,
+    /// Unreferenced blobs kept because they are younger than the sweep policy's
+    /// `min_age`. Without this an operator cannot tell "nothing to reclaim" from
+    /// "reclaiming held back by the age rule".
+    pub deferred: usize,
 }
 
 /// Sweep unreferenced blobs from the store at `root` (gonzalo#292).
@@ -905,6 +909,7 @@ pub async fn gc(root: &Path, min_age: Duration) -> Result<GcSummary> {
         scanned: records.len(),
         freed: report.freed.len(),
         retained: report.retained,
+        deferred: report.deferred,
     })
 }
 
@@ -2305,6 +2310,34 @@ mod tests {
         let g =
             SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
         assert_eq!(g.definitions("a")[0].path, "a.rs");
+    }
+
+    // The flag's default is a string clap parses at startup. A typo here is a
+    // runtime failure on every `gonzalo gc`, which no other test would catch.
+    #[test]
+    fn the_default_min_age_spelling_parses_to_an_hour() {
+        assert_eq!(
+            parse_duration("1h").unwrap(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(parse_duration("1h").unwrap(), gonzalo_core::DEFAULT_MIN_AGE);
+    }
+
+    #[tokio::test]
+    async fn gc_defers_a_blob_younger_than_min_age_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+        store.put_blob(b"brand new").await.unwrap();
+
+        // The default horizon: nothing written moments ago is collectable.
+        let held = gc(dir.path(), gonzalo_core::DEFAULT_MIN_AGE).await.unwrap();
+        assert_eq!(held.freed, 0);
+        assert_eq!(held.deferred, 1);
+
+        // An operator asking for the old behaviour gets it.
+        let swept = gc(dir.path(), std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(swept.freed, 1);
+        assert_eq!(swept.deferred, 0);
     }
 
     // ── index: view membership (#209) ────────────────────────────────────────

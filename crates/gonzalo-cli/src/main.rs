@@ -4,9 +4,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
     DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, WatchConfig, collect, delete, gc, get,
-    index_with_gc_filtered, list, migrate, parse_horizon, parse_revision, reset, reset_exit_code,
-    resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap, ticket_move, ticket_sync,
-    watch,
+    index_with_gc_filtered, list, migrate, parse_duration, parse_horizon, parse_revision, reset,
+    reset_exit_code, resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap,
+    ticket_move, ticket_sync, watch,
 };
 use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
 use gonzalo_store_fs::expand_tilde;
@@ -130,6 +130,11 @@ enum Commands {
         /// Root directory of the fs store.
         #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
+        /// Keep unreferenced blobs younger than this, so a sweep cannot delete
+        /// a blob a writer has uploaded but not yet referenced. Accepts the same
+        /// spellings as `collect --horizon`, e.g. `30m`, `2h`.
+        #[arg(long, default_value = "1h", value_parser = parse_duration)]
+        min_age: std::time::Duration,
     },
     /// Sync two filesystem stores, in both directions. Replicates deletions:
     /// a tombstone copies like any record. Exits 3 when it reports conflicts to
@@ -440,14 +445,16 @@ async fn main() -> Result<ExitCode> {
             if let Some(swept) = swept {
                 println!("gc.freed:    {}", swept.freed);
                 println!("gc.retained: {}", swept.retained);
+                println!("gc.deferred: {}", swept.deferred);
             }
         }
 
-        Commands::Gc { root } => {
-            let summary = gc(&root, gonzalo_core::DEFAULT_MIN_AGE).await?;
+        Commands::Gc { root, min_age } => {
+            let summary = gc(&root, min_age).await?;
             println!("scanned:  {}", summary.scanned);
             println!("freed:    {}", summary.freed);
             println!("retained: {}", summary.retained);
+            println!("deferred: {}", summary.deferred);
         }
 
         Commands::Sync { a, b, ancestor_cap } => {
