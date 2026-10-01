@@ -80,7 +80,7 @@ content, re-referencing the blob the first write orphaned.
   present), git's answer to the dedup path. Still races: GC can list the blob as
   old, then the writer freshens, then GC deletes on a decision already made.
   Closing it needs a conditional delete, which FS cannot do atomically. The
-  writer re-check covers the same case substrate-agnostically.
+  writer re-check narrows the same case substrate-agnostically.
 
 ## The trait and the wire
 

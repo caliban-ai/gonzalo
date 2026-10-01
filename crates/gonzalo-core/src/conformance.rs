@@ -862,7 +862,9 @@ async fn blob_list_reports_a_plausible_modified_time<B: BlobStore>(store: &B) {
 
     // Deliberately generous: the store's clock is not this process's clock (S3
     // stamps LastModified server-side). The point is to catch a substrate that
-    // returns the epoch, zero, or a client-side `now` it made up.
+    // returns the epoch, zero, or some other wildly wrong value. (A substrate
+    // returning `SystemTime::now()` lands inside the window and passes; the
+    // window must stay wide enough for S3's server-side `LastModified`.)
     let age = entry.age(before + Duration::from_secs(3600));
     assert!(
         age.is_some(),

@@ -491,8 +491,8 @@ async fn delete_blob(
     }
 }
 
-/// `GET /v1/blobs` — JSON array of every stored blob as `{hash, modified_unix_ms}`. Authorized `Read` on
-/// `_blobs`.
+/// `GET /v1/blobs` — JSON array of every stored blob as
+/// `{hash, modified_unix_ms}`. Authorized `Read` on `_blobs`.
 async fn list_blobs(
     State(svc): State<Arc<Service>>,
     Extension(principal): Extension<Principal>,

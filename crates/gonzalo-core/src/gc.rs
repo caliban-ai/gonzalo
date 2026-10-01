@@ -45,6 +45,10 @@ pub fn live_slice_hashes<'a>(
 
 /// The sweep set: hashes present in `all` but not in the live set, returned
 /// sorted and deduplicated (`all - live`).
+///
+/// This is **age-unaware**: it must not be used to build a delete list. Feeding
+/// it the hashes of `list_blobs()` rebuilds the unsafe sweep that deleted blobs
+/// a writer was about to reference; use `sweep_blobs_with` / `gc_blobs_with`.
 pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) -> Vec<ContentHash> {
     let mut garbage: Vec<ContentHash> =
         all.iter().filter(|h| !live.contains(*h)).cloned().collect();

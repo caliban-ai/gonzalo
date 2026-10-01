@@ -651,6 +651,10 @@ pub async fn index_with_worker(
         .chain(recon.modified.iter())
         .filter_map(|p| recon.manifest.get(p).map(|h| (p.clone(), h.clone())))
         .collect();
+    // An error here returns after the manifest committed but before
+    // `staging.apply`, so the persistent graph stays behind the manifest (#153's
+    // invariant holds) and the next run starts from a stale base; hence the
+    // message tells the operator to re-index.
     let restored = ensure_slices_present(&store, &newly_referenced, &staging).await?;
     if restored > 0 {
         eprintln!("restored {restored} slice blob(s) swept during this index run");

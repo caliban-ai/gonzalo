@@ -332,8 +332,9 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
             let restored = self.store.put_blob(&bytes).await?;
             if &restored != hash {
                 return Err(CoreError::Backend(format!(
-                    "vector index {}: shard {id} was swept and the re-encoded bytes \
-                     hash to {} rather than the committed {}",
+                    "vector index {}: the manifest commit already landed, but shard {id} \
+                     was swept and the re-encoded bytes hash to {} rather than the \
+                     committed {}; the index is unrecoverable",
                     self.key, restored.0, hash.0
                 )));
             }

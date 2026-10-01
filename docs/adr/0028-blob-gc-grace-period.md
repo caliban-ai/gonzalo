@@ -78,8 +78,10 @@ just referenced again.
   behind the store's) and when the subtraction cannot be represented, and the
   sweep treats every `None` as too young. A blob's own timestamp that overflows
   saturates to `i64::MAX`, which reads as future and hence too young. Two
-  pathological cases go the other way: a blob timestamped before the Unix epoch
-  maps to a negative value that reads as very old and collectable, and a `now`
+  pathological cases go the other way: an ordinary blob timestamped before the
+  Unix epoch maps to a negative value that reads as very old and collectable
+  (only the saturating extreme, `-i64::MAX`, overflows in `age` and is kept),
+  and a `now`
   that overflows saturates to `i64::MAX`, which also reads as very old. Neither
   is reachable with a sane clock, but they are exceptions, not kept data.
 - **A hash listed more than once resolves to its newest timestamp**, in a
@@ -169,9 +171,10 @@ enough margin for upload and ordinary skew without leaving garbage for days.
   already decided to delete it.** GC computes its mark set, lists blobs,
   decides an old blob is unreferenced and collectable, and then deletes. If a
   writer commits a manifest naming that blob after the decision but before the
-  delete, the writer's re-check sees the blob still present and does nothing,
-  and GC then deletes it, leaving a manifest that names a missing blob. No
-  crash is involved. This is the same flaw as the one that rules out freshening
+  delete, the writer's re-check either sees the blob still present and does
+  nothing, or restores it, and GC's pending delete then removes the blob (or
+  the restoration), leaving a manifest that names a missing blob. No crash is
+  involved. This is the same flaw as the one that rules out freshening
   on re-put: GC deletes on a decision it already made. The re-check narrows the
   exposure from the whole upload-to-commit interval to GC's own mark-to-delete
   interval; it does not remove it. Only durable leases close it entirely. A GC
@@ -186,6 +189,9 @@ enough margin for upload and ordinary skew without leaving garbage for days.
 - **Negative:** **unreferenced blobs now linger for at least `min_age`** before
   they can be reclaimed, so disk is freed later than before and a `gc` right
   after a `delete` and `collect` may report `deferred` rather than `freed`.
+- **Negative:** **listing blobs now costs a `stat` per blob.** `list_blobs` went
+  from one `read_dir` to `read_dir` plus a `stat` of every blob, a real
+  per-sweep cost on a large store under `--watch --gc`.
 - **Negative:** **`ServerStore::has_blob` downloads the blob**, so the daemon
   path pays bandwidth for each newly referenced blob. A `HEAD` route is a
   follow-up.

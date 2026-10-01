@@ -123,9 +123,10 @@ enum Commands {
         require_parse_worker: bool,
     },
     /// Garbage-collect unreferenced blobs, marking against every record in the
-    /// store: record bodies, the blobs tombstones pin, and graph-manifest
-    /// slices. A deleted record's blob is freed only once its tombstone has
-    /// been collected.
+    /// store: record bodies, the blobs tombstones pin, graph-manifest slices,
+    /// and vector-manifest shards. A deleted record's blob is freed only once
+    /// its tombstone has been collected. An unreferenced blob younger than
+    /// `--min-age` (default 1h) is kept and reported as `deferred`.
     Gc {
         /// Root directory of the fs store.
         #[arg(long, default_value = ".", value_parser = store_root)]
