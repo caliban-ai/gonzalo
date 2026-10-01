@@ -17,7 +17,9 @@ use std::time::{Duration, SystemTime};
 /// What a GC sweep did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcReport {
-    /// Hashes of blobs deleted because no record referenced them.
+    /// Hashes of blobs deleted because no record referenced them, in
+    /// [`ContentHash`] order — not listing order (the sweep walks a `BTreeMap`
+    /// to collapse duplicate listings). That order is intentional.
     pub freed: Vec<ContentHash>,
     /// Count of blobs kept because they are still referenced.
     pub retained: usize,
@@ -431,7 +433,7 @@ mod tests {
                 .listed
                 .iter()
                 .cloned()
-                .map(|h| BlobEntry::from_system_time(h, SystemTime::now()))
+                .map(|h| BlobEntry::from_system_time(h, UNIX_EPOCH + Duration::from_secs(1)))
                 .collect())
         }
         async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
@@ -603,6 +605,7 @@ mod tests {
             .unwrap();
         assert!(report.freed.is_empty(), "the newest timestamp is young");
         assert_eq!(report.deferred, 1);
+        assert_eq!(report.freed.len() + report.retained + report.deferred, 1);
     }
 
     #[tokio::test]
