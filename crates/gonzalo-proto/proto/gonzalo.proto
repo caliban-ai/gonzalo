@@ -143,9 +143,18 @@ message GetBlobResponse {
   bytes content = 2;
 }
 message ListBlobsRequest {}
+message BlobEntry {
+  // Hex ContentHash of the blob.
+  string hash = 1;
+  // When the blob was last written, Unix milliseconds.
+  int64 modified_unix_ms = 2;
+}
 message ListBlobsResponse {
-  // Hex ContentHash of each stored blob.
-  repeated string hashes = 1;
+  // Field 1 was `repeated string hashes`. Reserved, never reused: giving field
+  // 1 a new type would make an old client misparse silently, where an empty
+  // `entries` makes an old GC client delete nothing — it fails safe.
+  reserved 1;
+  repeated BlobEntry entries = 2;
 }
 message DeleteBlobRequest {
   string hash = 1;

@@ -78,7 +78,7 @@ impl Service {
         self.blobs.put_blob(content).await
     }
 
-    pub async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+    pub async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
         self.blobs.list_blobs().await
     }
 
@@ -673,7 +673,13 @@ mod tests {
             svc.get_blob(&hash).await.unwrap().as_deref(),
             Some(&b"checkpoint pre-image"[..])
         );
-        assert_eq!(svc.list_blobs().await.unwrap(), vec![hash.clone()]);
+        let listed = svc.list_blobs().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hash, hash);
+        assert_ne!(
+            listed[0].modified_unix_ms, 0,
+            "a zero timestamp means the substrate never reported one"
+        );
         svc.delete_blob(&hash).await.unwrap();
         assert_eq!(svc.get_blob(&hash).await.unwrap(), None);
 

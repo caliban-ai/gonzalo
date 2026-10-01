@@ -307,6 +307,41 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
         staged.into_iter().collect()
     }
 
+    /// Confirm the shard blobs this commit referenced still exist, re-uploading
+    /// any that do not.
+    ///
+    /// A sweep can delete a blob between the upload and the manifest commit that
+    /// names it. GC's age filter covers a freshly uploaded blob, but not an
+    /// **old** blob a commit newly references — which content-addressed dedup
+    /// produces whenever a shard returns to earlier content (upsert `x`, then
+    /// remove `x`). See ADR 0028.
+    ///
+    /// Called after the commit lands, so the in-memory shard is the committed
+    /// content and the bytes can be re-encoded on demand. Re-staging is not used
+    /// and no staged bytes are held: retaining them for a 256-shard batch would
+    /// add roughly 150 MB of peak memory for a case that almost never fires.
+    async fn verify_shard_blobs(&self, written: &BTreeMap<u16, ContentHash>) -> Result<()> {
+        for (id, hash) in written {
+            if self.store.has_blob(hash).await? {
+                continue;
+            }
+            let entries = self
+                .inner
+                .collect_where(|k| shard_of(k, self.shards) == *id);
+            let bytes = encode_shard(self.dim, &entries);
+            let restored = self.store.put_blob(&bytes).await?;
+            if &restored != hash {
+                return Err(CoreError::Backend(format!(
+                    "vector index {}: the manifest commit already landed, but shard {id} \
+                     was swept and the re-encoded bytes hash to {} rather than the \
+                     committed {}; the index is unrecoverable",
+                    self.key, restored.0, hash.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Persist `deltas` as shard blobs plus an updated manifest, under OCC.
     ///
     /// The write is built from `self.last_seen` — what this handle last
@@ -409,6 +444,7 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
                     let mut committed = record;
                     committed.revision = rev;
                     *self.last_seen.lock().await = Some(committed);
+                    self.verify_shard_blobs(&blobs).await?;
                     return Ok(());
                 }
                 PutResult::Conflict(_) if attempt < MAX_COMMIT_ATTEMPTS => {
@@ -634,7 +670,7 @@ mod tests {
             result
         }
 
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
             self.inner.list_blobs().await
         }
 
@@ -694,7 +730,7 @@ mod tests {
             self.inner.get_blob(hash).await
         }
 
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
             self.inner.list_blobs().await
         }
 
@@ -705,6 +741,125 @@ mod tests {
 
     fn index_key() -> RecordKey {
         VectorManifest::key("ns", "memories")
+    }
+
+    /// Deletes a chosen blob the moment a record `put` lands — a deterministic
+    /// stand-in for a GC sweep hitting the window between a writer's blob
+    /// upload and its manifest commit.
+    struct SweepsOnPut {
+        inner: FsStore,
+        victim: std::sync::Mutex<Option<ContentHash>>,
+    }
+
+    #[async_trait]
+    impl Store for SweepsOnPut {
+        async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            let victim = self.victim.lock().unwrap().take();
+            if let Some(hash) = victim {
+                self.inner.delete_blob(&hash).await?;
+            }
+            self.inner.put(record, expected).await
+        }
+        async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete_as(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+            author: Option<Identity>,
+        ) -> Result<DeleteResult> {
+            self.inner.delete_as(key, expected, author).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.inner.get_raw(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.list_raw(prefix).await
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            self.inner.put_raw(record, expected).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.inner.purge(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for SweepsOnPut {
+        async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+            self.inner.put_blob(content).await
+        }
+
+        async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+            self.inner.get_blob(hash).await
+        }
+
+        async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+            self.inner.has_blob(hash).await
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
+            self.inner.list_blobs().await
+        }
+
+        async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+            self.inner.delete_blob(hash).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_restores_a_shard_blob_swept_behind_its_back() {
+        let dir = tmp();
+        let key = index_key();
+        let k = RecordKey::new("ns", "coll", "a");
+        // A second key in the SAME shard as `k`, so that removing it returns the
+        // shard to its earlier content and re-references the earlier blob.
+        let shard = shard_of(&k, DEFAULT_SHARDS);
+        let x = (0..)
+            .map(|n| RecordKey::new("ns", "coll", format!("x{n}")))
+            .find(|c| shard_of(c, DEFAULT_SHARDS) == shard)
+            .unwrap();
+
+        // Commit 1: shard holds {a}; its blob is B1.
+        let idx = RecordVectorIndex::open(fs(&dir), key.clone(), "space-a", 3)
+            .await
+            .unwrap();
+        idx.upsert(k.clone(), vec![1.0, 0.0, 0.0]).await.unwrap();
+        let manifest = fs(&dir).get(&key).await.unwrap().unwrap();
+        let b1 = VectorManifest::from_body(&manifest.body)
+            .unwrap()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        // Commit 2: shard holds {a, x}; B1 is now unreferenced.
+        idx.upsert(x.clone(), vec![0.0, 1.0, 0.0]).await.unwrap();
+        drop(idx);
+
+        // Commit 3: remove x, returning the shard to {a} and re-referencing the
+        // old B1 — deleted by a sweep just as the manifest lands.
+        let store = SweepsOnPut {
+            inner: fs(&dir),
+            victim: std::sync::Mutex::new(Some(b1.clone())),
+        };
+        let idx = RecordVectorIndex::open(store, key.clone(), "space-a", 3)
+            .await
+            .unwrap();
+        idx.remove(&x).await.unwrap();
+        drop(idx);
+
+        // The re-check must have put the bytes back, so the index still opens.
+        let reopened = RecordVectorIndex::open(fs(&dir), key, "space-a", 3)
+            .await
+            .unwrap();
+        let keys = reopened.keys(&KeyPrefix::default()).await.unwrap();
+        assert_eq!(keys, vec![k]);
+        assert!(fs(&dir).has_blob(&b1).await.unwrap());
     }
 
     #[tokio::test]
@@ -1003,7 +1158,15 @@ mod tests {
         two.upsert(b.clone(), vec![0.0, 1.0, 0.0]).await.unwrap();
 
         let before = s.list_blobs().await.unwrap().len();
-        let report = gonzalo_core::gc::gc_blobs(&s).await.unwrap();
+        let report = gonzalo_core::gc::gc_blobs_with(
+            &s,
+            gonzalo_core::SweepPolicy {
+                min_age: std::time::Duration::ZERO,
+                now: std::time::SystemTime::now(),
+            },
+        )
+        .await
+        .unwrap();
         let after = s.list_blobs().await.unwrap().len();
 
         // `GcReport.freed` is a Vec<ContentHash> of what was deleted, not a count

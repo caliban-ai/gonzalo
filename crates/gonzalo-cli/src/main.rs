@@ -4,9 +4,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
     DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, WatchConfig, collect, delete, gc, get,
-    index_with_gc_filtered, list, migrate, parse_horizon, parse_revision, reset, reset_exit_code,
-    resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap, ticket_move, ticket_sync,
-    watch,
+    index_with_gc_filtered, list, migrate, parse_duration, parse_horizon, parse_revision, reset,
+    reset_exit_code, resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap,
+    ticket_move, ticket_sync, watch,
 };
 use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
 use gonzalo_store_fs::expand_tilde;
@@ -123,13 +123,19 @@ enum Commands {
         require_parse_worker: bool,
     },
     /// Garbage-collect unreferenced blobs, marking against every record in the
-    /// store: record bodies, the blobs tombstones pin, and graph-manifest
-    /// slices. A deleted record's blob is freed only once its tombstone has
-    /// been collected.
+    /// store: record bodies, the blobs tombstones pin, graph-manifest slices,
+    /// and vector-manifest shards. A deleted record's blob is freed only once
+    /// its tombstone has been collected. An unreferenced blob younger than
+    /// `--min-age` (default 1h) is kept and reported as `deferred`.
     Gc {
         /// Root directory of the fs store.
         #[arg(long, default_value = ".", value_parser = store_root)]
         root: PathBuf,
+        /// Keep unreferenced blobs younger than this, so a sweep cannot delete
+        /// a blob a writer has uploaded but not yet referenced. Accepts the same
+        /// spellings as `collect --horizon`, e.g. `30m`, `2h`.
+        #[arg(long, default_value = "1h", value_parser = parse_duration)]
+        min_age: std::time::Duration,
     },
     /// Sync two filesystem stores, in both directions. Replicates deletions:
     /// a tombstone copies like any record. Exits 3 when it reports conflicts to
@@ -389,8 +395,16 @@ async fn main() -> Result<ExitCode> {
                 watch(&root, &src, &repo, &view, config, gc).await?;
                 return Ok(ExitCode::SUCCESS);
             }
-            let (summary, swept) =
-                index_with_gc_filtered(&root, &src, &repo, &view, gc, &filter).await?;
+            let (summary, swept) = index_with_gc_filtered(
+                &root,
+                &src,
+                &repo,
+                &view,
+                gc,
+                gonzalo_core::DEFAULT_MIN_AGE,
+                &filter,
+            )
+            .await?;
             println!(
                 "driver:   {}",
                 if summary.incremental {
@@ -432,14 +446,16 @@ async fn main() -> Result<ExitCode> {
             if let Some(swept) = swept {
                 println!("gc.freed:    {}", swept.freed);
                 println!("gc.retained: {}", swept.retained);
+                println!("gc.deferred: {}", swept.deferred);
             }
         }
 
-        Commands::Gc { root } => {
-            let summary = gc(&root).await?;
+        Commands::Gc { root, min_age } => {
+            let summary = gc(&root, min_age).await?;
             println!("scanned:  {}", summary.scanned);
             println!("freed:    {}", summary.freed);
             println!("retained: {}", summary.retained);
+            println!("deferred: {}", summary.deferred);
         }
 
         Commands::Sync { a, b, ancestor_cap } => {

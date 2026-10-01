@@ -552,3 +552,17 @@ fn collect_purges_old_tombstones_and_reports_what_it_kept() {
         "live untouched"
     );
 }
+
+#[test]
+fn plain_gc_succeeds_with_the_default_min_age_and_reports_deferred() {
+    // Runs the real binary so clap parses the `--min-age` default ("1h") at
+    // startup; a typo there would break every plain `gonzalo gc`.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["gc"]);
+    assert!(out.status.success(), "gc failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("deferred:"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}

@@ -28,14 +28,15 @@ pub use vector_manifest::VectorManifest;
 
 pub mod gc;
 pub use gc::{
-    GcReport, gc_blobs, live_blob_hashes, live_slice_hashes, sweep_blobs, unreferenced_slices,
+    DEFAULT_MIN_AGE, GcReport, SweepPolicy, gc_blobs, gc_blobs_with, live_blob_hashes,
+    live_slice_hashes, sweep_blobs, sweep_blobs_with, unreferenced_slices,
 };
 
 pub mod error;
 pub use error::{CoreError, Result};
 
 pub mod store;
-pub use store::{BlobStore, Conflict, DeleteResult, PutResult, Store};
+pub use store::{BlobEntry, BlobStore, Conflict, DeleteResult, PutResult, Store};
 
 pub mod merge;
 pub use merge::{MergeOutcome, merge};

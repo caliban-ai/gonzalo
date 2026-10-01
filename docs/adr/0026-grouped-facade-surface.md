@@ -38,7 +38,7 @@ after its crate:
 
 | Module | Contents |
 |---|---|
-| root | the record and store core — `Record`, `RecordKey`, `RecordKind`, `Revision`, `Body`, `Meta`, `Identity`, `ContentHash`, `KeyPrefix`, `Store`, `BlobStore`, `AncestryStore`, `PutResult`, `DeleteResult`, `Conflict`, `CoreError`, `Result`, `MergeClass`, `MergeOutcome`; the operations `sync`, `sync_with_ancestry`, `merge`, `collect`, `reset`, `reset_as`, `gc_blobs`, `now_ms` and their reports; and the substrates `FsStore`, `GitStore`, `S3Store`, `ServerStore` |
+| root | the record and store core — `Record`, `RecordKey`, `RecordKind`, `Revision`, `Body`, `Meta`, `Identity`, `ContentHash`, `KeyPrefix`, `Store`, `BlobStore`, `BlobEntry`, `AncestryStore`, `PutResult`, `DeleteResult`, `Conflict`, `CoreError`, `Result`, `MergeClass`, `MergeOutcome`; the operations `sync`, `sync_with_ancestry`, `merge`, `collect`, `reset`, `reset_as`, `gc_blobs`, `gc_blobs_with`, `SweepPolicy`, `DEFAULT_MIN_AGE`, `now_ms` and their reports; and the substrates `FsStore`, `GitStore`, `S3Store`, `ServerStore` |
 | `memory` | `MemoryTier`, `Topic` |
 | `session` | `Session`, `Turn` |
 | `checkpoint` | `Checkpoint` |

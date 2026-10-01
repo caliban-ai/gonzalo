@@ -8,16 +8,25 @@
 //! self-correcting: a missed event can leave a blob briefly un-swept, never
 //! wrongly deleted, and never leaked forever the way a drifted refcount would.
 
-use crate::{BlobStore, Body, ContentHash, KeyPrefix, Manifest, Record, RecordKind, Result, Store};
-use std::collections::BTreeSet;
+use crate::{
+    BlobEntry, BlobStore, Body, ContentHash, KeyPrefix, Manifest, Record, RecordKind, Result, Store,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
 
 /// What a GC sweep did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcReport {
-    /// Hashes of blobs deleted because no record referenced them.
+    /// Hashes of blobs deleted because no record referenced them, in
+    /// [`ContentHash`] order — not listing order (the sweep walks a `BTreeMap`
+    /// to collapse duplicate listings). That order is intentional.
     pub freed: Vec<ContentHash>,
     /// Count of blobs kept because they are still referenced.
     pub retained: usize,
+    /// Count of blobs no record references that were kept anyway, because they
+    /// are younger than the policy's `min_age`. Without this an operator cannot
+    /// tell "nothing to reclaim" from "reclaiming held back".
+    pub deferred: usize,
 }
 
 /// The slice hashes referenced by any of the `manifests` (ADR 0012).
@@ -36,6 +45,10 @@ pub fn live_slice_hashes<'a>(
 
 /// The sweep set: hashes present in `all` but not in the live set, returned
 /// sorted and deduplicated (`all - live`).
+///
+/// This is **age-unaware**: it must not be used to build a delete list. Feeding
+/// it the hashes of `list_blobs()` rebuilds the unsafe sweep that deleted blobs
+/// a writer was about to reference; use `sweep_blobs_with` / `gc_blobs_with`.
 pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) -> Vec<ContentHash> {
     let mut garbage: Vec<ContentHash> =
         all.iter().filter(|h| !live.contains(*h)).cloned().collect();
@@ -91,8 +104,36 @@ pub fn live_blob_hashes<'a>(
     Ok(live)
 }
 
-/// Delete every blob in `blobs` outside the `live` mark set, and report what
-/// was freed versus retained.
+/// How long a blob must have gone untouched before a sweep may delete it.
+///
+/// A writer uploads its blobs *before* committing the manifest that names them,
+/// so a sweep that runs in between sees them as unreferenced. One hour exceeds
+/// the longest upload phase in the workspace (a full graph walk, or a bulk
+/// vector load of 256 shards over S3 — both minutes) and absorbs clock skew
+/// between the GC host and the store. See ADR 0028.
+pub const DEFAULT_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// When a sweep runs and how old a blob must be to qualify.
+///
+/// `now` is a parameter rather than read from the clock so the grace period is
+/// testable without backdating files across three substrates.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepPolicy {
+    pub min_age: Duration,
+    pub now: SystemTime,
+}
+
+impl Default for SweepPolicy {
+    fn default() -> Self {
+        Self {
+            min_age: DEFAULT_MIN_AGE,
+            now: SystemTime::now(),
+        }
+    }
+}
+
+/// Delete every blob in `blobs` outside the `live` mark set **and** at least
+/// [`DEFAULT_MIN_AGE`] old, and report what was freed, retained, and deferred.
 ///
 /// Split from [`gc_blobs`] so a caller that already knows its live set — a
 /// single view's manifests, say — can sweep without re-listing the store. The
@@ -102,16 +143,58 @@ pub async fn sweep_blobs<B>(blobs: &B, live: &BTreeSet<ContentHash>) -> Result<G
 where
     B: BlobStore + ?Sized,
 {
-    let all = blobs.list_blobs().await?;
-    let freed = unreferenced_slices(&all, live);
+    sweep_blobs_with(blobs, live, SweepPolicy::default()).await
+}
+
+/// As [`sweep_blobs`], with an explicit policy.
+pub async fn sweep_blobs_with<B>(
+    blobs: &B,
+    live: &BTreeSet<ContentHash>,
+    policy: SweepPolicy,
+) -> Result<GcReport>
+where
+    B: BlobStore + ?Sized,
+{
+    // Listings promise neither order nor uniqueness, so collapse duplicates to
+    // the NEWEST timestamp: a stale duplicate must never make a young blob look
+    // collectable.
+    let mut newest: BTreeMap<ContentHash, i64> = BTreeMap::new();
+    for entry in blobs.list_blobs().await? {
+        newest
+            .entry(entry.hash)
+            .and_modify(|ms| *ms = (*ms).max(entry.modified_unix_ms))
+            .or_insert(entry.modified_unix_ms);
+    }
+
+    let mut freed = Vec::new();
+    let mut deferred = 0usize;
+    let mut retained = 0usize;
+    for (hash, modified_unix_ms) in &newest {
+        if live.contains(hash) {
+            retained += 1;
+            continue;
+        }
+        let entry = BlobEntry {
+            hash: hash.clone(),
+            modified_unix_ms: *modified_unix_ms,
+        };
+        // `None` means dated in the future — treated as too young, because
+        // deleting on the strength of a clock disagreement is the one outcome
+        // that loses data.
+        match entry.age(policy.now) {
+            Some(age) if age >= policy.min_age => freed.push(hash.clone()),
+            _ => deferred += 1,
+        }
+    }
+
     for hash in &freed {
         blobs.delete_blob(hash).await?;
     }
-    // `all` may repeat a hash (listing order and uniqueness are unspecified)
-    // while `freed` is deduplicated, so count retained from the distinct set.
-    let distinct: BTreeSet<&ContentHash> = all.iter().collect();
-    let retained = distinct.len() - freed.len();
-    Ok(GcReport { freed, retained })
+    Ok(GcReport {
+        freed,
+        retained,
+        deferred,
+    })
 }
 
 /// Mark-sweep every blob in `store`: delete the ones no record references.
@@ -125,6 +208,14 @@ pub async fn gc_blobs<T>(store: &T) -> Result<GcReport>
 where
     T: Store + BlobStore + ?Sized,
 {
+    gc_blobs_with(store, SweepPolicy::default()).await
+}
+
+/// As [`gc_blobs`], with an explicit policy.
+pub async fn gc_blobs_with<T>(store: &T, policy: SweepPolicy) -> Result<GcReport>
+where
+    T: Store + BlobStore + ?Sized,
+{
     // Raw, because a tombstone is what pins a deleted record's blob. A consumer
     // listing hides tombstones, and sweeping against it would free exactly the
     // blobs the pin exists to keep.
@@ -135,16 +226,24 @@ where
             records.push(record);
         }
     }
-    sweep_blobs(store, &live_blob_hashes(&records)?).await
+    sweep_blobs_with(store, &live_blob_hashes(&records)?, policy).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Identity, Meta, RecordKey};
+    use crate::{BlobEntry, Identity, Meta, RecordKey};
+    use std::time::SystemTime;
 
     fn h(s: &str) -> ContentHash {
         ContentHash::of(s.as_bytes())
+    }
+
+    fn immediate() -> SweepPolicy {
+        SweepPolicy {
+            min_age: Duration::ZERO,
+            now: SystemTime::now(),
+        }
     }
 
     fn meta() -> Meta {
@@ -333,8 +432,13 @@ mod tests {
         async fn get_blob(&self, _hash: &ContentHash) -> Result<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
-            Ok(self.listed.clone())
+        async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
+            Ok(self
+                .listed
+                .iter()
+                .cloned()
+                .map(|h| BlobEntry::from_system_time(h, UNIX_EPOCH + Duration::from_secs(1)))
+                .collect())
         }
         async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
             self.deleted.lock().unwrap().push(hash.clone());
@@ -352,7 +456,7 @@ mod tests {
             deleted: Default::default(),
         };
 
-        let report = sweep_blobs(&blobs, &BTreeSet::from([h("keep")]))
+        let report = sweep_blobs_with(&blobs, &BTreeSet::from([h("keep")]), immediate())
             .await
             .unwrap();
 
@@ -368,12 +472,157 @@ mod tests {
             deleted: Default::default(),
         };
 
-        let report = sweep_blobs(&blobs, &BTreeSet::from([h("a"), h("b")]))
+        let report = sweep_blobs_with(&blobs, &BTreeSet::from([h("a"), h("b")]), immediate())
             .await
             .unwrap();
 
         assert!(report.freed.is_empty());
         assert_eq!(report.retained, 2);
         assert!(blobs.deleted.lock().unwrap().is_empty());
+    }
+
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// A store whose blobs carry the timestamps a test chooses.
+    struct AgedBlobs(std::sync::Mutex<Vec<BlobEntry>>);
+
+    #[async_trait::async_trait]
+    impl BlobStore for AgedBlobs {
+        async fn put_blob(&self, _content: &[u8]) -> Result<ContentHash> {
+            unreachable!("tests seed blobs directly")
+        }
+        async fn get_blob(&self, _hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+            self.0.lock().unwrap().retain(|e| &e.hash != hash);
+            Ok(())
+        }
+    }
+
+    fn aged(entries: Vec<(ContentHash, SystemTime)>) -> AgedBlobs {
+        AgedBlobs(std::sync::Mutex::new(
+            entries
+                .into_iter()
+                .map(|(h, t)| BlobEntry::from_system_time(h, t))
+                .collect(),
+        ))
+    }
+
+    fn policy(now: u64, min_age_secs: u64) -> SweepPolicy {
+        SweepPolicy {
+            min_age: Duration::from_secs(min_age_secs),
+            now: at(now),
+        }
+    }
+
+    // The bug this ticket exists for: a blob uploaded moments ago, whose
+    // manifest has not committed yet, must survive the sweep.
+    #[tokio::test]
+    async fn a_young_unreferenced_blob_is_deferred_not_freed() {
+        let blobs = aged(vec![(h("fresh"), at(3_600))]);
+        let report = sweep_blobs_with(&blobs, &BTreeSet::new(), policy(3_630, 3_600))
+            .await
+            .unwrap();
+        assert!(report.freed.is_empty());
+        assert_eq!(report.deferred, 1);
+        assert_eq!(report.retained, 0);
+    }
+
+    #[tokio::test]
+    async fn an_old_unreferenced_blob_is_freed() {
+        let blobs = aged(vec![(h("stale"), at(0))]);
+        let report = sweep_blobs_with(&blobs, &BTreeSet::new(), policy(7_200, 3_600))
+            .await
+            .unwrap();
+        assert_eq!(report.freed, vec![h("stale")]);
+        assert_eq!(report.deferred, 0);
+    }
+
+    // Review Focus 2. `>=`, not `>` — otherwise a blob sits one tick short of
+    // collectable forever.
+    #[tokio::test]
+    async fn a_blob_exactly_min_age_old_is_freed() {
+        let blobs = aged(vec![(h("edge"), at(0))]);
+        let report = sweep_blobs_with(&blobs, &BTreeSet::new(), policy(3_600, 3_600))
+            .await
+            .unwrap();
+        assert_eq!(report.freed, vec![h("edge")]);
+    }
+
+    // Review Focus 3. The migration path for every pre-existing test, and the
+    // way an operator asks for the old behaviour.
+    #[tokio::test]
+    async fn a_zero_min_age_sweeps_immediately() {
+        let blobs = aged(vec![(h("now"), at(1_000))]);
+        let report = sweep_blobs_with(
+            &blobs,
+            &BTreeSet::new(),
+            SweepPolicy {
+                min_age: Duration::ZERO,
+                now: at(1_000),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.freed, vec![h("now")]);
+    }
+
+    #[tokio::test]
+    async fn a_referenced_blob_is_retained_however_old() {
+        let blobs = aged(vec![(h("live"), at(0))]);
+        let live = BTreeSet::from([h("live")]);
+        let report = sweep_blobs_with(&blobs, &live, policy(100_000, 3_600))
+            .await
+            .unwrap();
+        assert!(report.freed.is_empty());
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.deferred, 0);
+    }
+
+    // The GC host's clock behind the store's. Deleting on the strength of a
+    // clock disagreement is the one outcome that loses data.
+    #[tokio::test]
+    async fn a_future_dated_blob_is_deferred_not_freed() {
+        let blobs = aged(vec![(h("ahead"), at(9_000))]);
+        let report = sweep_blobs_with(&blobs, &BTreeSet::new(), policy(1_000, 0))
+            .await
+            .unwrap();
+        assert!(report.freed.is_empty());
+        assert_eq!(report.deferred, 1);
+    }
+
+    // Review Focus 4. Listings promise neither order nor uniqueness; a
+    // duplicate must not let a young blob read as old.
+    #[tokio::test]
+    async fn a_repeated_hash_resolves_to_its_newest_timestamp() {
+        let blobs = aged(vec![(h("dup"), at(0)), (h("dup"), at(3_600))]);
+        let report = sweep_blobs_with(&blobs, &BTreeSet::new(), policy(3_630, 3_600))
+            .await
+            .unwrap();
+        assert!(report.freed.is_empty(), "the newest timestamp is young");
+        assert_eq!(report.deferred, 1);
+        assert_eq!(report.freed.len() + report.retained + report.deferred, 1);
+    }
+
+    #[tokio::test]
+    async fn the_three_outcomes_partition_the_distinct_blobs() {
+        let blobs = aged(vec![
+            (h("live"), at(0)),
+            (h("old"), at(0)),
+            (h("young"), at(3_600)),
+        ]);
+        let live = BTreeSet::from([h("live")]);
+        let report = sweep_blobs_with(&blobs, &live, policy(3_630, 3_600))
+            .await
+            .unwrap();
+        assert_eq!(report.freed.len() + report.retained + report.deferred, 3);
     }
 }

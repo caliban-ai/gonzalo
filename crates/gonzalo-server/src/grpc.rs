@@ -435,9 +435,15 @@ impl Gonzalo for GrpcAdapter {
     ) -> Result<Response<ListBlobsResponse>, Status> {
         let (metadata, _ext, _r) = req.into_parts();
         self.authorize(&metadata, Access::Read, BLOB_NS)?;
-        let hashes = self.service.list_blobs().await.map_err(internal)?;
+        let entries = self.service.list_blobs().await.map_err(internal)?;
         Ok(Response::new(ListBlobsResponse {
-            hashes: hashes.into_iter().map(|h| h.0).collect(),
+            entries: entries
+                .into_iter()
+                .map(|e| gonzalo_proto::v1::BlobEntry {
+                    hash: e.hash.0,
+                    modified_unix_ms: e.modified_unix_ms,
+                })
+                .collect(),
         }))
     }
 
@@ -921,7 +927,12 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(listed.hashes, vec![hash.clone()]);
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].hash, hash);
+        assert_ne!(
+            listed.entries[0].modified_unix_ms, 0,
+            "a zero timestamp means the substrate never reported one"
+        );
 
         adapter
             .delete_blob(Request::new(DeleteBlobRequest { hash: hash.clone() }))

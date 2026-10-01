@@ -5,6 +5,8 @@
 - **Source:** [`docs/superpowers/specs/2026-09-20-durable-vector-index-design.md`](../superpowers/specs/2026-09-20-durable-vector-index-design.md)
   (see that spec's "As built" section for where the shipped code departs from
   it)
+- **Amended by:** [ADR 0028](0028-blob-gc-grace-period.md), which narrows the
+  GC-during-commit window below for live writers.
 - **Amends:** [ADR 0014](0014-approximate-vector-index-backend.md), whose
   "Revisit if" named "on-disk or distributed scale" as a future trigger. This
   ADR is that revisit: it does not change the backend 0014 chose
@@ -244,9 +246,9 @@ correctly starts with empty counts.
   realistic *width*; it is not the number to quote for opening a real
   10,000-chunk index. `gonzalo gc`'s mark set already covers vector shard
   blobs, the same way it covers a graph manifest's slices, so running GC
-  against a store holding a durable vector index is safe **when no writer is
-  mid-commit** — see the commit-window gap below for the case where it is
-  not. An external vector backend (#202) still plugs in at the unchanged
+  against a store holding a durable vector index is much safer for live writers
+  than before, but not fully safe (see the commit-window consequence below and
+  ADR 0028 for the residual cases). An external vector backend (#202) still plugs in at the unchanged
   `VectorIndex` trait, without anything in this design standing in its way.
 - **Negative:** **one writer per index** — OCC detects a second writer and
   retries; it never merges. A second writer's in-memory view of shards it
@@ -272,17 +274,27 @@ correctly starts with empty counts.
   byte-identical content; `upsert_many(vec![])` was closed instead (`commit`
   now returns early when its delta batch is empty), but `remove` needs a
   staged-vs-stored hash comparison inside `commit` to close the same way,
-  which is separate follow-up work, not this fix. **GC is not safe during a
-  commit**: `commit` writes a new shard's blob before it `put`s the manifest
-  that names it, so a sweep landing in that window sees the shard as
-  unreferenced and deletes it; the manifest then commits naming a blob that no
-  longer exists, and the next `open` fails with "shard N names blob … but it
-  is absent" — the whole index becomes unopenable. The graph indexer has the
-  same window, but its data can be rebuilt by re-parsing source; a vector
-  index's caller-supplied vectors cannot be regenerated, so this window is
-  **unrecoverable** for vectors. A grace period to close it in code is
-  tracked as follow-up, not part of this change. **Deleting a vector manifest
-  does not pin its shards**: a tombstone pins only `Body::Blob`, and a
+  which is separate follow-up work, not this fix. **A GC sweep landing during a commit
+  is narrowed for live writers, not closed**: `commit` writes a new
+  shard's blob before it `put`s the manifest that names it, so a sweep landing
+  in that window used to see the shard as unreferenced and delete it, leaving a
+  manifest that names an absent blob and an index the next `open` cannot read
+  ("shard N names blob … but it is absent"). [ADR
+  0028](0028-blob-gc-grace-period.md) narrows that for live writers: a sweep
+  skips blobs younger than `min_age` (one hour by default), and `commit`
+  re-checks, after the manifest lands, any shard blob it newly referenced and
+  re-uploads one that is missing. What remains, first, is a writer that **crashes**
+  between its manifest commit and that re-check, which can still lose a newly
+  referenced old shard. Because caller-supplied vectors cannot be regenerated,
+  that case is **unrecoverable** for vectors. A second window needs no crash:
+  a sweep that has already decided to delete an old shard blob deletes it even
+  if a live writer commits a manifest naming it before the delete, because the
+  writer's re-check sees the blob still present. The re-check narrows the
+  exposure to GC's own mark-to-delete interval; it does not remove it, and
+  only durable leases would close both. Running `gonzalo gc` while vector
+  writes are in flight is therefore much less risky than before, not risk-free.
+  **Deleting a vector manifest
+  does not pin its shards** (open work: #327): a tombstone pins only `Body::Blob`, and a
   manifest's body is inline, so `delete` followed by `gc` sweeps the shards
   while the tombstone naming them still exists. **`sync` does not copy
   blobs**, so an index synced to a peer opens there with a missing-blob

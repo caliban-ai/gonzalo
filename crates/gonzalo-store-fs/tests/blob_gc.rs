@@ -4,10 +4,19 @@
 
 use gonzalo_core::{
     BlobStore, Body, ContentHash, DeleteResult, Identity, KeyPrefix, Manifest, Meta, PutResult,
-    Record, RecordKey, RecordKind, Store, collect, gc_blobs, now_ms,
+    Record, RecordKey, RecordKind, Store, SweepPolicy, collect, gc_blobs_with, now_ms,
 };
 use gonzalo_store_fs::FsStore;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+/// The tests assert a blob is freed right after it is written, which the
+/// default grace period now defers; opt out explicitly.
+fn immediate() -> SweepPolicy {
+    SweepPolicy {
+        min_age: Duration::ZERO,
+        now: SystemTime::now(),
+    }
+}
 
 fn fresh_store() -> FsStore {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -56,7 +65,13 @@ async fn list_blobs_reports_stored_hashes_and_skips_temps() {
     let h1 = store.put_blob(b"one").await.unwrap();
     let h2 = store.put_blob(b"two").await.unwrap();
 
-    let mut listed = store.list_blobs().await.unwrap();
+    let mut listed: Vec<ContentHash> = store
+        .list_blobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.hash)
+        .collect();
     listed.sort();
     let mut want = vec![h1, h2];
     want.sort();
@@ -107,7 +122,7 @@ async fn gc_sweeps_slices_no_live_manifest_references() {
     put_manifest(&store, "repo", "main", &main).await;
     put_manifest(&store, "repo", "feature", &feature).await;
 
-    let report = gc_blobs(&store).await.unwrap();
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
 
     assert_eq!(report.freed, vec![orphan.clone()]);
     assert_eq!(report.retained, 2);
@@ -123,7 +138,7 @@ async fn gc_with_no_records_frees_everything() {
     store.put_blob(b"a").await.unwrap();
     store.put_blob(b"b").await.unwrap();
 
-    let report = gc_blobs(&store).await.unwrap();
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
     assert_eq!(report.freed.len(), 2);
     assert_eq!(report.retained, 0);
     assert!(store.list_blobs().await.unwrap().is_empty());
@@ -137,7 +152,7 @@ async fn gc_keeps_a_live_records_own_blob_body() {
     let key = RecordKey::new("ns", "docs", "readme");
     let hash = put_blob_backed(&store, &key, b"the document body").await;
 
-    let report = gc_blobs(&store).await.unwrap();
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
 
     assert!(
         report.freed.is_empty(),
@@ -161,7 +176,7 @@ async fn a_tombstone_pins_its_blob_until_it_is_collected() {
     // The record is gone from consumer reads, but its bytes are pinned: a peer
     // can still sync the record back, and re-putting the same content must not
     // have to re-upload it.
-    let report = gc_blobs(&store).await.unwrap();
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
     assert!(
         report.freed.is_empty(),
         "a tombstone pins the blob of the record it replaced"
@@ -174,7 +189,7 @@ async fn a_tombstone_pins_its_blob_until_it_is_collected() {
         .unwrap();
     assert_eq!(collected.purged.len(), 1);
 
-    let report = gc_blobs(&store).await.unwrap();
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
     assert_eq!(report.freed, vec![hash.clone()]);
     assert_eq!(store.get_blob(&hash).await.unwrap(), None);
 }
@@ -203,9 +218,42 @@ async fn recreating_a_deleted_key_keeps_the_new_blob_and_drops_the_old_pin() {
     )
     .await;
 
-    let report = gc_blobs(&store).await.unwrap();
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
 
     assert_eq!(report.freed, vec![old.clone()]);
     assert_eq!(store.get_blob(&old).await.unwrap(), None);
     assert!(store.get_blob(&new).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn list_blobs_reports_a_modified_time_for_each_blob() {
+    let store = fresh_store();
+    let before = std::time::SystemTime::now();
+    let h = store.put_blob(b"one").await.unwrap();
+    let after = std::time::SystemTime::now();
+
+    let listed = store.list_blobs().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].hash, h);
+    let m =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(listed[0].modified_unix_ms as u64);
+    // Filesystem mtime granularity can be coarse, so allow a second of slack
+    // on each side rather than asserting a strict interval.
+    assert!(m + std::time::Duration::from_secs(1) >= before);
+    assert!(m <= after + std::time::Duration::from_secs(1));
+}
+
+// Weak by design: a blob deleted before listing never reaches `read_dir`. The
+// mid-listing race policy is pinned by `blob_entry_from_dir_entry`'s unit tests.
+#[tokio::test]
+async fn list_blobs_omits_a_deleted_blob() {
+    let store = fresh_store();
+    let keep = store.put_blob(b"keep").await.unwrap();
+    let gone = store.put_blob(b"gone").await.unwrap();
+
+    store.delete_blob(&gone).await.unwrap();
+
+    let listed = store.list_blobs().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].hash, keep);
 }

@@ -127,7 +127,7 @@ for the full authorship rules.
 | `GET /v1/raw/keys?namespace=&collection=` | list keys including tombstoned ones, both filters optional |
 | `POST /v1/purge/{ns}/{col}/{id}` | body `{"expected": <revision>}`; physically removes the record |
 | `GET`, `PUT`, `DELETE /v1/blobs/{hash}` | content-addressed blob bytes |
-| `GET /v1/blobs` | list blob hashes |
+| `GET /v1/blobs` | list blobs, as objects carrying each blob's hash and modified time |
 | `POST /v1/tickets/sync` | sync one ticket connection; the body is one `[[connection]]` entry from `tickets.toml`, as JSON |
 | `GET /v1/graph/{definitions,references,callers,callees,impact}?repo=&view=&name=` | code-graph queries against an indexed view |
 

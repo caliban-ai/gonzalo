@@ -642,6 +642,24 @@ pub async fn index_with_worker(
         }
     }
 
+    // Only added/modified paths need checking: an unchanged path was referenced
+    // by both the old manifest and the new one, so no sweep ever saw it as
+    // garbage.
+    let newly_referenced: Vec<(String, ContentHash)> = recon
+        .added
+        .iter()
+        .chain(recon.modified.iter())
+        .filter_map(|p| recon.manifest.get(p).map(|h| (p.clone(), h.clone())))
+        .collect();
+    // An error here returns after the manifest committed but before
+    // `staging.apply`, so the persistent graph stays behind the manifest (#153's
+    // invariant holds) and the next run starts from a stale base; hence the
+    // message tells the operator to re-index.
+    let restored = ensure_slices_present(&store, &newly_referenced, &staging).await?;
+    if restored > 0 {
+        eprintln!("restored {restored} slice blob(s) swept during this index run");
+    }
+
     // Manifest committed — now advance the persistent graph to match it.
     staging.apply(&mut graph);
 
@@ -719,6 +737,43 @@ struct DesiredView {
     unindexed: UnindexedCounts,
     /// Whether the git-diff-driven driver produced this, rather than a full walk.
     incremental: bool,
+}
+
+/// Confirm the slice blobs a just-committed manifest references still exist,
+/// re-uploading any a sweep took.
+///
+/// A sweep can delete a blob between the upload and the manifest commit naming
+/// it. GC's age filter covers a freshly uploaded slice, but not an **old** blob
+/// this run newly references — content-addressed dedup makes that ordinary when
+/// a file reverts to earlier content. Returns how many blobs it restored. See
+/// ADR 0028.
+async fn ensure_slices_present(
+    store: &FsStore,
+    wanted: &[(String, ContentHash)],
+    staging: &GraphStaging,
+) -> anyhow::Result<usize> {
+    let mut restored = 0;
+    for (path, hash) in wanted {
+        if store.has_blob(hash).await? {
+            continue;
+        }
+        let Some((_, slice)) = staging.inserts.iter().find(|(p, _)| p == path) else {
+            anyhow::bail!(
+                "slice blob {} for {path} is missing and this run did not parse it, \
+                 so it cannot be restored; re-index the view",
+                hash.0
+            );
+        };
+        let put = store.put_blob(&slice.to_slice_bytes()).await?;
+        anyhow::ensure!(
+            &put == hash,
+            "restored slice for {path} hashes to {} rather than the committed {}",
+            put.0,
+            hash.0
+        );
+        restored += 1;
+    }
+    Ok(restored)
 }
 
 async fn build_desired_full(
@@ -866,6 +921,10 @@ pub struct GcSummary {
     pub freed: usize,
     /// Blobs kept because some record still references them.
     pub retained: usize,
+    /// Unreferenced blobs kept because they are younger than the sweep policy's
+    /// `min_age`. Without this an operator cannot tell "nothing to reclaim" from
+    /// "reclaiming held back by the age rule".
+    pub deferred: usize,
 }
 
 /// Sweep unreferenced blobs from the store at `root` (gonzalo#292).
@@ -882,7 +941,7 @@ pub struct GcSummary {
 /// Deleting a record therefore does not reclaim its bytes: the tombstone pins
 /// them until `collect` removes it past the horizon. Reclaiming is `delete`,
 /// then `collect`, then this.
-pub async fn gc(root: &Path) -> Result<GcSummary> {
+pub async fn gc(root: &Path, min_age: Duration) -> Result<GcSummary> {
     let store = FsStore::new(root);
 
     // Every record, across all repos and collections (unset prefix = all), and
@@ -896,11 +955,16 @@ pub async fn gc(root: &Path) -> Result<GcSummary> {
     }
 
     let live = gonzalo_core::live_blob_hashes(&records)?;
-    let report = gonzalo_core::sweep_blobs(&store, &live).await?;
+    let policy = gonzalo_core::SweepPolicy {
+        min_age,
+        now: std::time::SystemTime::now(),
+    };
+    let report = gonzalo_core::sweep_blobs_with(&store, &live, policy).await?;
     Ok(GcSummary {
         scanned: records.len(),
         freed: report.freed.len(),
         retained: report.retained,
+        deferred: report.deferred,
     })
 }
 
@@ -916,8 +980,18 @@ pub async fn index_with_gc(
     repo: &str,
     view: &str,
     gc_after: bool,
+    min_age: Duration,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
-    index_with_gc_filtered(root, src, repo, view, gc_after, &IndexFilter::default()).await
+    index_with_gc_filtered(
+        root,
+        src,
+        repo,
+        view,
+        gc_after,
+        min_age,
+        &IndexFilter::default(),
+    )
+    .await
 }
 
 /// [`index_with_gc`], with control over which paths enter the view (#209).
@@ -927,26 +1001,41 @@ pub async fn index_with_gc_filtered(
     repo: &str,
     view: &str,
     gc_after: bool,
+    min_age: Duration,
     filter: &IndexFilter,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
     let mode = resolve_parse_worker();
-    index_with_gc_filtered_worker(root, src, repo, view, gc_after, filter, mode.worker()).await
+    index_with_gc_filtered_worker(
+        root,
+        src,
+        repo,
+        view,
+        gc_after,
+        min_age,
+        filter,
+        mode.worker(),
+    )
+    .await
 }
 
 /// [`index_with_gc_filtered`], with the parse worker pinned rather than
 /// resolved — see [`index_with_worker`].
+// Eight parameters: the index/GC/worker knobs are independent and every caller
+// spells them out; a params struct would be churn for one internal-ish seam.
+#[allow(clippy::too_many_arguments)]
 pub async fn index_with_gc_filtered_worker(
     root: &Path,
     src: &Path,
     repo: &str,
     view: &str,
     gc_after: bool,
+    min_age: Duration,
     filter: &IndexFilter,
     worker: Option<&Path>,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
     let summary = index_with_worker(root, src, repo, view, filter, worker).await?;
     let swept = if gc_after {
-        Some(gc(root).await?)
+        Some(gc(root, min_age).await?)
     } else {
         None
     };
@@ -1325,6 +1414,7 @@ mod tests {
         repo: &str,
         view: &str,
         gc_after: bool,
+        min_age: Duration,
     ) -> Result<(IndexSummary, Option<GcSummary>)> {
         index_with_gc_filtered_worker(
             root,
@@ -1332,6 +1422,7 @@ mod tests {
             repo,
             view,
             gc_after,
+            min_age,
             &IndexFilter::default(),
             None,
         )
@@ -2248,7 +2339,7 @@ mod tests {
     #[tokio::test]
     async fn gc_on_empty_store_frees_nothing() {
         let root = TempDir::new().unwrap();
-        let summary = gc(root.path()).await.unwrap();
+        let summary = gc(root.path(), Duration::ZERO).await.unwrap();
         assert_eq!(summary.scanned, 0);
         assert_eq!(summary.freed, 0);
         assert_eq!(summary.retained, 0);
@@ -2265,7 +2356,7 @@ mod tests {
         write_file(src.path(), "a.rs", "fn a() { b(); }");
         index(root.path(), src.path(), "r", "main").await.unwrap();
 
-        let summary = gc(root.path()).await.unwrap();
+        let summary = gc(root.path(), Duration::ZERO).await.unwrap();
         assert_eq!(summary.scanned, 1, "the view's manifest record");
         assert_eq!(summary.freed, 1, "the pre-edit slice is unreferenced");
         assert_eq!(summary.retained, 1, "the current slice stays");
@@ -2274,6 +2365,34 @@ mod tests {
         let g =
             SqliteGraphStore::open(view_db_path(&root.path().join("graphs"), "r", "main")).unwrap();
         assert_eq!(g.definitions("a")[0].path, "a.rs");
+    }
+
+    // The flag's default is a string clap parses at startup. A typo here is a
+    // runtime failure on every `gonzalo gc`, which no other test would catch.
+    #[test]
+    fn the_default_min_age_spelling_parses_to_an_hour() {
+        assert_eq!(
+            parse_duration("1h").unwrap(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(parse_duration("1h").unwrap(), gonzalo_core::DEFAULT_MIN_AGE);
+    }
+
+    #[tokio::test]
+    async fn gc_defers_a_blob_younger_than_min_age_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+        store.put_blob(b"brand new").await.unwrap();
+
+        // The default horizon: nothing written moments ago is collectable.
+        let held = gc(dir.path(), gonzalo_core::DEFAULT_MIN_AGE).await.unwrap();
+        assert_eq!(held.freed, 0);
+        assert_eq!(held.deferred, 1);
+
+        // An operator asking for the old behaviour gets it.
+        let swept = gc(dir.path(), std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(swept.freed, 1);
+        assert_eq!(swept.deferred, 0);
     }
 
     // ── index: view membership (#209) ────────────────────────────────────────
@@ -2377,14 +2496,15 @@ mod tests {
         // Reindex changed content with the post-index sweep on: the pre-edit
         // slice is orphaned and should be freed in the same call.
         write_file(src.path(), "a.rs", "fn a() { b(); }");
-        let (_summary, swept) = index_with_gc(root.path(), src.path(), "r", "main", true)
-            .await
-            .unwrap();
+        let (_summary, swept) =
+            index_with_gc(root.path(), src.path(), "r", "main", true, Duration::ZERO)
+                .await
+                .unwrap();
         let swept = swept.expect("gc runs when enabled");
         assert_eq!(swept.freed, 1, "orphaned slice swept during the index");
 
         // A follow-up gc finds nothing left to free.
-        assert_eq!(gc(root.path()).await.unwrap().freed, 0);
+        assert_eq!(gc(root.path(), Duration::ZERO).await.unwrap().freed, 0);
     }
 
     #[tokio::test]
@@ -2395,13 +2515,14 @@ mod tests {
         index(root.path(), src.path(), "r", "main").await.unwrap();
 
         write_file(src.path(), "a.rs", "fn a() { b(); }");
-        let (_summary, swept) = index_with_gc(root.path(), src.path(), "r", "main", false)
-            .await
-            .unwrap();
+        let (_summary, swept) =
+            index_with_gc(root.path(), src.path(), "r", "main", false, Duration::ZERO)
+                .await
+                .unwrap();
         assert!(swept.is_none(), "no gc when disabled");
 
         // The orphan survived: an explicit gc still has one to free.
-        assert_eq!(gc(root.path()).await.unwrap().freed, 1);
+        assert_eq!(gc(root.path(), Duration::ZERO).await.unwrap().freed, 1);
     }
 
     // ── watch: debounce core (gonzalo#100) ──────────────────────────────────
@@ -2464,7 +2585,7 @@ mod tests {
         std::fs::remove_file(src_a.path().join("shared.rs")).unwrap();
         index(root.path(), src_a.path(), "r", "a").await.unwrap();
 
-        let summary = gc(root.path()).await.unwrap();
+        let summary = gc(root.path(), Duration::ZERO).await.unwrap();
         assert_eq!(summary.scanned, 2, "one manifest record per view");
         assert_eq!(
             summary.freed, 0,
@@ -2810,5 +2931,38 @@ mod tombstone_cli_tests {
             ..clean
         };
         assert_eq!(sync_exit_code(&unconverged), EXIT_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ensure_slices_present_restores_a_blob_that_was_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        // Parse one real file so staging holds a Slice whose bytes we can restore.
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let mut staging = GraphStaging::default();
+        let desired = build_desired_full(&store, &mut staging, None, &src, &IndexFilter::default())
+            .await
+            .unwrap();
+
+        let wanted: Vec<(String, ContentHash)> = desired
+            .entries
+            .iter()
+            .map(|(p, h)| (p.clone(), h.clone()))
+            .collect();
+        assert!(!wanted.is_empty(), "the parsed file produced a slice");
+
+        // A sweep takes it between the upload and the manifest commit.
+        store.delete_blob(&wanted[0].1).await.unwrap();
+        assert!(!store.has_blob(&wanted[0].1).await.unwrap());
+
+        let restored = ensure_slices_present(&store, &wanted, &staging)
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert!(store.has_blob(&wanted[0].1).await.unwrap());
     }
 }

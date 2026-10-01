@@ -16,6 +16,7 @@
 
 use crate::{Debouncer, index_with_gc};
 use anyhow::{Context, Result};
+use gonzalo_core::DEFAULT_MIN_AGE;
 use notify::{RecursiveMode, Watcher};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -56,7 +57,7 @@ pub async fn watch(
     gc: bool,
 ) -> Result<()> {
     // Prime the view before watching, so a fresh run is immediately queryable.
-    let (summary, swept) = index_with_gc(root, src, repo, view, gc).await?;
+    let (summary, swept) = index_with_gc(root, src, repo, view, gc, DEFAULT_MIN_AGE).await?;
     eprintln!(
         "gonzalo watch: initial index ({} files, {} added, {} modified, {} deleted{})",
         summary.files,
@@ -99,12 +100,12 @@ pub async fn watch(
             _ = debounce_tick.tick() => {
                 if debouncer.is_due(Instant::now()) {
                     debouncer.clear();
-                    reindex(root, src, repo, view, gc, "incremental").await;
+                    reindex(root, src, repo, view, gc, DEFAULT_MIN_AGE, "incremental").await;
                 }
             }
             _ = reconcile_tick.tick() => {
                 debouncer.clear(); // a full pass subsumes any pending change
-                reindex(root, src, repo, view, gc, "full reconcile").await;
+                reindex(root, src, repo, view, gc, DEFAULT_MIN_AGE, "full reconcile").await;
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("gonzalo watch: shutting down");
@@ -119,8 +120,16 @@ pub async fn watch(
 /// orphaned slices. A failure is logged, not fatal — the watcher keeps running
 /// so a transient error (e.g. a half-written file) is corrected on the next
 /// event or reconcile.
-async fn reindex(root: &Path, src: &Path, repo: &str, view: &str, gc: bool, reason: &str) {
-    match index_with_gc(root, src, repo, view, gc).await {
+async fn reindex(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    gc: bool,
+    min_age: Duration,
+    reason: &str,
+) {
+    match index_with_gc(root, src, repo, view, gc, min_age).await {
         Ok((s, swept)) => eprintln!(
             "gonzalo watch: re-indexed ({reason}): {} added, {} modified, {} deleted{}",
             s.added,
@@ -169,11 +178,20 @@ mod tests {
         // Change the file so the pre-edit slice is orphaned, then reindex under
         // the watch loop's helper with gc enabled.
         std::fs::write(src.path().join("a.rs"), "fn a() { b(); }").unwrap();
-        reindex(root.path(), src.path(), "r", "main", true, "test").await;
+        reindex(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            true,
+            Duration::ZERO,
+            "test",
+        )
+        .await;
 
         // The orphan was already swept during the reindex, so an explicit gc
         // finds nothing left to free.
-        assert_eq!(gc(root.path()).await.unwrap().freed, 0);
+        assert_eq!(gc(root.path(), Duration::ZERO).await.unwrap().freed, 0);
     }
 
     /// Counterpart: without the flag, the reindex leaves the orphan behind.
@@ -185,9 +203,18 @@ mod tests {
         index(root.path(), src.path(), "r", "main").await.unwrap();
 
         std::fs::write(src.path().join("a.rs"), "fn a() { b(); }").unwrap();
-        reindex(root.path(), src.path(), "r", "main", false, "test").await;
+        reindex(
+            root.path(),
+            src.path(),
+            "r",
+            "main",
+            false,
+            Duration::ZERO,
+            "test",
+        )
+        .await;
 
         // The orphan survived: an explicit gc still has one to free.
-        assert_eq!(gc(root.path()).await.unwrap().freed, 1);
+        assert_eq!(gc(root.path(), Duration::ZERO).await.unwrap().freed, 1);
     }
 }

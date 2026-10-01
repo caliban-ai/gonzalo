@@ -11,6 +11,18 @@ the patch version for fixes.
 
 ### Added
 
+- **`BlobStore::has_blob`.** A defaulted method (`get_blob(..).is_some()`),
+  overridden by the filesystem store with `try_exists` and by S3 with
+  `HeadObject`. A failure that is not "no such key" is an error, not `false`.
+  Over the daemon it downloads the blob. (#325)
+- **A sweep policy for blob GC.** `SweepPolicy`, `DEFAULT_MIN_AGE` (one hour),
+  `sweep_blobs_with` and `gc_blobs_with` let a caller set the minimum blob age
+  explicitly; `gc_blobs` and `sweep_blobs` keep their signatures and use the
+  default. `GcReport` gains `deferred`, the unreferenced blobs held back for
+  being too young, and `freed` now comes back in hash order. (#325)
+- **`gonzalo gc --min-age <duration>`** (default `1h`, same spellings as
+  `collect --horizon`). The `gc` and `index --gc` summaries print `deferred`.
+  (#325)
 - **Vectors now survive the process that built them.** A new
   `RecordVectorIndex` persists a `VectorIndex` behind sharded,
   content-addressed blobs named by a new `RecordKind::VectorManifest` record
@@ -26,9 +38,9 @@ the patch version for fixes.
   already marks a graph manifest's slices, so running GC against a store
   holding a durable vector index is safe when no writer is mid-commit. A
   sweep that lands between a write's shard upload and its manifest commit
-  deletes the new shard and leaves the index unopenable, and unlike a graph
-  slice the vectors cannot be regenerated, so do not run `gonzalo gc` while
-  vector writes are in flight. A durable index's writes commit under
+  used to delete the new shard and leave the index unopenable; see the
+  grace-period fix under Fixed for how that is now narrowed, and what remains.
+  A durable index's writes commit under
   optimistic concurrency, retrying up to 5 times on a conflict. Each commit is
   checked against the manifest revision the writer's in-memory state came
   from, so two writers on the same shard cannot silently overwrite each
@@ -105,6 +117,18 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: `BlobStore::list_blobs` returns `Vec<BlobEntry>`.** Each entry
+  carries the blob's hash and `modified_unix_ms`, which the sweep needs to tell
+  a freshly uploaded blob from an abandoned one. Any out-of-tree `BlobStore`
+  implementor must change its signature. (#325)
+- **BREAKING: the daemon's blob listing returns objects.** HTTP
+  `GET /v1/blobs` returns `[{"hash": …, "modified_unix_ms": …}]` instead of
+  `["…"]`, and gRPC `ListBlobsResponse` reserves field 1 and adds
+  `repeated BlobEntry entries = 2`, so an old gRPC client sees an empty list and
+  a GC through it deletes nothing. `docs/api/openapi.json` gains a `BlobEntry`
+  schema; note that the #198 drift check compares paths and methods, not response
+  schemas, so this change is not guarded by it. See [ADR
+  0028](docs/adr/0028-blob-gc-grace-period.md). (#325)
 - **BREAKING: `VectorIndex` gains a required `keys` method.** There was no way
   to enumerate an arbitrary index's contents, which is what `KnowledgeStore::open`
   needs to rebuild derived state — its per-record chunk counts — after a
@@ -173,6 +197,18 @@ the patch version for fixes.
 
 ### Fixed
 
+- **A sweep could delete a blob between a writer's upload and the manifest
+  commit naming it.** Both manifest writers upload blobs before committing, so
+  a `gonzalo gc` (or `gonzalo index --gc` under `--watch`, which needs no
+  operator) landing in between deleted the blob; for a vector shard that left
+  the index unopenable and unrecoverable. A sweep now keeps unreferenced blobs
+  younger than the minimum age, and each writer re-checks the blobs it newly
+  referenced after its manifest commits and re-uploads any that are gone. This narrows
+  the race rather than closing it: a writer that crashes between its commit
+  and that re-check, or a live writer whose old blob a sweep had already
+  decided to delete, can still lose it, and the minimum age is also the clock-skew
+  tolerance: a GC host running ahead of the store defeats it. See [ADR
+  0028](docs/adr/0028-blob-gc-grace-period.md). (#325)
 - **`gonzalo gc` no longer deletes live records' content.** The mark set was
   built from graph manifests alone — the only blob references that existed when
   it was written — so on any store holding a record whose body is a blob, a

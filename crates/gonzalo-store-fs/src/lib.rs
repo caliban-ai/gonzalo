@@ -7,9 +7,9 @@ pub use tilde::expand_tilde;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
-    KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, Store, now_ms,
-    plan_delete, plan_purge, plan_put, plan_put_raw, validate_ancestor_cap,
+    BlobEntry, BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult,
+    Identity, KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, Store,
+    now_ms, plan_delete, plan_purge, plan_put, plan_put_raw, validate_ancestor_cap,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::io::{self, Write};
@@ -235,7 +235,7 @@ impl BlobStore for FsStore {
         }
     }
 
-    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+    async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
         let dir = layout::blobs_dir(&self.root);
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
@@ -254,11 +254,24 @@ impl BlobStore for FsStore {
             // temp files (`<hash>.tmp.<pid>.<nonce>`) and any stray files carry a
             // `.` and are skipped, so a concurrent `put_blob` is never mistaken for
             // a collectable blob.
-            if is_blob_hash(&name) {
-                out.push(ContentHash(name));
+            // Skip non-blobs before the metadata syscall; the decision function
+            // re-checks the name so it is correct on its own.
+            if !is_blob_hash(&name) {
+                continue;
+            }
+            let md = entry.metadata().await;
+            if let Some(e) = blob_entry_from_dir_entry(&name, md)? {
+                out.push(e);
             }
         }
         Ok(out)
+    }
+
+    async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        let path = layout::blob_path(&self.root, hash);
+        tokio::fs::try_exists(&path)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))
     }
 
     async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
@@ -270,6 +283,33 @@ impl BlobStore for FsStore {
             Err(e) => Err(CoreError::Backend(e.to_string())),
         }
     }
+}
+
+/// Decide what one directory entry contributes to a blob listing.
+///
+/// `Ok(None)` means skip: either the name is not a committed blob, or the blob
+/// was unlinked between `read_dir` and the metadata call — a concurrent sweeper,
+/// which must not abort this listing. Any other metadata failure is a real
+/// error.
+fn blob_entry_from_dir_entry(
+    name: &str,
+    metadata: std::io::Result<std::fs::Metadata>,
+) -> Result<Option<BlobEntry>> {
+    if !is_blob_hash(name) {
+        return Ok(None);
+    }
+    let md = match metadata {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CoreError::Backend(e.to_string())),
+    };
+    let modified = md
+        .modified()
+        .map_err(|e| CoreError::Backend(e.to_string()))?;
+    Ok(Some(BlobEntry::from_system_time(
+        ContentHash(name.to_string()),
+        modified,
+    )))
 }
 
 /// Whether `name` is a committed blob's filename: blake3 hex, `[0-9a-f]{64}`.
@@ -526,4 +566,56 @@ async fn collect_keys(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn hash_name() -> String {
+        "a".repeat(64)
+    }
+
+    #[test]
+    fn a_blob_unlinked_before_its_metadata_read_is_skipped() {
+        let r = blob_entry_from_dir_entry(&hash_name(), Err(Error::from(ErrorKind::NotFound)));
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_blob_hash_yields_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x");
+        std::fs::write(&f, b"x").unwrap();
+        for name in [
+            "not-a-hash",
+            "tmp.partial",
+            &"A".repeat(64),
+            &"a".repeat(63),
+        ] {
+            let r = blob_entry_from_dir_entry(name, std::fs::metadata(&f));
+            assert!(matches!(r, Ok(None)), "{name} must not be listed");
+        }
+    }
+
+    #[test]
+    fn any_other_metadata_failure_is_a_real_error() {
+        let r =
+            blob_entry_from_dir_entry(&hash_name(), Err(Error::from(ErrorKind::PermissionDenied)));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_readable_blob_yields_an_entry_with_a_real_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x");
+        std::fs::write(&f, b"x").unwrap();
+        let md = std::fs::metadata(&f);
+        let e = blob_entry_from_dir_entry(&hash_name(), md)
+            .unwrap()
+            .expect("an entry");
+        assert_eq!(e.hash, ContentHash(hash_name()));
+        assert_ne!(e.modified_unix_ms, 0);
+    }
 }
