@@ -234,17 +234,14 @@ async fn list_blobs_reports_a_modified_time_for_each_blob() {
     assert!(m <= after + std::time::Duration::from_secs(1));
 }
 
-// A concurrent sweeper (or `--watch --gc` beside a manual `gc`) can delete a
-// blob between `read_dir` and the metadata call. Skipping it keeps the listing
-// usable; erroring would abort the whole GC run.
+// Weak by design: a blob deleted before listing never reaches `read_dir`. The
+// mid-listing race policy is pinned by `blob_entry_from_dir_entry`'s unit tests.
 #[tokio::test]
-async fn list_blobs_skips_a_blob_that_vanishes_mid_listing() {
+async fn list_blobs_omits_a_deleted_blob() {
     let store = fresh_store();
     let keep = store.put_blob(b"keep").await.unwrap();
     let gone = store.put_blob(b"gone").await.unwrap();
 
-    // Simulate the race deterministically: the entry is in the directory when
-    // `read_dir` runs, and absent when metadata is read.
     store.delete_blob(&gone).await.unwrap();
 
     let listed = store.list_blobs().await.unwrap();

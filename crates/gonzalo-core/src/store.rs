@@ -128,11 +128,13 @@ pub struct BlobEntry {
 impl BlobEntry {
     pub fn from_system_time(hash: ContentHash, modified: SystemTime) -> Self {
         let modified_unix_ms = match modified.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_millis() as i64,
+            // Saturate toward the future: a wrapped value would read as very old,
+            // the one direction that deletes data.
+            Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
             // Before the epoch: a bogus or wildly-wrong mtime. Represent it
             // faithfully as a negative rather than clamping, so it reads as very
             // old (collectable) instead of accidentally very new.
-            Err(e) => -(e.duration().as_millis() as i64),
+            Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
         };
         Self {
             hash,
@@ -147,8 +149,10 @@ impl BlobEntry {
     /// disagreement.
     pub fn age(&self, now: SystemTime) -> Option<Duration> {
         let now_ms = match now.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_millis() as i64,
-            Err(e) => -(e.duration().as_millis() as i64),
+            // Saturate toward the future: a wrapped value would read as very old,
+            // the one direction that deletes data.
+            Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+            Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
         };
         let age_ms = now_ms.checked_sub(self.modified_unix_ms)?;
         if age_ms < 0 {
