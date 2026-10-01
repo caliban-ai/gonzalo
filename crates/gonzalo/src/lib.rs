@@ -152,10 +152,11 @@
 // (ADR 0026). Everything that is a *domain noun* lives under the module naming
 // its domain, mirroring the structure `gonzalo-domain` already has.
 pub use gonzalo_core::{
-    AncestryStore, BlobStore, Body, CollectReport, Conflict, ContentHash, CoreError, DeleteResult,
-    GcReport, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta, PutResult, Record, RecordKey,
-    RecordKind, ResetReport, Result, Revision, Store, SyncConflict, SyncReport, collect, gc_blobs,
-    merge, now_ms, reset, reset_as, sync, sync_with_ancestry,
+    AncestryStore, BlobEntry, BlobStore, Body, CollectReport, Conflict, ContentHash, CoreError,
+    DEFAULT_MIN_AGE, DeleteResult, GcReport, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta,
+    PutResult, Record, RecordKey, RecordKind, ResetReport, Result, Revision, Store, SweepPolicy,
+    SyncConflict, SyncReport, collect, gc_blobs, gc_blobs_with, merge, now_ms, reset, reset_as,
+    sync, sync_with_ancestry,
 };
 
 #[cfg(feature = "fs")]
@@ -289,6 +290,25 @@ mod facade_reexports {
         let report = GcReport::default();
         assert!(report.freed.is_empty());
         assert_eq!(report.retained, 0);
+    }
+
+    #[test]
+    fn blob_gc_policy_surface_is_re_exported() {
+        // An out-of-tree `BlobStore` implementor writes `list_blobs` against
+        // `BlobEntry`, and a caller wanting anything but the safe default
+        // reaches for `SweepPolicy` / `gc_blobs_with` (ADR 0028).
+        let entry = BlobEntry {
+            hash: ContentHash("h".into()),
+            modified_unix_ms: 0,
+        };
+        assert_eq!(entry.modified_unix_ms, 0);
+        let _policy = SweepPolicy {
+            min_age: DEFAULT_MIN_AGE,
+            ..SweepPolicy::default()
+        };
+        // Naming it in a `use` pins the export without needing a store.
+        #[allow(unused_imports)]
+        use crate::gc_blobs_with as _;
     }
 
     #[test]
