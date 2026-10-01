@@ -5,6 +5,8 @@
 - **Amends:** [ADR 0012](0012-code-graph-two-level-keying.md), whose mark-sweep marked
   against manifests alone. [ADR 0021](0021-replicated-deletion-with-tombstones.md)
   named blob garbage collection as follow-up work; this is it.
+- **Amended by:** [ADR 0028](0028-blob-gc-grace-period.md), which adds an age rule
+  to the sweep: an unreferenced blob is deleted only once it is old enough.
 
 ## Context
 

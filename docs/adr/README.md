@@ -48,10 +48,11 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted (blob GC follow-up settled by [0024](0024-blob-garbage-collection.md); S3 listing cost by [0025](0025-s3-tombstone-markers.md)) |
 | [0022](0022-fleet-access-control-records.md) | Fleet access-control records as a capability layer | accepted (channel config and `GrantScope::Repo` amended by [0023](0023-channel-config-fields.md)) |
 | [0023](0023-channel-config-fields.md) | Channel configuration fields, and workspaces instead of repos | accepted |
-| [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted |
+| [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted (sweep gains an age rule from [0028](0028-blob-gc-grace-period.md)) |
 | [0025](0025-s3-tombstone-markers.md) | Sibling tombstone markers in the S3 layout | accepted |
 | [0026](0026-grouped-facade-surface.md) | A grouped facade surface | accepted |
-| [0027](0027-durable-vector-index.md) | A durable vector index | accepted |
+| [0027](0027-durable-vector-index.md) | A durable vector index | accepted (GC-during-commit window addressed for live writers by [0028](0028-blob-gc-grace-period.md)) |
+| [0028](0028-blob-gc-grace-period.md) | A grace period for blob garbage collection | accepted |
 
 ## Adding a new ADR
 

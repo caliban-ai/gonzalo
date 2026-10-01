@@ -179,10 +179,13 @@ reloads every shard that changed and retries.
 
 `gonzalo gc` already treats a vector manifest's shard blobs as live, the same
 way it treats a code-graph manifest's slices, so running GC against a store
-holding a durable vector index is safe when no writer is mid-commit. A sweep
-that lands between a commit's shard-blob write and its manifest write can
-still delete the not-yet-referenced shard, which is unrecoverable for vectors
-since they cannot be regenerated the way graph slices can — see
+holding a durable vector index is safe while writers are running: a sweep
+skips blobs younger than `--min-age` (one hour by default), and a writer
+re-checks the blobs it newly referenced after its manifest commits
+([ADR 0028](./adr/0028-blob-gc-grace-period.md)). One window remains: a writer
+that crashes between its manifest commit and that re-check can still lose a
+newly referenced shard to a sweep, which is unrecoverable for vectors since
+they cannot be regenerated the way graph slices can — see
 [ADR 0027](./adr/0027-durable-vector-index.md#consequences).
 
 The whole index loads into memory when opened — there is no partial or paged

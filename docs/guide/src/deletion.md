@@ -246,12 +246,23 @@ $ gonzalo gc --root ./store
 scanned:  128
 freed:    3
 retained: 41
+deferred: 0
 ```
 
 `gc` marks every blob the store still needs, from the records themselves: a
 record whose body *is* a blob, the blob a tombstone pins, every code-graph
 slice a view's manifest names, and every shard a vector index's manifest
-names. Everything else is deleted.
+names. Everything else is deleted, with one exception: a blob younger than
+`--min-age` (default `1h`) is kept, because a writer uploads its blobs before the
+manifest that names them, and a sweep in between would delete a blob that is
+about to be referenced ([ADR 0028](./adr/0028-blob-gc-grace-period.md)). Those
+blobs are counted as `deferred`, so a sweep that reclaims nothing tells you
+whether there was nothing to reclaim or only blobs too young to touch. They are
+freed by a later `gc` once they are old enough. `--min-age` takes the same
+spellings as `collect --horizon`; the one-hour default is also how long your
+clocks may disagree, so don't lower it below the skew between the GC host and
+the store. `gonzalo index --gc` (including under `--watch`) always uses the
+default.
 
 **A tombstone pins the blob of the record it replaced** (ADR 0024). A delete is
 replicated, not final: while the tombstone is around, a peer that never saw the
