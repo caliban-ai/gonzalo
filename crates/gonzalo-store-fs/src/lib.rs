@@ -7,9 +7,9 @@ pub use tilde::expand_tilde;
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
-    KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, Store, now_ms,
-    plan_delete, plan_purge, plan_put, plan_put_raw, validate_ancestor_cap,
+    BlobEntry, BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult,
+    Identity, KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, Store,
+    now_ms, plan_delete, plan_purge, plan_put, plan_put_raw, validate_ancestor_cap,
 };
 use rustix::fs::{FlockOperation, flock};
 use std::io::{self, Write};
@@ -235,7 +235,7 @@ impl BlobStore for FsStore {
         }
     }
 
-    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+    async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
         let dir = layout::blobs_dir(&self.root);
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
@@ -255,7 +255,18 @@ impl BlobStore for FsStore {
             // `.` and are skipped, so a concurrent `put_blob` is never mistaken for
             // a collectable blob.
             if is_blob_hash(&name) {
-                out.push(ContentHash(name));
+                // A concurrent sweeper can unlink the blob between `read_dir`
+                // and this metadata call. Skip a vanished entry rather than
+                // failing the listing, which would abort the GC run that is
+                // probably what deleted it.
+                let modified = match entry.metadata().await {
+                    Ok(md) => md
+                        .modified()
+                        .map_err(|e| CoreError::Backend(e.to_string()))?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(CoreError::Backend(e.to_string())),
+                };
+                out.push(BlobEntry::from_system_time(ContentHash(name), modified));
             }
         }
         Ok(out)

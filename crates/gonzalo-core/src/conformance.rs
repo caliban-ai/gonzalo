@@ -883,7 +883,13 @@ async fn blob_list_reports_stored_hashes<B: BlobStore>(store: &B) {
     assert!(store.list_blobs().await.unwrap().is_empty());
     let h1 = store.put_blob(b"slice one").await.unwrap();
     let h2 = store.put_blob(b"slice two").await.unwrap();
-    let mut listed = store.list_blobs().await.unwrap();
+    let mut listed: Vec<ContentHash> = store
+        .list_blobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.hash)
+        .collect();
     listed.sort();
     let mut want = vec![h1, h2];
     want.sort();

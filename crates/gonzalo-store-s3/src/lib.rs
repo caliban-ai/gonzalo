@@ -6,11 +6,13 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult, Identity,
-    KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision, decode_segment,
-    now_ms, object_key, plan_delete, plan_purge, plan_put, plan_put_raw, validate_ancestor_cap,
+    BlobEntry, BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, DeletePlan, DeleteResult,
+    Identity, KeyPrefix, PurgePlan, PutPlan, PutResult, Record, RecordKey, Result, Revision,
+    decode_segment, now_ms, object_key, plan_delete, plan_purge, plan_put, plan_put_raw,
+    validate_ancestor_cap,
 };
 
 /// Key prefix under which content-addressed blobs live (`blobs/<hash>`), kept
@@ -1016,7 +1018,7 @@ impl BlobStore for S3Store {
         }
     }
 
-    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+    async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
         let mut out = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
@@ -1036,7 +1038,18 @@ impl BlobStore for S3Store {
                 if let Some(k) = obj.key()
                     && let Some(hash) = blob_hash_from_key(k)
                 {
-                    out.push(hash);
+                    // ListObjectsV2 always carries LastModified; a response
+                    // without one is a malformed listing, not a blob we can
+                    // reason about the age of.
+                    let dt = obj.last_modified().ok_or_else(|| {
+                        CoreError::Backend(format!("blob {k} listed without a LastModified"))
+                    })?;
+                    let modified = SystemTime::try_from(*dt).map_err(|e| {
+                        CoreError::Backend(format!(
+                            "blob {k} has an unrepresentable LastModified: {e}"
+                        ))
+                    })?;
+                    out.push(BlobEntry::from_system_time(hash, modified));
                 }
             }
             match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {

@@ -491,7 +491,7 @@ async fn delete_blob(
     }
 }
 
-/// `GET /v1/blobs` — JSON array of every stored blob hash. Authorized `Read` on
+/// `GET /v1/blobs` — JSON array of every stored blob as `{hash, modified_unix_ms}`. Authorized `Read` on
 /// `_blobs`.
 async fn list_blobs(
     State(svc): State<Arc<Service>>,
@@ -501,7 +501,7 @@ async fn list_blobs(
         return forbidden(&principal, Access::Read, BLOB_NS);
     }
     match svc.list_blobs().await {
-        Ok(hashes) => (StatusCode::OK, Json(hashes)).into_response(),
+        Ok(entries) => (StatusCode::OK, Json(entries)).into_response(),
         Err(e) => server_error(e),
     }
 }
@@ -1180,8 +1180,20 @@ mod tests {
         // LIST reports the hash.
         let (s, body) = call(svc.clone(), auth.clone(), "GET", "/v1/blobs", None, None).await;
         assert_eq!(s, StatusCode::OK);
-        let hashes: Vec<gonzalo_core::ContentHash> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(hashes, vec![gonzalo_core::ContentHash::of(&content)]);
+        let entries: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let first = &entries.as_array().expect("an array of blob entries")[0];
+        assert_eq!(
+            first.get("hash").and_then(|h| h.as_str()),
+            Some(gonzalo_core::ContentHash::of(&content).0.as_str())
+        );
+        let ms = first
+            .get("modified_unix_ms")
+            .and_then(|m| m.as_i64())
+            .expect("modified_unix_ms is present and an integer");
+        assert_ne!(
+            ms, 0,
+            "a zero timestamp means the substrate never reported one"
+        );
 
         // DELETE removes it; a follow-up GET is 404.
         let (s, _) = call(

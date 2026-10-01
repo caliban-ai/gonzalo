@@ -97,7 +97,9 @@ impl<S: Store, B: BlobStore> Store for AncestryStore<S, B> {
 pub(crate) mod tests {
     use super::*;
     use crate::store::Conflict;
-    use crate::{Body, ContentHash, CoreError, Identity, Meta, RecordKind, revision::Revision};
+    use crate::{
+        BlobEntry, Body, ContentHash, CoreError, Identity, Meta, RecordKind, revision::Revision,
+    };
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -187,8 +189,15 @@ pub(crate) mod tests {
         async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
             Ok(self.blobs.lock().unwrap().get(hash).cloned())
         }
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
-            Ok(self.blobs.lock().unwrap().keys().cloned().collect())
+        async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
+            Ok(self
+                .blobs
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .map(|h| BlobEntry::from_system_time(h, std::time::SystemTime::now()))
+                .collect())
         }
         async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
             self.blobs.lock().unwrap().remove(hash);

@@ -102,7 +102,8 @@ pub async fn sweep_blobs<B>(blobs: &B, live: &BTreeSet<ContentHash>) -> Result<G
 where
     B: BlobStore + ?Sized,
 {
-    let all = blobs.list_blobs().await?;
+    let entries = blobs.list_blobs().await?;
+    let all: Vec<ContentHash> = entries.into_iter().map(|e| e.hash).collect();
     let freed = unreferenced_slices(&all, live);
     for hash in &freed {
         blobs.delete_blob(hash).await?;
@@ -141,7 +142,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Identity, Meta, RecordKey};
+    use crate::{BlobEntry, Identity, Meta, RecordKey};
+    use std::time::SystemTime;
 
     fn h(s: &str) -> ContentHash {
         ContentHash::of(s.as_bytes())
@@ -333,8 +335,13 @@ mod tests {
         async fn get_blob(&self, _hash: &ContentHash) -> Result<Option<Vec<u8>>> {
             Ok(None)
         }
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
-            Ok(self.listed.clone())
+        async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
+            Ok(self
+                .listed
+                .iter()
+                .cloned()
+                .map(|h| BlobEntry::from_system_time(h, SystemTime::now()))
+                .collect())
         }
         async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
             self.deleted.lock().unwrap().push(hash.clone());

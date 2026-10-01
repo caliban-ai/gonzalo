@@ -170,7 +170,12 @@ async fn s3_blob_store_put_get_list_delete() {
 
     // Listed among the stored blobs.
     assert!(
-        store.list_blobs().await.unwrap().contains(&hash),
+        store
+            .list_blobs()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.hash == hash),
         "put blob must appear in list_blobs"
     );
 
@@ -178,7 +183,14 @@ async fn s3_blob_store_put_get_list_delete() {
     store.delete_blob(&hash).await.unwrap();
     assert_eq!(store.get_blob(&hash).await.unwrap(), None);
     store.delete_blob(&hash).await.unwrap();
-    assert!(!store.list_blobs().await.unwrap().contains(&hash));
+    assert!(
+        !store
+            .list_blobs()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.hash == hash)
+    );
 }
 
 /// The TOCTOU acceptance test for gonzalo#5: many writers that all read the

@@ -3,6 +3,7 @@
 use crate::{ContentHash, Identity, Record, RecordKey, Result, Revision};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
 
 /// A detected concurrent-edit conflict: the caller's write expected
 /// `expected` to be the current revision, but the store holds `current`.
@@ -111,6 +112,52 @@ pub trait Store: Send + Sync {
     async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult>;
 }
 
+/// One stored blob and when it was last written.
+///
+/// The timestamp is Unix milliseconds rather than a [`SystemTime`] because this
+/// type crosses the daemon's HTTP and gRPC surfaces, where milliseconds are the
+/// wire form; keeping one type avoids a near-identical DTO in the client and the
+/// server. Use [`from_system_time`](Self::from_system_time) and
+/// [`age`](Self::age) rather than reading the field arithmetically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobEntry {
+    pub hash: ContentHash,
+    pub modified_unix_ms: i64,
+}
+
+impl BlobEntry {
+    pub fn from_system_time(hash: ContentHash, modified: SystemTime) -> Self {
+        let modified_unix_ms = match modified.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as i64,
+            // Before the epoch: a bogus or wildly-wrong mtime. Represent it
+            // faithfully as a negative rather than clamping, so it reads as very
+            // old (collectable) instead of accidentally very new.
+            Err(e) => -(e.duration().as_millis() as i64),
+        };
+        Self {
+            hash,
+            modified_unix_ms,
+        }
+    }
+
+    /// How old this blob is at `now`, or `None` when it is dated in the future.
+    ///
+    /// Callers treat `None` as "too young to sweep": a blob dated ahead of the
+    /// GC host's clock must not be deleted on the strength of a clock
+    /// disagreement.
+    pub fn age(&self, now: SystemTime) -> Option<Duration> {
+        let now_ms = match now.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as i64,
+            Err(e) => -(e.duration().as_millis() as i64),
+        };
+        let age_ms = now_ms.checked_sub(self.modified_unix_ms)?;
+        if age_ms < 0 {
+            return None;
+        }
+        Some(Duration::from_millis(age_ms as u64))
+    }
+}
+
 /// A content-addressed blob store for out-of-line record bodies
 /// ([`Body::Blob`]). Content is keyed by its [`ContentHash`], so byte-identical
 /// bodies — e.g. code-graph slices shared across worktrees (ADR 0012) — are
@@ -127,11 +174,61 @@ pub trait BlobStore: Send + Sync {
     /// Fetch blob content by hash, or `None` if absent.
     async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>>;
 
-    /// List the hashes of every stored blob. Order is unspecified. Used by GC
-    /// to enumerate candidates for sweeping (ADR 0012).
-    async fn list_blobs(&self) -> Result<Vec<ContentHash>>;
+    /// Every stored blob with the time it was last written. Order is
+    /// unspecified, and a hash may repeat — a caller that cares resolves a
+    /// duplicate to its newest timestamp. Used by GC to enumerate candidates
+    /// and decide which are old enough to sweep (ADR 0024, 0028).
+    async fn list_blobs(&self) -> Result<Vec<BlobEntry>>;
+
+    /// Whether `hash` is stored.
+    ///
+    /// Defaulted so this is not a breaking addition. The default fetches the
+    /// blob and throws the bytes away; substrates override it with a cheap
+    /// existence check. A writer uses this after committing to confirm the
+    /// blobs it referenced are still present (ADR 0028).
+    async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        Ok(self.get_blob(hash).await?.is_some())
+    }
 
     /// Delete the blob addressed by `hash`. Deleting an absent blob is an
     /// idempotent no-op — GC may race another sweeper or a re-put.
     async fn delete_blob(&self, hash: &ContentHash) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn at(ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn age_is_the_gap_between_modified_and_now() {
+        let e = BlobEntry::from_system_time(ContentHash("h".into()), at(1_000));
+        assert_eq!(e.age(at(4_000)), Some(Duration::from_millis(3_000)));
+    }
+
+    #[test]
+    fn age_of_a_blob_dated_in_the_future_is_none() {
+        // The GC host's clock behind the store's. `None` means "too young", so
+        // the sweep keeps the blob — ambiguity errs toward keeping data.
+        let e = BlobEntry::from_system_time(ContentHash("h".into()), at(9_000));
+        assert_eq!(e.age(at(1_000)), None);
+    }
+
+    #[test]
+    fn age_at_exactly_now_is_zero_not_none() {
+        let e = BlobEntry::from_system_time(ContentHash("h".into()), at(5_000));
+        assert_eq!(e.age(at(5_000)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_pre_epoch_timestamp_round_trips_as_a_negative_and_still_ages() {
+        let before_epoch = UNIX_EPOCH - Duration::from_millis(500);
+        let e = BlobEntry::from_system_time(ContentHash("h".into()), before_epoch);
+        assert!(e.modified_unix_ms < 0);
+        assert_eq!(e.age(at(500)), Some(Duration::from_millis(1_000)));
+    }
 }

@@ -634,7 +634,7 @@ mod tests {
             result
         }
 
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
             self.inner.list_blobs().await
         }
 
@@ -694,7 +694,7 @@ mod tests {
             self.inner.get_blob(hash).await
         }
 
-        async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+        async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
             self.inner.list_blobs().await
         }
 

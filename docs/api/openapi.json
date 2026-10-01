@@ -277,14 +277,14 @@
     "/v1/blobs": {
       "get": {
         "tags": ["blobs"],
-        "summary": "List stored blob hashes",
+        "summary": "List stored blobs",
         "description": "Requires `read` on the `_blobs` namespace.",
         "responses": {
           "200": {
-            "description": "every stored blob's hash",
+            "description": "every stored blob, with the time it was last written",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ContentHash" } }
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/BlobEntry" } }
               }
             }
           },
@@ -393,6 +393,18 @@
       "ContentHash": {
         "type": "string",
         "description": "A blake3 hash, hex-encoded."
+      },
+      "BlobEntry": {
+        "type": "object",
+        "required": ["hash", "modified_unix_ms"],
+        "properties": {
+          "hash": { "$ref": "#/components/schemas/ContentHash" },
+          "modified_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the blob was last written, Unix milliseconds."
+          }
+        }
       },
       "RecordKey": {
         "type": "object",

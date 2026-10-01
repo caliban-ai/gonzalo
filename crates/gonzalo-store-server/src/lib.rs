@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult, Record,
-    RecordKey, Result, Revision, Store, store::Conflict,
+    BlobEntry, BlobStore, ContentHash, CoreError, DeleteResult, Identity, KeyPrefix, PutResult,
+    Record, RecordKey, Result, Revision, Store, store::Conflict,
 };
 use gonzalo_proto::http::{
     DeleteBody, DeleteOutcome, PurgeBody, PutBody, PutOutcome, RawRecordBody,
@@ -540,7 +540,7 @@ impl BlobStore for ServerStore {
         }
     }
 
-    async fn list_blobs(&self) -> Result<Vec<ContentHash>> {
+    async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
         match &self.backend {
             Backend::Http {
                 base,
@@ -553,13 +553,20 @@ impl BlobStore for ServerStore {
                     .await
                     .map_err(be)?;
                 let resp = ensure_read_ok(resp).await?;
-                Ok(resp.json::<Vec<ContentHash>>().await.map_err(be)?)
+                Ok(resp.json::<Vec<BlobEntry>>().await.map_err(be)?)
             }
             Backend::Grpc { client, token } => {
                 let mut client = client.clone();
                 let req = grpc_request(ListBlobsRequest {}, token)?;
                 let resp = client.list_blobs(req).await.map_err(status)?.into_inner();
-                Ok(resp.hashes.into_iter().map(ContentHash).collect())
+                Ok(resp
+                    .entries
+                    .into_iter()
+                    .map(|e| BlobEntry {
+                        hash: ContentHash(e.hash),
+                        modified_unix_ms: e.modified_unix_ms,
+                    })
+                    .collect())
             }
         }
     }

@@ -56,7 +56,13 @@ async fn list_blobs_reports_stored_hashes_and_skips_temps() {
     let h1 = store.put_blob(b"one").await.unwrap();
     let h2 = store.put_blob(b"two").await.unwrap();
 
-    let mut listed = store.list_blobs().await.unwrap();
+    let mut listed: Vec<ContentHash> = store
+        .list_blobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.hash)
+        .collect();
     listed.sort();
     let mut want = vec![h1, h2];
     want.sort();
@@ -208,4 +214,40 @@ async fn recreating_a_deleted_key_keeps_the_new_blob_and_drops_the_old_pin() {
     assert_eq!(report.freed, vec![old.clone()]);
     assert_eq!(store.get_blob(&old).await.unwrap(), None);
     assert!(store.get_blob(&new).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn list_blobs_reports_a_modified_time_for_each_blob() {
+    let store = fresh_store();
+    let before = std::time::SystemTime::now();
+    let h = store.put_blob(b"one").await.unwrap();
+    let after = std::time::SystemTime::now();
+
+    let listed = store.list_blobs().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].hash, h);
+    let m =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(listed[0].modified_unix_ms as u64);
+    // Filesystem mtime granularity can be coarse, so allow a second of slack
+    // on each side rather than asserting a strict interval.
+    assert!(m + std::time::Duration::from_secs(1) >= before);
+    assert!(m <= after + std::time::Duration::from_secs(1));
+}
+
+// A concurrent sweeper (or `--watch --gc` beside a manual `gc`) can delete a
+// blob between `read_dir` and the metadata call. Skipping it keeps the listing
+// usable; erroring would abort the whole GC run.
+#[tokio::test]
+async fn list_blobs_skips_a_blob_that_vanishes_mid_listing() {
+    let store = fresh_store();
+    let keep = store.put_blob(b"keep").await.unwrap();
+    let gone = store.put_blob(b"gone").await.unwrap();
+
+    // Simulate the race deterministically: the entry is in the directory when
+    // `read_dir` runs, and absent when metadata is read.
+    store.delete_blob(&gone).await.unwrap();
+
+    let listed = store.list_blobs().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].hash, keep);
 }
