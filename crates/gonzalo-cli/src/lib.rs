@@ -642,6 +642,20 @@ pub async fn index_with_worker(
         }
     }
 
+    // Only added/modified paths need checking: an unchanged path was referenced
+    // by both the old manifest and the new one, so no sweep ever saw it as
+    // garbage.
+    let newly_referenced: Vec<(String, ContentHash)> = recon
+        .added
+        .iter()
+        .chain(recon.modified.iter())
+        .filter_map(|p| recon.manifest.get(p).map(|h| (p.clone(), h.clone())))
+        .collect();
+    let restored = ensure_slices_present(&store, &newly_referenced, &staging).await?;
+    if restored > 0 {
+        eprintln!("restored {restored} slice blob(s) swept during this index run");
+    }
+
     // Manifest committed — now advance the persistent graph to match it.
     staging.apply(&mut graph);
 
@@ -719,6 +733,43 @@ struct DesiredView {
     unindexed: UnindexedCounts,
     /// Whether the git-diff-driven driver produced this, rather than a full walk.
     incremental: bool,
+}
+
+/// Confirm the slice blobs a just-committed manifest references still exist,
+/// re-uploading any a sweep took.
+///
+/// A sweep can delete a blob between the upload and the manifest commit naming
+/// it. GC's age filter covers a freshly uploaded slice, but not an **old** blob
+/// this run newly references — content-addressed dedup makes that ordinary when
+/// a file reverts to earlier content. Returns how many blobs it restored. See
+/// ADR 0028.
+async fn ensure_slices_present(
+    store: &FsStore,
+    wanted: &[(String, ContentHash)],
+    staging: &GraphStaging,
+) -> anyhow::Result<usize> {
+    let mut restored = 0;
+    for (path, hash) in wanted {
+        if store.has_blob(hash).await? {
+            continue;
+        }
+        let Some((_, slice)) = staging.inserts.iter().find(|(p, _)| p == path) else {
+            anyhow::bail!(
+                "slice blob {} for {path} is missing and this run did not parse it, \
+                 so it cannot be restored; re-index the view",
+                hash.0
+            );
+        };
+        let put = store.put_blob(&slice.to_slice_bytes()).await?;
+        anyhow::ensure!(
+            &put == hash,
+            "restored slice for {path} hashes to {} rather than the committed {}",
+            put.0,
+            hash.0
+        );
+        restored += 1;
+    }
+    Ok(restored)
 }
 
 async fn build_desired_full(
@@ -2876,5 +2927,38 @@ mod tombstone_cli_tests {
             ..clean
         };
         assert_eq!(sync_exit_code(&unconverged), EXIT_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ensure_slices_present_restores_a_blob_that_was_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+
+        // Parse one real file so staging holds a Slice whose bytes we can restore.
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        let mut staging = GraphStaging::default();
+        let desired = build_desired_full(&store, &mut staging, None, &src, &IndexFilter::default())
+            .await
+            .unwrap();
+
+        let wanted: Vec<(String, ContentHash)> = desired
+            .entries
+            .iter()
+            .map(|(p, h)| (p.clone(), h.clone()))
+            .collect();
+        assert!(!wanted.is_empty(), "the parsed file produced a slice");
+
+        // A sweep takes it between the upload and the manifest commit.
+        store.delete_blob(&wanted[0].1).await.unwrap();
+        assert!(!store.has_blob(&wanted[0].1).await.unwrap());
+
+        let restored = ensure_slices_present(&store, &wanted, &staging)
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert!(store.has_blob(&wanted[0].1).await.unwrap());
     }
 }
