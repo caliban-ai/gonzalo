@@ -132,8 +132,10 @@ impl BlobEntry {
             // the one direction that deletes data.
             Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
             // Before the epoch: a bogus or wildly-wrong mtime. Represent it
-            // faithfully as a negative rather than clamping, so it reads as very
-            // old (collectable) instead of accidentally very new.
+            // faithfully as a negative rather than clamping, so an ordinary
+            // negative reads as very old (collectable). In the saturating
+            // sub-case (`-i64::MAX`) `age()`'s `checked_sub` overflows and
+            // returns `None`, so that blob is KEPT.
             Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
         };
         Self {
@@ -203,6 +205,20 @@ pub trait BlobStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_saturated_pre_epoch_timestamp_has_no_age_and_so_is_kept() {
+        // `from_system_time` saturates a pre-epoch mtime to `-i64::MAX`, which a
+        // `SystemTime` cannot portably express (it would need to be ~292 million
+        // years before the epoch), so the struct is built directly. `age()`'s
+        // `checked_sub` overflows and returns `None`, which the sweep treats as
+        // too young: the blob is kept, not collected.
+        let e = super::BlobEntry {
+            hash: super::ContentHash("h".into()),
+            modified_unix_ms: -i64::MAX,
+        };
+        assert_eq!(e.age(std::time::SystemTime::now()), None);
+    }
+
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 

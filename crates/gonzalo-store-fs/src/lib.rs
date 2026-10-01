@@ -584,6 +584,22 @@ mod listing_tests {
     }
 
     #[test]
+    fn a_name_that_is_not_a_blob_hash_yields_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x");
+        std::fs::write(&f, b"x").unwrap();
+        for name in [
+            "not-a-hash",
+            "tmp.partial",
+            &"A".repeat(64),
+            &"a".repeat(63),
+        ] {
+            let r = blob_entry_from_dir_entry(name, std::fs::metadata(&f));
+            assert!(matches!(r, Ok(None)), "{name} must not be listed");
+        }
+    }
+
+    #[test]
     fn any_other_metadata_failure_is_a_real_error() {
         let r =
             blob_entry_from_dir_entry(&hash_name(), Err(Error::from(ErrorKind::PermissionDenied)));
