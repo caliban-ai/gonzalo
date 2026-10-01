@@ -71,11 +71,15 @@ just referenced again.
   gRPC surfaces, where milliseconds are the wire form, so one type serves core,
   client and server instead of three near-identical ones, and age arithmetic
   stays in integers.
-- **Every ambiguity errs toward keeping data.** `age` returns `None` for a
-  future-dated blob (the GC host's clock is behind the store's) and for
-  arithmetic that cannot be represented, and the sweep treats every `None` as
-  too young. Overflow saturates to `i64::MAX`, which reads as future and hence
-  too young.
+- **Clock disagreements an operator can plausibly hit err toward keeping
+  data.** `age` returns `None` for a future-dated blob (the GC host's clock is
+  behind the store's) and when the subtraction cannot be represented, and the
+  sweep treats every `None` as too young. A blob's own timestamp that overflows
+  saturates to `i64::MAX`, which reads as future and hence too young. Two
+  pathological cases go the other way: a blob timestamped before the Unix epoch
+  maps to a negative value that reads as very old and collectable, and a `now`
+  that overflows saturates to `i64::MAX`, which also reads as very old. Neither
+  is reachable with a sane clock, but they are exceptions, not kept data.
 - **A hash listed more than once resolves to its newest timestamp**, in a
   separate pass before any decision is made, so a stale duplicate cannot make a
   young blob collectable.
@@ -145,7 +149,10 @@ enough margin for upload and ordinary skew without leaving garbage for days.
 
 ## Consequences
 
-- **Positive:** the race is closed for live writers on every substrate.
+- **Positive:** the race is narrowed for live writers on every substrate: a
+  blob a writer is about to reference is no longer exposed for the whole
+  upload-to-commit interval, only for the much shorter interval described in
+  the second negative consequence below.
   `gonzalo index --gc` under `--watch` is covered with no flag, because the
   production callers pass `DEFAULT_MIN_AGE`. `deferred` tells an operator why a
   sweep reclaimed nothing, instead of leaving "nothing to free" and "everything
@@ -155,6 +162,18 @@ enough margin for upload and ordinary skew without leaving garbage for days.
   close that window. A sweep that lands in it deletes the blob, the process
   dies before re-uploading, and for a vector shard the index is left
   unopenable. Durable leases are the only fix, and they are out of scope here.
+- **Negative:** **a live writer can still lose a blob to a sweep that has
+  already decided to delete it.** GC computes its mark set, lists blobs,
+  decides an old blob is unreferenced and collectable, and then deletes. If a
+  writer commits a manifest naming that blob after the decision but before the
+  delete, the writer's re-check sees the blob still present and does nothing,
+  and GC then deletes it, leaving a manifest that names a missing blob. No
+  crash is involved. This is the same flaw as the one that rules out freshening
+  on re-put: GC deletes on a decision it already made. The re-check narrows the
+  exposure from the whole upload-to-commit interval to GC's own mark-to-delete
+  interval; it does not remove it. Closing it entirely needs durable leases, or
+  a GC that re-marks immediately before each delete, and neither is part of
+  this change.
 - **Negative:** **clock skew beyond `min_age`**, in the losing direction (GC host
   *ahead* of the store), defeats the age filter. `min_age` is the skew
   tolerance; it is not a separate setting, and lowering it for faster

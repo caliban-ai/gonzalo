@@ -246,9 +246,9 @@ correctly starts with empty counts.
   realistic *width*; it is not the number to quote for opening a real
   10,000-chunk index. `gonzalo gc`'s mark set already covers vector shard
   blobs, the same way it covers a graph manifest's slices, so running GC
-  against a store holding a durable vector index is safe for live writers
-  (see the commit-window consequence below and ADR 0028 for the residual
-  crash case). An external vector backend (#202) still plugs in at the unchanged
+  against a store holding a durable vector index is much safer for live writers
+  than before, but not fully safe (see the commit-window consequence below and
+  ADR 0028 for the residual cases). An external vector backend (#202) still plugs in at the unchanged
   `VectorIndex` trait, without anything in this design standing in its way.
 - **Negative:** **one writer per index** — OCC detects a second writer and
   retries; it never merges. A second writer's in-memory view of shards it
@@ -275,7 +275,7 @@ correctly starts with empty counts.
   now returns early when its delta batch is empty), but `remove` needs a
   staged-vs-stored hash comparison inside `commit` to close the same way,
   which is separate follow-up work, not this fix. **A GC sweep landing during a commit
-  is closed for live writers, but not for a crashed one**: `commit` writes a new
+  is narrowed for live writers, not closed**: `commit` writes a new
   shard's blob before it `put`s the manifest that names it, so a sweep landing
   in that window used to see the shard as unreferenced and delete it, leaving a
   manifest that names an absent blob and an index the next `open` cannot read
@@ -283,12 +283,17 @@ correctly starts with empty counts.
   0028](0028-blob-gc-grace-period.md) closes that for live writers: a sweep
   skips blobs younger than `min_age` (one hour by default), and `commit`
   re-checks, after the manifest lands, any shard blob it newly referenced and
-  re-uploads one that is missing. What remains is a writer that **crashes**
+  re-uploads one that is missing. What remains, first, is a writer that **crashes**
   between its manifest commit and that re-check, which can still lose a newly
   referenced old shard. Because caller-supplied vectors cannot be regenerated,
-  that case is **unrecoverable** for vectors, and only durable leases would
-  close it. Operators no longer need to avoid `gonzalo gc` while vector
-  writes are in flight. **Deleting a vector manifest
+  that case is **unrecoverable** for vectors. A second window needs no crash:
+  a sweep that has already decided to delete an old shard blob deletes it even
+  if a live writer commits a manifest naming it before the delete, because the
+  writer's re-check sees the blob still present. The re-check narrows the
+  exposure to GC's own mark-to-delete interval; it does not remove it, and
+  only durable leases would close both. Running `gonzalo gc` while vector
+  writes are in flight is therefore much less risky than before, not risk-free.
+  **Deleting a vector manifest
   does not pin its shards**: a tombstone pins only `Body::Blob`, and a
   manifest's body is inline, so `delete` followed by `gc` sweeps the shards
   while the tombstone naming them still exists. **`sync` does not copy

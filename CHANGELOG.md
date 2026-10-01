@@ -203,9 +203,10 @@ the patch version for fixes.
   operator) landing in between deleted the blob; for a vector shard that left
   the index unopenable and unrecoverable. A sweep now keeps unreferenced blobs
   younger than the minimum age, and each writer re-checks the blobs it newly
-  referenced after its manifest commits and re-uploads any that are gone. A
-  writer that crashes between its commit and that re-check can still lose a
-  newly referenced old blob, and the minimum age is also the clock-skew
+  referenced after its manifest commits and re-uploads any that are gone. This narrows
+  the race rather than closing it: a writer that crashes between its commit
+  and that re-check, or a live writer whose old blob a sweep had already
+  decided to delete, can still lose it, and the minimum age is also the clock-skew
   tolerance: a GC host running ahead of the store defeats it. See [ADR
   0028](docs/adr/0028-blob-gc-grace-period.md). (#325)
 - **`gonzalo gc` no longer deletes live records' content.** The mark set was

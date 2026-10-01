@@ -46,9 +46,12 @@ content, re-referencing the blob the first write orphaned.
 
 ## Decisions
 
-1. **Guarantee: no loss while writers are alive.** A writer that stays up never
-   loses a blob it referenced. A writer that *crashes* inside a millisecond
-   window can still lose one; closing that needs durable leases, which is
+1. **Guarantee: the race is narrowed, not closed.** A blob a writer has just
+   uploaded is protected for `min_age`, and the writer's re-check restores a
+   missing blob it newly referenced. Two windows remain (see "Known limits"):
+   a writer that *crashes* between its commit and its re-check, and a live
+   writer whose blob a sweep has already decided to delete. Closing either
+   needs durable leases (or a GC that re-marks before each delete), which is
    deliberately out of scope (see "Rejected alternatives").
 2. **GC sweeps by blob age.** `list_blobs` reports each blob's modified time and
    the sweep deletes only unreferenced blobs at least `min_age` old.
@@ -249,8 +252,16 @@ and nothing to explain why.
 - **A writer that crashes between its commit and its re-check**, having newly
   referenced an old blob that a concurrent GC sweeps in that window, still loses
   it. Durable leases are the only fix and are out of scope.
+- **A live writer can lose a blob to a sweep that already decided.** GC marks,
+  lists, decides an old blob is collectable, then deletes. A writer that commits
+  a manifest naming that blob between the decision and the delete runs its
+  re-check, sees the blob still present, and does nothing; GC then deletes it.
+  No crash is involved. The re-check narrows the exposure from the whole
+  upload-to-commit interval to GC's mark-to-delete interval; closing it needs
+  leases or a re-mark immediately before each delete.
 - **Clock skew beyond `min_age`** in the losing direction (GC host ahead of the
-  store) defeats the age filter. The writer re-check still covers a live writer.
+  store) defeats the age filter. The writer re-check only partly covers this,
+  for the reason in the previous limit.
 - **A `ServerStore` `has_blob` downloads the blob.** Correct, but costs
   bandwidth per newly referenced blob on the daemon path.
 - **The #198 drift check compares paths and methods, not response schemas**, so
