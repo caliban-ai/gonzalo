@@ -1044,6 +1044,8 @@ The age filter protects *freshly uploaded* blobs. It cannot protect an **old** b
 
 - [ ] **Step 1: Write the failing test**
 
+> **This step's test as originally written does not exercise the helper, and was corrected during implementation.** It upserts key `b` in its second commit, which lands in a *different* shard from `a` — so the swept blob is never in the set the helper checks, and the test fails red even with the helper working. The shipped test instead uses three commits that follow the dedup rationale this task exists for: upsert `a` (producing blob B1), upsert a key chosen to land in the **same shard** as `a` (orphaning B1), then remove that key (re-referencing B1) while the fake deletes B1 as the manifest lands. It then asserts the index reopens and `has_blob(B1)` is true. Read the shipped test in `record_index.rs` rather than the sketch below, which is kept only to show the fake's shape.
+
 Add to `mod tests` in `crates/gonzalo-vector/src/record_index.rs`:
 
 ```rust
