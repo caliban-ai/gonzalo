@@ -389,8 +389,16 @@ async fn main() -> Result<ExitCode> {
                 watch(&root, &src, &repo, &view, config, gc).await?;
                 return Ok(ExitCode::SUCCESS);
             }
-            let (summary, swept) =
-                index_with_gc_filtered(&root, &src, &repo, &view, gc, &filter).await?;
+            let (summary, swept) = index_with_gc_filtered(
+                &root,
+                &src,
+                &repo,
+                &view,
+                gc,
+                gonzalo_core::DEFAULT_MIN_AGE,
+                &filter,
+            )
+            .await?;
             println!(
                 "driver:   {}",
                 if summary.incremental {
@@ -436,7 +444,7 @@ async fn main() -> Result<ExitCode> {
         }
 
         Commands::Gc { root } => {
-            let summary = gc(&root).await?;
+            let summary = gc(&root, gonzalo_core::DEFAULT_MIN_AGE).await?;
             println!("scanned:  {}", summary.scanned);
             println!("freed:    {}", summary.freed);
             println!("retained: {}", summary.retained);

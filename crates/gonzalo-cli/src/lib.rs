@@ -882,7 +882,7 @@ pub struct GcSummary {
 /// Deleting a record therefore does not reclaim its bytes: the tombstone pins
 /// them until `collect` removes it past the horizon. Reclaiming is `delete`,
 /// then `collect`, then this.
-pub async fn gc(root: &Path) -> Result<GcSummary> {
+pub async fn gc(root: &Path, min_age: Duration) -> Result<GcSummary> {
     let store = FsStore::new(root);
 
     // Every record, across all repos and collections (unset prefix = all), and
@@ -896,7 +896,11 @@ pub async fn gc(root: &Path) -> Result<GcSummary> {
     }
 
     let live = gonzalo_core::live_blob_hashes(&records)?;
-    let report = gonzalo_core::sweep_blobs(&store, &live).await?;
+    let policy = gonzalo_core::SweepPolicy {
+        min_age,
+        now: std::time::SystemTime::now(),
+    };
+    let report = gonzalo_core::sweep_blobs_with(&store, &live, policy).await?;
     Ok(GcSummary {
         scanned: records.len(),
         freed: report.freed.len(),
@@ -916,8 +920,18 @@ pub async fn index_with_gc(
     repo: &str,
     view: &str,
     gc_after: bool,
+    min_age: Duration,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
-    index_with_gc_filtered(root, src, repo, view, gc_after, &IndexFilter::default()).await
+    index_with_gc_filtered(
+        root,
+        src,
+        repo,
+        view,
+        gc_after,
+        min_age,
+        &IndexFilter::default(),
+    )
+    .await
 }
 
 /// [`index_with_gc`], with control over which paths enter the view (#209).
@@ -927,26 +941,41 @@ pub async fn index_with_gc_filtered(
     repo: &str,
     view: &str,
     gc_after: bool,
+    min_age: Duration,
     filter: &IndexFilter,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
     let mode = resolve_parse_worker();
-    index_with_gc_filtered_worker(root, src, repo, view, gc_after, filter, mode.worker()).await
+    index_with_gc_filtered_worker(
+        root,
+        src,
+        repo,
+        view,
+        gc_after,
+        min_age,
+        filter,
+        mode.worker(),
+    )
+    .await
 }
 
 /// [`index_with_gc_filtered`], with the parse worker pinned rather than
 /// resolved — see [`index_with_worker`].
+// Eight parameters: the index/GC/worker knobs are independent and every caller
+// spells them out; a params struct would be churn for one internal-ish seam.
+#[allow(clippy::too_many_arguments)]
 pub async fn index_with_gc_filtered_worker(
     root: &Path,
     src: &Path,
     repo: &str,
     view: &str,
     gc_after: bool,
+    min_age: Duration,
     filter: &IndexFilter,
     worker: Option<&Path>,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
     let summary = index_with_worker(root, src, repo, view, filter, worker).await?;
     let swept = if gc_after {
-        Some(gc(root).await?)
+        Some(gc(root, min_age).await?)
     } else {
         None
     };
@@ -1325,6 +1354,7 @@ mod tests {
         repo: &str,
         view: &str,
         gc_after: bool,
+        min_age: Duration,
     ) -> Result<(IndexSummary, Option<GcSummary>)> {
         index_with_gc_filtered_worker(
             root,
@@ -1332,6 +1362,7 @@ mod tests {
             repo,
             view,
             gc_after,
+            min_age,
             &IndexFilter::default(),
             None,
         )
@@ -2248,7 +2279,7 @@ mod tests {
     #[tokio::test]
     async fn gc_on_empty_store_frees_nothing() {
         let root = TempDir::new().unwrap();
-        let summary = gc(root.path()).await.unwrap();
+        let summary = gc(root.path(), Duration::ZERO).await.unwrap();
         assert_eq!(summary.scanned, 0);
         assert_eq!(summary.freed, 0);
         assert_eq!(summary.retained, 0);
@@ -2265,7 +2296,7 @@ mod tests {
         write_file(src.path(), "a.rs", "fn a() { b(); }");
         index(root.path(), src.path(), "r", "main").await.unwrap();
 
-        let summary = gc(root.path()).await.unwrap();
+        let summary = gc(root.path(), Duration::ZERO).await.unwrap();
         assert_eq!(summary.scanned, 1, "the view's manifest record");
         assert_eq!(summary.freed, 1, "the pre-edit slice is unreferenced");
         assert_eq!(summary.retained, 1, "the current slice stays");
@@ -2377,14 +2408,15 @@ mod tests {
         // Reindex changed content with the post-index sweep on: the pre-edit
         // slice is orphaned and should be freed in the same call.
         write_file(src.path(), "a.rs", "fn a() { b(); }");
-        let (_summary, swept) = index_with_gc(root.path(), src.path(), "r", "main", true)
-            .await
-            .unwrap();
+        let (_summary, swept) =
+            index_with_gc(root.path(), src.path(), "r", "main", true, Duration::ZERO)
+                .await
+                .unwrap();
         let swept = swept.expect("gc runs when enabled");
         assert_eq!(swept.freed, 1, "orphaned slice swept during the index");
 
         // A follow-up gc finds nothing left to free.
-        assert_eq!(gc(root.path()).await.unwrap().freed, 0);
+        assert_eq!(gc(root.path(), Duration::ZERO).await.unwrap().freed, 0);
     }
 
     #[tokio::test]
@@ -2395,13 +2427,14 @@ mod tests {
         index(root.path(), src.path(), "r", "main").await.unwrap();
 
         write_file(src.path(), "a.rs", "fn a() { b(); }");
-        let (_summary, swept) = index_with_gc(root.path(), src.path(), "r", "main", false)
-            .await
-            .unwrap();
+        let (_summary, swept) =
+            index_with_gc(root.path(), src.path(), "r", "main", false, Duration::ZERO)
+                .await
+                .unwrap();
         assert!(swept.is_none(), "no gc when disabled");
 
         // The orphan survived: an explicit gc still has one to free.
-        assert_eq!(gc(root.path()).await.unwrap().freed, 1);
+        assert_eq!(gc(root.path(), Duration::ZERO).await.unwrap().freed, 1);
     }
 
     // ── watch: debounce core (gonzalo#100) ──────────────────────────────────
@@ -2464,7 +2497,7 @@ mod tests {
         std::fs::remove_file(src_a.path().join("shared.rs")).unwrap();
         index(root.path(), src_a.path(), "r", "a").await.unwrap();
 
-        let summary = gc(root.path()).await.unwrap();
+        let summary = gc(root.path(), Duration::ZERO).await.unwrap();
         assert_eq!(summary.scanned, 2, "one manifest record per view");
         assert_eq!(
             summary.freed, 0,
