@@ -1071,6 +1071,35 @@ impl BlobStore for S3Store {
             .map_err(|e| CoreError::Backend(e.into_service_error().to_string()))?;
         Ok(()) // S3 delete of an absent key succeeds — idempotent
     }
+
+    async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        let key = format!("{BLOB_PREFIX}{}", hash.0);
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() || head_means_absent(svc.code().unwrap_or_default()) {
+                    Ok(false)
+                } else {
+                    Err(CoreError::Backend(svc.to_string()))
+                }
+            }
+        }
+    }
+}
+
+/// Whether a `HeadObject` error code means "no such blob" as opposed to a fault
+/// worth surfacing. S3 answers a missing key with 404 `NotFound`; anything else
+/// is a real error and must not be reported as absence.
+fn head_means_absent(code: &str) -> bool {
+    matches!(code, "NotFound" | "NoSuchKey")
 }
 
 /// Parse a blob object key `blobs/<hash>` back into a [`ContentHash`]. Returns
@@ -1139,6 +1168,16 @@ fn marked_flag_key(namespace: &str, collection: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Review Focus 5. A 403, a 500 or throttling must surface as Err. Reporting
+    // `false` would make a writer re-upload on every transient fault and hide a
+    // broken store behind what looks like a missing blob.
+    #[test]
+    fn a_head_error_other_than_not_found_is_not_absence() {
+        assert!(!head_means_absent("AccessDenied"));
+        assert!(!head_means_absent("InternalError"));
+        assert!(head_means_absent("NotFound"));
+    }
 
     #[test]
     fn marker_key_is_the_record_key_plus_a_suffix() {

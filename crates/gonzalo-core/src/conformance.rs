@@ -10,6 +10,7 @@ use crate::{
     Record, RecordKey, RecordKind, Revision, Store, tombstone_hash,
 };
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 fn sample(key: RecordKey, payload: &[u8]) -> Record {
     let body = Body::Inline(payload.to_vec());
@@ -846,6 +847,41 @@ where
     blob_put_is_content_addressed_and_idempotent(&factory().await).await;
     blob_list_reports_stored_hashes(&factory().await).await;
     blob_delete_removes_and_is_idempotent(&factory().await).await;
+    blob_list_reports_a_plausible_modified_time(&factory().await).await;
+    has_blob_tracks_presence(&factory().await).await;
+}
+
+async fn blob_list_reports_a_plausible_modified_time<B: BlobStore>(store: &B) {
+    let before = SystemTime::now();
+    let hash = store.put_blob(b"aged content").await.unwrap();
+    let listed = store.list_blobs().await.unwrap();
+    let entry = listed
+        .iter()
+        .find(|e| e.hash == hash)
+        .expect("the blob just written is listed");
+
+    // Deliberately generous: the store's clock is not this process's clock (S3
+    // stamps LastModified server-side). The point is to catch a substrate that
+    // returns the epoch, zero, or a client-side `now` it made up.
+    let age = entry.age(before + Duration::from_secs(3600));
+    assert!(
+        age.is_some(),
+        "modified should not be dated an hour into the future"
+    );
+    assert!(
+        age.unwrap() <= Duration::from_secs(7200),
+        "modified looks nothing like now: {:?}",
+        entry.modified_unix_ms
+    );
+    assert_ne!(entry.modified_unix_ms, 0, "epoch means unimplemented");
+}
+
+async fn has_blob_tracks_presence<B: BlobStore>(store: &B) {
+    let hash = store.put_blob(b"present").await.unwrap();
+    assert!(store.has_blob(&hash).await.unwrap());
+
+    let absent = ContentHash::of(b"never stored by this test");
+    assert!(!store.has_blob(&absent).await.unwrap());
 }
 
 async fn blob_get_absent_returns_none<B: BlobStore>(store: &B) {

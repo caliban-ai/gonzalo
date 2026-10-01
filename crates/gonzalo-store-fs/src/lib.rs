@@ -267,6 +267,13 @@ impl BlobStore for FsStore {
         Ok(out)
     }
 
+    async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        let path = layout::blob_path(&self.root, hash);
+        tokio::fs::try_exists(&path)
+            .await
+            .map_err(|e| CoreError::Backend(e.to_string()))
+    }
+
     async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
         let path = layout::blob_path(&self.root, hash);
         match tokio::fs::remove_file(&path).await {
