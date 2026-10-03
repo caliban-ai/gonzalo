@@ -156,7 +156,7 @@ pub use gonzalo_core::{
     DEFAULT_MIN_AGE, DeleteResult, GcReport, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta,
     PutResult, Record, RecordKey, RecordKind, ResetReport, Result, Revision, Store, SweepPolicy,
     SyncConflict, SyncReport, collect, gc_blobs, gc_blobs_with, merge, now_ms, reset, reset_as,
-    sync, sync_with_ancestry,
+    sync, sync_with_ancestry, undelete,
 };
 
 #[cfg(feature = "fs")]
@@ -280,6 +280,17 @@ mod facade_reexports {
         let _reset_fn = reset;
         let _reset_as_fn = reset_as;
         let _collect_fn = collect;
+    }
+
+    #[test]
+    fn undelete_is_re_exported() {
+        // The recovery half of `delete` (gonzalo#327): without the root
+        // export a consumer cannot reach it at all.
+        // Bind the function value: `gonzalo_core` exports both a module and a
+        // function named `undelete`, and a bare `use` is satisfied by the
+        // module alone. A value binding needs the function, which is generic
+        // over the store, so name one.
+        let _undelete_fn = undelete::<FsStore>;
     }
 
     #[test]
@@ -479,6 +490,7 @@ mod tests {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         };
 
         assert!(matches!(

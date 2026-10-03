@@ -60,7 +60,7 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 /// The mark set: every blob hash these records still need. `records` must be
 /// the store's **raw** records, tombstones included.
 ///
-/// Four things reference a blob (gonzalo#292, gonzalo#323):
+/// Five things reference a blob (gonzalo#292, gonzalo#323, gonzalo#327):
 ///
 /// - a record whose body is a [`Body::Blob`] — the bytes are its content;
 /// - a tombstone's [`deleted_blob`](Record::deleted_blob). **A tombstone pins
@@ -72,9 +72,13 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 /// - every slice a graph manifest names (ADR 0012) — blobs referenced from a
 ///   record's *contents* rather than from its body;
 /// - every shard a vector manifest names (ADR 0027) — the same
-///   contents-not-body reference, for a durable vector index's shard blobs.
+///   contents-not-body reference, for a durable vector index's shard blobs;
+/// - every blob named by the **retained body of a manifest tombstone**
+///   ([`deleted_kind`](Record::deleted_kind), ADR 0029) — the same references
+///   as the two manifest arms above, kept alive after the delete so the index
+///   can still be restored. Released when the tombstone is collected.
 ///
-/// Marking any one of the four alone deletes the other three's blobs, so this
+/// Marking any one of the five alone deletes the other four's blobs, so this
 /// unions them from the records rather than from a caller's idea of liveness.
 pub fn live_blob_hashes<'a>(
     records: impl IntoIterator<Item = &'a Record>,
@@ -99,6 +103,24 @@ pub fn live_blob_hashes<'a>(
                     .entries
                     .into_values(),
             );
+        }
+        // A manifest tombstone retains its body, so the references inside it
+        // are still live: the bytes survive until the tombstone is collected,
+        // exactly like `deleted_blob` for a blob-bodied record (ADR 0029).
+        // `deleted_kind` names the parser; guessing by trying both would make an
+        // unrelated inline body that happens to parse look like a manifest.
+        if record.kind == RecordKind::Tombstone {
+            match record.deleted_kind {
+                Some(RecordKind::VectorManifest) => live.extend(
+                    crate::VectorManifest::from_body(&record.body)?
+                        .entries
+                        .into_values(),
+                ),
+                Some(RecordKind::GraphManifest) => {
+                    live.extend(Manifest::from_body(&record.body)?.entries.into_values())
+                }
+                _ => {}
+            }
         }
     }
     Ok(live)
@@ -624,5 +646,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.freed.len() + report.retained + report.deferred, 3);
+    }
+
+    fn vector_manifest_body(entries: &[(u16, &str)]) -> Body {
+        let mut m = crate::VectorManifest::new("space-a", 3, 256);
+        for (id, content) in entries {
+            m.entries.insert(*id, h(content));
+        }
+        m.to_body()
+    }
+
+    // The bug. A deleted vector index's shards must survive until the tombstone
+    // is collected, exactly as a deleted blob-bodied record's blob does.
+    #[test]
+    fn a_vector_manifest_tombstone_pins_its_shards() {
+        let live = record(
+            "memories",
+            RecordKind::VectorManifest,
+            vector_manifest_body(&[(0, "shard-zero"), (9, "shard-nine")]),
+        );
+        let t = crate::tombstone_of(&live, 1_000, 8, None);
+
+        let marked = live_blob_hashes([&t]).unwrap();
+        assert!(marked.contains(&h("shard-zero")));
+        assert!(marked.contains(&h("shard-nine")));
+    }
+
+    #[test]
+    fn a_graph_manifest_tombstone_pins_its_slices() {
+        let mut gm = Manifest::new();
+        gm.insert("src/lib.rs", h("slice"));
+        let live = record("main", RecordKind::GraphManifest, gm.to_body());
+        let t = crate::tombstone_of(&live, 1_000, 8, None);
+
+        assert!(live_blob_hashes([&t]).unwrap().contains(&h("slice")));
+    }
+
+    // A tombstone claiming a manifest kind over a body that will not parse must
+    // error, never sweep. Same rule as the live arms, which assert `is_err()`.
+    #[test]
+    fn a_tombstone_whose_retained_body_will_not_parse_is_an_error() {
+        let mut t = record(
+            "memories",
+            RecordKind::Tombstone,
+            Body::Inline(b"not json".to_vec()),
+        );
+        t.deleted_kind = Some(RecordKind::VectorManifest);
+        assert!(live_blob_hashes([&t]).is_err());
+    }
+
+    // A tombstone of an ordinary kind marks nothing new, and one written before
+    // the field existed has deleted_kind: None.
+    #[test]
+    fn a_tombstone_without_deleted_kind_marks_only_its_pinned_blob() {
+        let mut t = record("doc", RecordKind::Tombstone, Body::Inline(Vec::new()));
+        t.deleted_blob = Some(h("pinned"));
+        let marked = live_blob_hashes([&t]).unwrap();
+        assert_eq!(marked, BTreeSet::from([h("pinned")]));
+    }
+
+    // A manifest tombstone synced to a peer that never received the blobs makes
+    // the mark set name hashes the store does not hold. That must not error or
+    // distort the counts.
+    #[tokio::test]
+    async fn marking_a_hash_the_store_does_not_hold_is_harmless() {
+        let blobs = aged(vec![(h("present"), at(0))]);
+        let live = BTreeSet::from([h("present"), h("never-stored")]);
+        let report = sweep_blobs_with(&blobs, &live, policy(100_000, 0))
+            .await
+            .unwrap();
+        assert!(report.freed.is_empty());
+        assert_eq!(report.retained, 1, "only the hash actually listed counts");
+        assert_eq!(report.deferred, 0);
     }
 }

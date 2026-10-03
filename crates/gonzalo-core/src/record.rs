@@ -181,6 +181,18 @@ pub struct Record {
     /// from the same content, still has its bytes (gonzalo#292).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_blob: Option<ContentHash>,
+    /// Tombstones only: the kind of the record that was deleted.
+    ///
+    /// Set when the deleted body is **retained** — the manifest kinds, whose
+    /// bodies name blobs out of line — so GC knows which parser to use for the
+    /// references inside, and `undelete` knows what kind to recreate. A
+    /// manifest's body is the only record of which blob was which shard, so
+    /// discarding it would leave the pinned bytes unnameable (ADR 0029).
+    ///
+    /// `None` on a tombstone whose body was discarded, and on every tombstone
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_kind: Option<RecordKind>,
 }
 
 impl Meta {
@@ -231,6 +243,7 @@ impl Record {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         }
     }
 
@@ -256,6 +269,7 @@ impl Record {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         }
     }
 
@@ -450,6 +464,7 @@ mod tests {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         }
     }
 

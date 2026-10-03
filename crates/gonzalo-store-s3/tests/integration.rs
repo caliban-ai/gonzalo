@@ -94,6 +94,7 @@ fn sample(key: RecordKey, payload: &[u8], revision: Revision, parent: Option<Rev
         deleted_at: None,
         deleted_blob: None,
         key,
+        deleted_kind: None,
     }
 }
 

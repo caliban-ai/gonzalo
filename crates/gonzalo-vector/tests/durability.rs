@@ -1,9 +1,13 @@
 //! The ticket's acceptance criterion: an index of real size is written, dropped,
 //! reopened, and queried — with the reopen cost reported rather than assumed.
 
-use gonzalo_core::{KeyPrefix, RecordKey, VectorManifest};
+use gonzalo_core::{
+    DeleteResult, KeyPrefix, RecordKey, Store as _, SweepPolicy, VectorManifest, gc_blobs_with,
+    now_ms, undelete,
+};
 use gonzalo_store_fs::FsStore;
 use gonzalo_vector::{RecordVectorIndex, VectorIndex as _};
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 const N: usize = 10_000;
@@ -50,4 +54,55 @@ async fn ten_thousand_vectors_survive_a_reopen() {
     assert_eq!(hits.len(), 5);
 
     println!("reopened {N} vectors (dim {DIM}) in {elapsed:?}");
+}
+
+/// A deleted vector index is recoverable for the tombstone's lifetime: the
+/// shards survive a sweep taken while it is deleted, and after `undelete` the
+/// index opens and answers queries (ADR 0029).
+#[tokio::test]
+async fn a_deleted_index_can_be_undeleted_and_queried() {
+    let dir = TempDir::new().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = VectorManifest::key("ns", "restored");
+
+    let mut probe = vec![0.0; DIM];
+    probe[3] = 1.0;
+
+    let idx = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "restored-space", DIM)
+        .await
+        .unwrap();
+    idx.upsert_many(vec![(RecordKey::new("ns", "coll", "a"), probe.clone())])
+        .await
+        .unwrap();
+    drop(idx);
+
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    // A sweep with no grace period, while the index is deleted. The tombstone's
+    // retained body is the only thing keeping these shards alive.
+    let swept = gc_blobs_with(
+        &store,
+        SweepPolicy {
+            min_age: Duration::ZERO,
+            now: SystemTime::now(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(swept.freed.is_empty(), "the shards were pinned");
+
+    undelete(&store, &key, now_ms(), None).await.unwrap();
+
+    let reopened = RecordVectorIndex::open(FsStore::new(dir.path()), key, "restored-space", DIM)
+        .await
+        .unwrap();
+    assert_eq!(reopened.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+    let hits = reopened
+        .query(&probe, 1, &KeyPrefix::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the restored index answers queries");
 }
