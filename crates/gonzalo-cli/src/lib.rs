@@ -1136,6 +1136,18 @@ pub async fn delete(
     })
 }
 
+/// Restore the record at `namespace/collection/id` from its tombstone.
+pub async fn undelete(
+    root: &Path,
+    namespace: &str,
+    collection: &str,
+    id: &str,
+) -> Result<Revision> {
+    let store = FsStore::new(root);
+    let key = RecordKey::new(namespace, collection, id);
+    Ok(gonzalo_core::undelete(&store, &key, gonzalo_core::now_ms(), None).await?)
+}
+
 /// Tombstone every live record in `namespace` (optionally one `collection`)
 /// via [`gonzalo_core::reset_as`], attributing each tombstone to
 /// [`CLI_AUTHOR`].

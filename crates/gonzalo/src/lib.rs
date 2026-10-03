@@ -156,7 +156,7 @@ pub use gonzalo_core::{
     DEFAULT_MIN_AGE, DeleteResult, GcReport, Identity, KeyPrefix, MergeClass, MergeOutcome, Meta,
     PutResult, Record, RecordKey, RecordKind, ResetReport, Result, Revision, Store, SweepPolicy,
     SyncConflict, SyncReport, collect, gc_blobs, gc_blobs_with, merge, now_ms, reset, reset_as,
-    sync, sync_with_ancestry,
+    sync, sync_with_ancestry, undelete,
 };
 
 #[cfg(feature = "fs")]
@@ -280,6 +280,15 @@ mod facade_reexports {
         let _reset_fn = reset;
         let _reset_as_fn = reset_as;
         let _collect_fn = collect;
+    }
+
+    #[test]
+    fn undelete_is_re_exported() {
+        // The recovery half of `delete` (gonzalo#327): without the root
+        // export a consumer cannot reach it at all.
+        // Naming it in a `use` pins the export without needing a store.
+        #[allow(unused_imports)]
+        use crate::undelete as _;
     }
 
     #[test]

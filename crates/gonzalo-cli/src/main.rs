@@ -6,7 +6,7 @@ use gonzalo_cli::{
     DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, WatchConfig, collect, delete, gc, get,
     index_with_gc_filtered, list, migrate, parse_duration, parse_horizon, parse_revision, reset,
     reset_exit_code, resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap,
-    ticket_move, ticket_sync, watch,
+    ticket_move, ticket_sync, undelete, watch,
 };
 use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
 use gonzalo_store_fs::expand_tilde;
@@ -179,6 +179,24 @@ enum Commands {
         /// Most recent revisions a record remembers in `ancestors` (at least 1).
         #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
         ancestor_cap: usize,
+    },
+    /// Restore a record from its tombstone, while the tombstone still exists.
+    /// Only manifest kinds retain a body, so only they can be restored. Fails
+    /// if the record is live, the key was recreated, the tombstone has already
+    /// been collected, or a blob the retained body names is gone.
+    Undelete {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".", value_parser = store_root)]
+        root: PathBuf,
+        /// Namespace of the record.
+        #[arg(long)]
+        namespace: String,
+        /// Collection of the record.
+        #[arg(long)]
+        collection: String,
+        /// ID of the record.
+        #[arg(long)]
+        id: String,
     },
     /// Tombstone every live record in a namespace, or in one collection of it.
     /// Not atomic but idempotent: re-run to finish after conflicts. Exits 3 if
@@ -500,6 +518,18 @@ async fn main() -> Result<ExitCode> {
                     return Ok(ExitCode::from(EXIT_CONFLICT));
                 }
             }
+        }
+
+        Commands::Undelete {
+            root,
+            namespace,
+            collection,
+            id,
+        } => {
+            let key = RecordKey::new(&namespace, &collection, &id);
+            let revision = undelete(&root, &namespace, &collection, &id).await?;
+            println!("restored: {key}");
+            println!("revision: {}", serde_json::to_string(&revision)?);
         }
 
         Commands::Reset {
