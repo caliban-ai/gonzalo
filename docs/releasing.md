@@ -7,15 +7,17 @@ that exists only for this repo, and a tag↔version check. The actual upload run
 through **`scripts/publish.sh`**, which is resumable and rate-limit-aware (see
 below).
 
-A `v*` tag drives **three** workflows off the same push, in lockstep:
+A `v*` tag drives **four** workflows off the same push, in lockstep:
 
 - `release-image.yml` → builds and pushes the `ghcr.io/caliban-ai/gonzalo`
   container image;
 - `publish.yml` → publishes the crate set to crates.io;
 - `release-binaries.yml` → builds the Apple Silicon archive and attaches it to
-  the GitHub Release (see [Prebuilt binaries](#prebuilt-binaries-macos-apple-silicon)).
+  the GitHub Release (see [Prebuilt binaries](#prebuilt-binaries-macos-apple-silicon));
+- `release-schemas.yml` → attaches the `.proto` and the OpenAPI document to the
+  GitHub Release (see [Schema artifacts](#schema-artifacts)).
 
-One tag, one release — image, crate, and binary versions never drift.
+One tag, one release — image, crate, binary and schema versions never drift.
 
 ## What gets published
 
@@ -296,6 +298,39 @@ gh release upload vX.Y.Z gonzalo-vX.Y.Z-aarch64-apple-darwin.tar.gz{,.sha256} --
 **Only `aarch64-apple-darwin` is built.** No x86_64 Mac, no Linux (the container
 image covers Linux), no Windows. Another target gets added when there is a
 concrete request for one, not before.
+
+## Schema artifacts
+
+Every release also carries the two descriptions of the daemon's surface, staged
+by `release-schemas.yml` under their released names:
+
+```
+gonzalo-vX.Y.Z.proto              # from crates/gonzalo-proto/proto/gonzalo.proto
+gonzalo-openapi-vX.Y.Z.json       # from docs/api/openapi.json
+```
+
+They exist so a non-Rust consumer can **generate** a client without owning a
+cargo registry client (ADR 0007 + ADR 0020; see the guide's
+[Generating a client](https://caliban-ai.github.io/gonzalo/clients.html)
+chapter). Nothing is built, so this is its own job rather than a step inside
+`release-binaries.yml` — copying two files has no business queueing behind a
+macOS compile.
+
+Two operational notes:
+
+- **A stale description cannot ship.** `SERVED_OPERATIONS` is checked against
+  the router's own source and against `docs/api/openapi.json`, in both
+  directions, by the test suite. A tag that would publish a description
+  disagreeing with the router fails CI before this workflow runs. The check
+  compares paths and methods, not response schemas.
+- **It polls for the Release rather than creating one**, for the same reason
+  `release-binaries.yml` does: the notes are curated by hand from the changelog.
+  It waits ten minutes and then fails, having already attached the artifacts to
+  the workflow run — so a late Release needs no rebuild, just
+  `gh run download <run-id>` and `gh release upload`.
+
+The workflow landed after `v0.7.0` was tagged, so `v0.7.0` and earlier carry no
+schema assets; both files are still readable from the repository at those tags.
 
 ## Verifying a release — the crates.io API is not what cargo reads
 

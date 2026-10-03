@@ -142,13 +142,19 @@ revision the store no longer holds, the common case being a write over a deleted
 key — returns `412`. Other internal failures return an opaque `500`; the detail
 goes to the daemon's stderr.
 
+This surface is described by `docs/api/openapi.json`, which the test suite checks
+against the router in both directions, and which each release attaches to its
+GitHub Release. Generate a client from it rather than hand-writing one — see
+[Generating a client](./clients.md).
+
 ## gRPC API
 
 The `gonzalo` service in `gonzalo-proto` carries the same operations: `Get`, `Put`,
 `Delete`, `List`, `GetRaw`, `ListRaw`, `PutRaw`, `Purge`, `PutBlob`, `GetBlob`,
 `ListBlobs`, `DeleteBlob`, `TicketSync`, and `GraphDefinitions`, `GraphReferencesTo`,
 `GraphCallersOf`, `GraphCallees`, `GraphImpact`. Authorization is identical to
-HTTP.
+HTTP, and the `.proto` is published per release alongside the OpenAPI document
+([Generating a client](./clients.md)).
 
 ## From Rust
 

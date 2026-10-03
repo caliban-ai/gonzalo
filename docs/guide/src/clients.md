@@ -11,7 +11,7 @@ exists so non-Rust tools can share a store.
 
 ## The artifacts
 
-Every release attaches both descriptions to its
+Both descriptions are attached to each
 [GitHub Release](https://github.com/caliban-ai/gonzalo/releases):
 
 | file | describes | for |
@@ -19,9 +19,21 @@ Every release attaches both descriptions to its
 | `gonzalo-vX.Y.Z.proto` | the gRPC surface | `protoc`, `buf`, and every gRPC toolchain |
 | `gonzalo-openapi-vX.Y.Z.json` | the HTTP/JSON surface | OpenAPI generators, and anything that reads OpenAPI 3.1 |
 
+Attached releases **start with the first one after `v0.7.0`** — the workflow that
+uploads them landed after that tag, so `v0.7.0` and earlier carry only the macOS
+archive.
+
 Both also live in the repository — `crates/gonzalo-proto/proto/gonzalo.proto`
 and [`docs/api/openapi.json`](https://github.com/caliban-ai/gonzalo/blob/main/docs/api/openapi.json) —
-and the `.proto` ships inside the `gonzalo-proto` crate on crates.io.
+and the `.proto` ships inside the `gonzalo-proto` crate on crates.io. For a
+release with no attached artifact, read them from the repository at that tag,
+which is the same content:
+
+```sh
+base=https://raw.githubusercontent.com/caliban-ai/gonzalo/v0.7.0
+curl -fsSL "$base/docs/api/openapi.json" -o gonzalo-openapi-v0.7.0.json
+curl -fsSL "$base/crates/gonzalo-proto/proto/gonzalo.proto" -o gonzalo-v0.7.0.proto
+```
 
 **They cannot drift from what the daemon serves.** The route table, the router
 and the OpenAPI document are checked against each other by the test suite, in
@@ -29,8 +41,11 @@ both directions: an operation added to the daemon without describing it fails
 CI, and so does one described but not served. A description nothing checks is
 worse than none, because it is believed.
 
+Otherwise take them from the release:
+
 ```sh
-gh release download v0.7.0 --repo caliban-ai/gonzalo \
+tag=$(gh release view --repo caliban-ai/gonzalo --json tagName -q .tagName)
+gh release download "$tag" --repo caliban-ai/gonzalo \
   --pattern 'gonzalo-openapi-*.json' --pattern 'gonzalo-*.proto'
 ```
 
