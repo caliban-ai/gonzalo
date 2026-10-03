@@ -21,6 +21,9 @@ use crate::{
 /// written. `author`, when given, is stamped as the restorer; `None` keeps the
 /// tombstone's author.
 ///
+/// The body, kind and `meta` come back; `links` do not, because a tombstone
+/// never kept them.
+///
 /// Refuses, without writing anything, when there is no tombstone, the record is
 /// live, the tombstone's body was not retained, a blob the body names is
 /// missing, or the key changed while this ran.

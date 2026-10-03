@@ -7,6 +7,8 @@
   named blob garbage collection as follow-up work; this is it.
 - **Amended by:** [ADR 0028](0028-blob-gc-grace-period.md), which adds an age rule
   to the sweep: an unreferenced blob is deleted only once it is old enough.
+- **Amended by:** [ADR 0029](0029-manifest-tombstone-pin.md), which extends the
+  tombstone pin to the blobs a deleted manifest references.
 
 ## Context
 

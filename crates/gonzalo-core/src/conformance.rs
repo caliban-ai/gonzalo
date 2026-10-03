@@ -413,9 +413,9 @@ async fn delete_visible_to_raw_reads<S: Store>(store: &S) {
     assert!(store.list_raw(&tomb_prefix()).await.unwrap().contains(&key));
 }
 
-/// Deleting a blob-backed non-manifest record leaves the blob's hash on the tombstone, and
-/// the substrate round-trips it. The tombstone's body is empty, so this pin is
-/// the only thing standing between the content and the next blob sweep
+/// Deleting a blob-backed non-manifest record leaves the blob's hash on the
+/// tombstone, and the substrate round-trips it. For non-manifest kinds the
+/// tombstone's body is empty, so this pin is the only thing standing between the content and the next blob sweep
 /// (gonzalo#292) — a substrate that drops the field on the way to storage frees
 /// bytes a peer can still resurrect the record from.
 async fn tombstone_pins_the_deleted_records_blob<S: Store>(store: &S) {
@@ -451,6 +451,7 @@ async fn tombstone_pins_the_deleted_records_blob<S: Store>(store: &S) {
         .expect("recreated record");
     assert_eq!(live.deleted_blob, None);
 }
+
 /// Deleting a manifest kind retains its body and records the kind, and the
 /// substrate round-trips both. A manifest's body is the only record of which
 /// blob was which shard, so a substrate that drops either on the way to storage

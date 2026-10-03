@@ -11,6 +11,16 @@ the patch version for fixes.
 
 ### Added
 
+- **Deleting a manifest is now recoverable.** `Record` gains an additive
+  `deleted_kind` field (tombstones only; absent on every existing record). A
+  `GraphManifest` or `VectorManifest` tombstone now retains the deleted body
+  instead of discarding it, and `gonzalo gc` marks through that body, so a
+  deleted index's slices or shards survive until `collect` removes the
+  tombstone. `gonzalo_core::undelete`, the `gonzalo undelete` subcommand and the
+  facade re-export restore a manifest from its tombstone, preserving
+  `meta.created`. Reopening a deleted vector index before undeleting it
+  discards the tombstone. ([ADR 0029](docs/adr/0029-manifest-tombstone-pin.md),
+  #327)
 - **`BlobStore::has_blob`.** A defaulted method (`get_blob(..).is_some()`),
   overridden by the filesystem store with `try_exists` and by S3 with
   `HeadObject`. A failure that is not "no such key" is an error, not `false`.

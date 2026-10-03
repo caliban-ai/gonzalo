@@ -60,7 +60,7 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 /// The mark set: every blob hash these records still need. `records` must be
 /// the store's **raw** records, tombstones included.
 ///
-/// Four things reference a blob (gonzalo#292, gonzalo#323):
+/// Five things reference a blob (gonzalo#292, gonzalo#323, gonzalo#327):
 ///
 /// - a record whose body is a [`Body::Blob`] — the bytes are its content;
 /// - a tombstone's [`deleted_blob`](Record::deleted_blob). **A tombstone pins
@@ -72,9 +72,13 @@ pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) ->
 /// - every slice a graph manifest names (ADR 0012) — blobs referenced from a
 ///   record's *contents* rather than from its body;
 /// - every shard a vector manifest names (ADR 0027) — the same
-///   contents-not-body reference, for a durable vector index's shard blobs.
+///   contents-not-body reference, for a durable vector index's shard blobs;
+/// - every blob named by the **retained body of a manifest tombstone**
+///   ([`deleted_kind`](Record::deleted_kind), ADR 0029) — the same references
+///   as the two manifest arms above, kept alive after the delete so the index
+///   can still be restored. Released when the tombstone is collected.
 ///
-/// Marking any one of the four alone deletes the other three's blobs, so this
+/// Marking any one of the five alone deletes the other four's blobs, so this
 /// unions them from the records rather than from a caller's idea of liveness.
 pub fn live_blob_hashes<'a>(
     records: impl IntoIterator<Item = &'a Record>,

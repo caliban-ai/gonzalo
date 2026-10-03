@@ -45,14 +45,15 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted (local-only deletion superseded by [0021](0021-replicated-deletion-with-tombstones.md)) |
 | [0019](0019-s3-backend-qualification-rustfs.md) | Qualified S3 backend for HA: RustFS | accepted |
 | [0020](0020-rust-native-deliverables.md) | Rust-native deliverables; the daemon is the non-Rust boundary | accepted |
-| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted (blob GC follow-up settled by [0024](0024-blob-garbage-collection.md); S3 listing cost by [0025](0025-s3-tombstone-markers.md)) |
+| [0021](0021-replicated-deletion-with-tombstones.md) | Replicated deletion with tombstones | accepted (blob GC follow-up settled by [0024](0024-blob-garbage-collection.md); S3 listing cost by [0025](0025-s3-tombstone-markers.md); manifest tombstone shape amended by [0029](0029-manifest-tombstone-pin.md)) |
 | [0022](0022-fleet-access-control-records.md) | Fleet access-control records as a capability layer | accepted (channel config and `GrantScope::Repo` amended by [0023](0023-channel-config-fields.md)) |
 | [0023](0023-channel-config-fields.md) | Channel configuration fields, and workspaces instead of repos | accepted |
-| [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted (sweep gains an age rule from [0028](0028-blob-gc-grace-period.md)) |
+| [0024](0024-blob-garbage-collection.md) | Blob garbage collection, and tombstones pin their blobs | accepted (sweep gains an age rule from [0028](0028-blob-gc-grace-period.md); pin extended to manifests by [0029](0029-manifest-tombstone-pin.md)) |
 | [0025](0025-s3-tombstone-markers.md) | Sibling tombstone markers in the S3 layout | accepted |
 | [0026](0026-grouped-facade-surface.md) | A grouped facade surface | accepted |
 | [0027](0027-durable-vector-index.md) | A durable vector index | accepted (GC-during-commit window narrowed for live writers by [0028](0028-blob-gc-grace-period.md)) |
 | [0028](0028-blob-gc-grace-period.md) | A grace period for blob garbage collection | accepted |
+| [0029](0029-manifest-tombstone-pin.md) | Manifest tombstones retain their body, and `undelete` restores it | accepted |
 
 ## Adding a new ADR
 

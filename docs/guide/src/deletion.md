@@ -277,6 +277,45 @@ is the horizon you already chose. Reclaiming them is three steps, in order:
 Like collection, GC is explicit and never automatic: a blob swept while some
 peer still holds the record naming it can't be restored by a later sync.
 
+### Deleting an index, and getting it back
+
+A graph or vector manifest is different: its body is inline JSON that names its
+blobs, so a tombstone that threw the body away would leave the blobs unnameable.
+Instead, the tombstone of a manifest **keeps the body** and records which kind
+it was, and `gc` marks through it. The slices or shards it names survive until
+the tombstone is collected, so the same three steps apply
+([ADR 0029](./adr/0029-manifest-tombstone-pin.md)). Because of that, a deleted
+index can be put back within the horizon:
+
+```sh
+gonzalo undelete --root ~/.gonzalo --namespace vectors --collection indexes --id docs
+```
+
+```text
+restored: vectors/indexes/docs
+revision: {"counter":5,"hash":"…"}
+```
+
+The restored manifest keeps its original `created` time. `undelete` writes
+nothing and exits non-zero when:
+
+- there is no tombstone at the key (never existed, or already collected);
+- the record is live;
+- the tombstone did not keep a body: only manifest kinds can be undeleted;
+- a blob the manifest names is missing, for example one that another deleted
+  and collected index also used. The message names the hashes;
+- the key was re-created since the delete.
+
+> **Warning.** Do not reopen a deleted index before you undelete it.
+> `RecordVectorIndex::open` does not see tombstones, so opening a deleted
+> key quietly starts a new empty index, and its first commit overwrites the
+> tombstone, taking the retained body and the chance to restore with it.
+> Run `gonzalo undelete` first.
+
+If two peers delete different revisions of the same manifest, sync keeps the
+newer tombstone and drops the other, so shards that only the older revision named
+lose their pin early. The surviving tombstone is still a complete manifest.
+
 ## Ancestor cap
 
 Each record keeps a short list of the revisions it came from, so sync can tell
