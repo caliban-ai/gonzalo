@@ -4,7 +4,8 @@
 
 use gonzalo_core::{
     BlobStore, Body, ContentHash, DeleteResult, Identity, KeyPrefix, Manifest, Meta, PutResult,
-    Record, RecordKey, RecordKind, Store, SweepPolicy, collect, gc_blobs_with, now_ms,
+    Record, RecordKey, RecordKind, Store, SweepPolicy, VectorManifest, collect, gc_blobs_with,
+    now_ms, reset,
 };
 use gonzalo_store_fs::FsStore;
 use std::time::{Duration, SystemTime};
@@ -256,4 +257,114 @@ async fn list_blobs_omits_a_deleted_blob() {
     let listed = store.list_blobs().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].hash, keep);
+}
+
+/// Store `manifest` as `(ns, index_id)`'s vector-manifest record, the shape GC
+/// reads shards out of.
+async fn put_vector_manifest(store: &FsStore, ns: &str, index_id: &str, m: &VectorManifest) {
+    committed(
+        store,
+        Record::create(
+            VectorManifest::key(ns, index_id),
+            RecordKind::VectorManifest,
+            m.to_body(),
+            meta(),
+        ),
+    )
+    .await;
+}
+
+/// Seed one vector index with a single shard blob, returning the manifest's key
+/// and the shard's hash.
+async fn store_with_vector_index(store: &FsStore) -> (RecordKey, ContentHash) {
+    let shard = store.put_blob(b"shard bytes").await.unwrap();
+    let mut m = VectorManifest::new("space-a", 3, 256);
+    m.entries.insert(0, shard.clone());
+    put_vector_manifest(store, "ns", "memories", &m).await;
+    (VectorManifest::key("ns", "memories"), shard)
+}
+
+// End to end over a real store: delete a vector index, sweep with no grace
+// period, and the shards are still there.
+#[tokio::test]
+async fn deleting_a_vector_index_does_not_free_its_shards() {
+    let store = fresh_store();
+    let (key, shard) = store_with_vector_index(&store).await;
+
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
+    assert!(report.freed.is_empty(), "the tombstone pins the shard");
+    assert!(store.has_blob(&shard).await.unwrap());
+}
+
+// The horizon still ends. Collect the tombstone and the shard becomes
+// collectable -- pinning must not turn into leaking.
+#[tokio::test]
+async fn collecting_the_tombstone_releases_the_shards() {
+    let store = fresh_store();
+    let (key, shard) = store_with_vector_index(&store).await;
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let collected = collect(&store, &KeyPrefix::default(), Duration::ZERO, now_ms() + 1)
+        .await
+        .unwrap();
+    assert_eq!(collected.purged.len(), 1);
+
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
+    assert_eq!(report.freed, vec![shard]);
+}
+
+// Purge is the admin escape hatch, and it must still release the shards --
+// otherwise a retained body could make them unreclaimable.
+#[tokio::test]
+async fn purging_the_tombstone_releases_the_shards() {
+    let store = fresh_store();
+    let (key, shard) = store_with_vector_index(&store).await;
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let t = store.get_raw(&key).await.unwrap().expect("tombstone");
+    assert_eq!(
+        store.purge(&key, t.revision).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let report = gc_blobs_with(&store, immediate()).await.unwrap();
+    assert_eq!(report.freed, vec![shard]);
+}
+
+// `reset` tombstones every key in a namespace, which is the realistic way a
+// vector index gets deleted by accident. Its shards must be pinned just as a
+// single delete pins them.
+#[tokio::test]
+async fn resetting_a_namespace_pins_a_vector_index_in_it() {
+    let store = fresh_store();
+    let (_key, shard) = store_with_vector_index(&store).await;
+
+    let report = reset(
+        &store,
+        &KeyPrefix {
+            namespace: Some("ns".into()),
+            collection: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.deleted.len(), 1);
+
+    let swept = gc_blobs_with(&store, immediate()).await.unwrap();
+    assert!(
+        swept.freed.is_empty(),
+        "reset's tombstone pins the shard too"
+    );
+    assert!(store.has_blob(&shard).await.unwrap());
 }
