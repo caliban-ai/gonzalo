@@ -136,9 +136,13 @@ mean different things depending on whether `collect` had run. Only an explicit
 - **Positive:** the fix adds no wire surface, trait method or planner arm. Old
   records read unchanged, and a tombstone written before this one marks nothing,
   as it did not before.
-- **Negative:** **reopening a deleted index destroys its recoverability, and the
-  most natural recovery attempt does exactly that.**
-  `RecordVectorIndex::open` (`crates/gonzalo-vector/src/record_index.rs`) reads
+- **Negative:** **any `put` that creates over a manifest tombstone destroys its
+  recoverability, and the most natural recovery attempt does exactly that.**
+  A consumer `put` with `expected: None` over a tombstone takes `plan_put`'s
+  recreation arm (`crates/gonzalo-core/src/tombstone.rs`), which overwrites the
+  tombstone, re-stamps `meta.created` and clears the retained body, whichever
+  caller issued it. The severe case is `RecordVectorIndex::open`
+  (`crates/gonzalo-vector/src/record_index.rs`), which reads
   with `store.get`, which hides tombstones, so opening the key of a deleted
   index does not fail: it silently builds a fresh, empty manifest. That
   manifest's first commit goes through `store.put(record, None)` into
@@ -147,10 +151,16 @@ mean different things depending on whether `collect` had run. Only an explicit
   window go with it. The most likely operator action after an accidental delete
   is to restart the application and reopen the index, and that is the action
   that makes `undelete` impossible. Run `gonzalo undelete` **before** anything
-  opens the key. A follow-up ticket will be filed. The deliberate decision here
-  was to document the hazard rather than change `open`, because the consumer
-  read path (exposing a tombstone to `open`, or letting `put` name one) is out
-  of this change's scope.
+  opens the key. A second live path is the indexer: `gonzalo index`
+  (`crates/gonzalo-cli/src/lib.rs`) derives `expected` from a consumer `get`,
+  which sees no record under a tombstone, so indexing a `GraphManifest` key
+  after `gonzalo delete` takes the same arm. The stakes are lower there, since
+  graph slices regenerate from source, but the restore window is gone all the
+  same. The vector case is the severe one because shards cannot be regenerated.
+  #333 tracks it. The deliberate decision here was to document the hazard
+  rather than change `open`, because the consumer read path (exposing a
+  tombstone to `open`, or letting `put` name one) is out of this change's
+  scope.
 - **Negative:** **a divergent delete can drop a pin early.** When two peers
   delete *different revisions* of the same manifest key, sync's
   diverged-tombstone merge calls `tombstone_winner`
@@ -159,8 +169,30 @@ mean different things depending on whether `collect` had run. Only an explicit
   revision lose their pin before the horizon. It degrades gracefully: the
   surviving tombstone is a complete, self-consistent manifest, so `undelete`
   restores a coherent index, and the higher counter means the *newer* manifest is
-  the one that survives. Selection does not look at the body, so every peer
-  converges on the same tombstone.
+  the one that survives. Selection does not look at the body, so when the
+  counters differ every peer converges on the same tombstone. **When the
+  counters are equal they do not.** `tombstone_hash()` is a constant
+  (`ContentHash::of(b"gonzalo:tombstone:v1")`), so every tombstone's revision
+  hash is identical and two tombstones at the same counter have *equal
+  revisions*. `tombstone_winner` compares `(counter, hash)` with `>=`, so on a
+  tie each peer keeps its own side, and both `sync` (`Relation::InSync`) and git
+  `pull` then treat the pair as already agreeing. The peers end up holding
+  different retained bodies at the same revision, permanently and silently. It
+  is reachable whenever two peers' live manifests diverged at the same counter
+  (same counter, different body hash) and both were then deleted. Revision-level
+  convergence holds; body-level convergence does not, and each peer's `undelete`
+  restores its own manifest.
+- **Negative:** **an older binary's `gc` frees the shards the pin protects.**
+  `Record` has no `deny_unknown_fields`, so a binary that predates
+  `deleted_kind` reads a manifest tombstone without error, but its
+  `live_blob_hashes` does not mark through the retained body, and re-serialising
+  the record drops the field. Its `gc` therefore frees exactly the shards the
+  tombstone exists to pin, and a vector index's shards cannot be regenerated.
+  Compatibility holds one way only: old records read unchanged under the new
+  binary, but a new record is not safe under the old one. The realistic exposure
+  is one store root run by two binary versions; sync copies records and not
+  blobs, so peers with separate blob stores are not affected. Upgrade every
+  binary that runs `gc` against a store before relying on the pin.
 - **Negative:** **a manifest tombstone is no longer small.** It carries the
   manifest's JSON, a few hundred bytes for a 256-shard index, until `collect`
   removes it. That departs from "tombstones are tiny and uniform".

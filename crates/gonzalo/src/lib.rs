@@ -286,9 +286,11 @@ mod facade_reexports {
     fn undelete_is_re_exported() {
         // The recovery half of `delete` (gonzalo#327): without the root
         // export a consumer cannot reach it at all.
-        // Naming it in a `use` pins the export without needing a store.
-        #[allow(unused_imports)]
-        use crate::undelete as _;
+        // Bind the function value: `gonzalo_core` exports both a module and a
+        // function named `undelete`, and a bare `use` is satisfied by the
+        // module alone. A value binding needs the function, which is generic
+        // over the store, so name one.
+        let _undelete_fn = undelete::<FsStore>;
     }
 
     #[test]

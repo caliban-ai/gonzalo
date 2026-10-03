@@ -482,7 +482,7 @@
         "type": "string",
         "enum": [
           "MemoryTier", "Topic", "Session", "Checkpoint", "Ticket", "TicketEvent", "GraphManifest",
-          "Person", "IdentityBinding", "RoleGrant", "ChannelConfig", "LinkToken", "AuditEntry",
+          "VectorManifest", "Person", "IdentityBinding", "RoleGrant", "ChannelConfig", "LinkToken", "AuditEntry",
           "Tombstone"
         ]
       },

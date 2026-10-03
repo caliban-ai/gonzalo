@@ -197,6 +197,9 @@ enum Commands {
         /// ID of the record.
         #[arg(long)]
         id: String,
+        /// Most recent revisions a record remembers in `ancestors` (at least 1).
+        #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
+        ancestor_cap: usize,
     },
     /// Tombstone every live record in a namespace, or in one collection of it.
     /// Not atomic but idempotent: re-run to finish after conflicts. Exits 3 if
@@ -525,9 +528,10 @@ async fn main() -> Result<ExitCode> {
             namespace,
             collection,
             id,
+            ancestor_cap,
         } => {
             let key = RecordKey::new(&namespace, &collection, &id);
-            let revision = undelete(&root, &namespace, &collection, &id).await?;
+            let revision = undelete(&root, ancestor_cap, &namespace, &collection, &id).await?;
             println!("restored: {key}");
             println!("revision: {}", serde_json::to_string(&revision)?);
         }

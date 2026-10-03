@@ -19,7 +19,10 @@ the patch version for fixes.
   tombstone. `gonzalo_core::undelete`, the `gonzalo undelete` subcommand and the
   facade re-export restore a manifest from its tombstone, preserving
   `meta.created`. Reopening a deleted vector index before undeleting it
-  discards the tombstone. ([ADR 0029](docs/adr/0029-manifest-tombstone-pin.md),
+  discards the tombstone, and so does any other `put` that creates at the key.
+  An older binary's `gc` does not read `deleted_kind` and frees the shards the
+  tombstone pins, so upgrade every binary that runs `gc` against a store first.
+  ([ADR 0029](docs/adr/0029-manifest-tombstone-pin.md),
   #327)
 - **`BlobStore::has_blob`.** A defaulted method (`get_blob(..).is_some()`),
   overridden by the filesystem store with `try_exists` and by S3 with

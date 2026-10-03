@@ -310,18 +310,30 @@ nothing and exits non-zero when:
 > `RecordVectorIndex::open` does not see tombstones, so opening a deleted
 > key quietly starts a new empty index, and its first commit overwrites the
 > tombstone, taking the retained body and the chance to restore with it.
-> Run `gonzalo undelete` first.
+> Run `gonzalo undelete` first. The same is true of anything else that creates
+> a record at that key: `gonzalo index` run against a deleted graph manifest
+> overwrites its tombstone in the same way.
+
+> **Warning.** Upgrade every binary that runs `gonzalo gc` against a store
+> before you rely on this pin. An older binary reads a tombstone that carries
+> `deleted_kind` without complaint, but it does not mark through the retained
+> body, so its `gc` frees the very shards the tombstone protects, and a vector
+> index's shards cannot be regenerated. Sync copies records, not blobs, so
+> peers with separate blob stores are not exposed; the risk is one store root
+> run by two binary versions.
 
 If two peers delete different revisions of the same manifest, sync keeps the
 newer tombstone and drops the other, so shards that only the older revision named
 lose their pin early. The surviving tombstone is still a complete manifest.
+If the two tombstones sit at the same counter, each peer keeps its own and they
+do not converge on one body; see [ADR 0029](./adr/0029-manifest-tombstone-pin.md).
 
 ## Ancestor cap
 
 Each record keeps a short list of the revisions it came from, so sync can tell
 "this side is just behind" apart from "both sides changed". The list is capped at
 32 entries by default. To change it, pass `--ancestor-cap <n>` to `gonzalo delete`,
-`reset`, `collect` or `sync`, or set the `GONZALO_ANCESTOR_CAP` environment
+`undelete`, `reset`, `collect` or `sync`, or set the `GONZALO_ANCESTOR_CAP` environment
 variable for `gonzalod`, which has no command-line flags. The cap must be at least
 1. Most deployments never need to change it.
 

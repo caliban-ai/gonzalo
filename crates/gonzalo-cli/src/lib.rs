@@ -1137,15 +1137,20 @@ pub async fn delete(
 }
 
 /// Restore the record at `namespace/collection/id` from its tombstone.
+///
+/// The restore is attributed to [`CLI_AUTHOR`], the operator restoring it,
+/// rather than whoever deleted the record.
 pub async fn undelete(
     root: &Path,
+    ancestor_cap: usize,
     namespace: &str,
     collection: &str,
     id: &str,
 ) -> Result<Revision> {
-    let store = FsStore::new(root);
+    let store = open_store(root, ancestor_cap)?;
     let key = RecordKey::new(namespace, collection, id);
-    Ok(gonzalo_core::undelete(&store, &key, gonzalo_core::now_ms(), None).await?)
+    let author = Identity::new(CLI_AUTHOR);
+    Ok(gonzalo_core::undelete(&store, &key, gonzalo_core::now_ms(), Some(&author)).await?)
 }
 
 /// Tombstone every live record in `namespace` (optionally one `collection`)
@@ -2857,6 +2862,55 @@ mod tombstone_cli_tests {
             .expect("tombstone stored");
         assert!(tomb.is_tombstone());
         assert_eq!(tomb.meta.author, Identity::new(CLI_AUTHOR));
+    }
+
+    #[tokio::test]
+    async fn undelete_stamps_the_cli_author_not_the_deleter() {
+        let root = TempDir::new().unwrap();
+        let store = FsStore::new(root.path());
+        let body = gonzalo_core::Manifest::new().to_body();
+        let key = RecordKey::new("ns", "col", "k");
+        let record = Record {
+            key: key.clone(),
+            kind: RecordKind::GraphManifest,
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            meta: Meta {
+                author: Identity::new("not-the-cli"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+            deleted_blob: None,
+            deleted_kind: None,
+        };
+        assert!(matches!(
+            store.put(record, None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+        let deleted = store
+            .delete_as(&key, None, Some(Identity::new("someone-else")))
+            .await
+            .unwrap();
+        assert!(matches!(deleted, gonzalo_core::DeleteResult::Deleted));
+
+        undelete(
+            root.path(),
+            gonzalo_core::DEFAULT_ANCESTOR_CAP,
+            "ns",
+            "col",
+            "k",
+        )
+        .await
+        .unwrap();
+
+        let restored = store.get(&key).await.unwrap().expect("restored");
+        assert_eq!(restored.meta.author, Identity::new(CLI_AUTHOR));
     }
 
     #[tokio::test]

@@ -205,6 +205,9 @@ pub fn plan_put(
                 // The recreated record is live and carries its own body, so it
                 // pins nothing on the tombstone's behalf (gonzalo#292).
                 record.deleted_blob = None;
+                // `deleted_kind` is set on tombstones only; a client-supplied
+                // record must not smuggle one onto a live record.
+                record.deleted_kind = None;
                 // A recreation starts a new life at this key: the deleted
                 // record's `created` does not carry over.
                 record.meta.created = now_ms;
@@ -803,6 +806,21 @@ mod tests {
         // The key is live again, so the old content stops being pinned: the
         // recreated record's own body is what keeps a blob alive (gonzalo#292).
         assert_eq!(stored.deleted_blob, None);
+    }
+
+    #[test]
+    fn recreating_over_a_tombstone_clears_deleted_kind() {
+        // `deleted_kind` is documented as set on tombstones only. Records cross
+        // the daemon as full JSON, so an incoming live record can carry one;
+        // the recreation arm must not persist it.
+        let t = tomb(3);
+        let mut fresh = live(0, b"again", vec![]);
+        fresh.deleted_kind = Some(RecordKind::VectorManifest);
+        let PutPlan::Write(stored) = plan_put(Some(&t), fresh, None, 32) else {
+            panic!("expected Write");
+        };
+        assert!(!stored.is_tombstone());
+        assert_eq!(stored.deleted_kind, None);
     }
 
     #[test]
