@@ -62,7 +62,7 @@ macOS arm64 is the only prebuilt target. Everywhere else, build from the registr
 ### Anywhere else: from crates.io
 
 ```sh
-v=0.6.0   # the version you want; `cargo search gonzalo-cli` shows the newest
+v=0.7.0   # the version you want; `cargo search gonzalo-cli` shows the newest
 cargo install "gonzalo-cli@$v" "gonzalo-mcp@$v" "gonzalo-parse@$v"
 ```
 
@@ -284,17 +284,28 @@ address a record by `namespace`, `collection` and `id`.
 | `record_put` | write a record — **only when the server allows writes** |
 | `record_delete` | delete a record — **only when the server allows writes** |
 
-A key that holds nothing is an *error* naming the key, not an empty result, for
-the same reason an unknown view is: an agent reads nothing as "there is nothing
-there" rather than "you asked the wrong question". Deleted records are hidden
-from both `record_get` and `record_list`.
+`record_get` on a key that holds nothing is an *error* naming the key, not an
+empty result, for the same reason an unknown view is: an agent reads nothing as
+"there is nothing there" rather than "you asked the wrong question". Deleted
+records are hidden from both `record_get` and `record_list`. `record_delete` is
+the exception — deleting an absent key succeeds and changes nothing, because to
+a consumer that key is already gone.
+
+A write that loses a race is **not** an error either: `record_put` answers
+`{"committed": false, …}` carrying the record the store actually holds, and
+`record_delete` answers `{"deleted": false, …}` the same way
+([ADR 0005](./adr/0005-optimistic-concurrency-and-conflict-surfacing.md)).
+Re-read and retry; never retry blind.
 
 `diff` is the most useful tool here for reviewing work: point it at a branch view and
 a main view and it reports what changed *structurally*, which is a different and often
 better question than what a textual diff shows.
 
-Every whole-view result is bounded and reports `total` and `truncated`, so a capped
-list never masquerades as a complete one.
+`top`, `list` and `unreferenced` are bounded and report `total` and `truncated`
+beside the items, so a capped list never masquerades as a complete one.
+`overview`'s counts are never truncated — only its `largest_files` is capped, by
+`largest`. `impact` reports `truncated` when it stopped at `max_depth` with a
+frontier still unexplored.
 
 ### Parameters
 
@@ -309,7 +320,7 @@ Every tool except `status` and `views` selects a view with `repo` and `view_id`
 | `overview` | `largest`: how many of the largest files to list (default 20) |
 | `top` | `by` (required): `fan_in`, `fan_out` or `definitions`; `limit` (default 20) |
 | `list` | `path_prefix`, `kind`, `name_contains`, `limit` (default 100) |
-| `unreferenced` | `path_prefix`, `kind`, `name_contains`, `exclude_tests`, `limit` (default 100) |
+| `unreferenced` | `path_prefix`, `kind`, `name_contains`, `exclude_tests` (default `true`), `limit` (default 100) |
 
 The record tools take no view selector:
 
@@ -319,8 +330,17 @@ The record tools take no view selector:
 | `record_list` | `namespace` (required); `collection` to narrow it |
 | `record_put` | `namespace`, `collection`, `id`, `body` (all required); `kind` (default `Topic`); `expected_revision` |
 
-`kind` is one of `function`, `struct`, `enum`, `trait`, `impl`, `module`, `const`,
-`static`, `type_alias`, `class` or `interface`.
+`list` and `unreferenced` take a **symbol** `kind`: one of `function`, `struct`,
+`enum`, `trait`, `impl`, `module`, `const`, `static`, `type_alias`, `class` or
+`interface`.
+
+`record_put`'s `kind` is a **record** kind instead — `MemoryTier`, `Topic`,
+`Session`, `Checkpoint`, `Ticket`, `TicketEvent`, `GraphManifest`, or one of the
+fleet kinds (`Person`, `IdentityBinding`, `RoleGrant`, `ChannelConfig`,
+`LinkToken`, `AuditEntry`) — and defaults to `Topic`. An unknown kind is an
+error rather than silently the default, and a tombstone cannot be written
+directly: deleting is `record_delete`'s job. Omitting `expected_revision` means
+"this key must not exist yet", so a `record_put` cannot silently overwrite.
 
 ## Capability boundaries
 
