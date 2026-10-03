@@ -255,6 +255,7 @@ where
     delete_hides_from_get_and_list(&factory().await).await;
     delete_visible_to_raw_reads(&factory().await).await;
     tombstone_pins_the_deleted_records_blob(&factory().await).await;
+    tombstone_retains_a_manifest_body(&factory().await).await;
     delete_stale_expected_writes_no_tombstone(&factory().await).await;
     delete_of_absent_key_writes_nothing(&factory().await).await;
     delete_of_tombstone_is_noop(&factory().await).await;
@@ -412,7 +413,7 @@ async fn delete_visible_to_raw_reads<S: Store>(store: &S) {
     assert!(store.list_raw(&tomb_prefix()).await.unwrap().contains(&key));
 }
 
-/// Deleting a blob-backed record leaves the blob's hash on the tombstone, and
+/// Deleting a blob-backed non-manifest record leaves the blob's hash on the tombstone, and
 /// the substrate round-trips it. The tombstone's body is empty, so this pin is
 /// the only thing standing between the content and the next blob sweep
 /// (gonzalo#292) — a substrate that drops the field on the way to storage frees
@@ -449,6 +450,37 @@ async fn tombstone_pins_the_deleted_records_blob<S: Store>(store: &S) {
         .unwrap()
         .expect("recreated record");
     assert_eq!(live.deleted_blob, None);
+}
+/// Deleting a manifest kind retains its body and records the kind, and the
+/// substrate round-trips both. A manifest's body is the only record of which
+/// blob was which shard, so a substrate that drops either on the way to storage
+/// unpins every shard and loses the mapping that would let an operator put the
+/// index back (ADR 0029).
+async fn tombstone_retains_a_manifest_body<S: Store>(store: &S) {
+    let key = tomb_key("manifest");
+    let mut m = crate::VectorManifest::new("space-a", 3, 256);
+    m.entries.insert(0, ContentHash::of(b"shard-zero"));
+    let body = m.to_body();
+
+    let mut record = sample(key.clone(), b"unused");
+    record.kind = RecordKind::VectorManifest;
+    record.revision = Revision::initial(body.bytes());
+    record.body = body.clone();
+    committed(store, record, None).await;
+
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    let t = store.get_raw(&key).await.unwrap().expect("tombstone");
+    assert!(t.is_tombstone());
+    assert_eq!(t.body, body, "the manifest body survives the round trip");
+    assert_eq!(
+        t.deleted_kind,
+        Some(RecordKind::VectorManifest),
+        "a substrate that drops deleted_kind unpins every shard"
+    );
 }
 
 /// A stale conditional delete conflicts and leaves the live record in place.
