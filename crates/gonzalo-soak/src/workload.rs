@@ -618,6 +618,7 @@ fn build_record(key: &RecordKey, body_bytes: &[u8], parent: Option<Revision>) ->
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     }
 }
 

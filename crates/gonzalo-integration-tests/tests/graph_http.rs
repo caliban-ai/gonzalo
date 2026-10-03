@@ -43,6 +43,7 @@ async fn seed(fs: &FsStore) {
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     };
     assert!(matches!(
         fs.put(record, None).await.unwrap(),

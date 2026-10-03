@@ -30,6 +30,7 @@ fn rec(key: RecordKey, payload: &str) -> Record {
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     }
 }
 

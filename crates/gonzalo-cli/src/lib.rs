@@ -129,6 +129,7 @@ pub async fn migrate(
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         };
 
         match store.put(record, None).await? {
@@ -630,6 +631,7 @@ pub async fn index_with_worker(
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     };
     match store.put(record, expected).await? {
         PutResult::Committed(_) => {}
@@ -2812,6 +2814,7 @@ mod tombstone_cli_tests {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         };
         let live = record.revision.clone();
         assert!(matches!(
@@ -2866,6 +2869,7 @@ mod tombstone_cli_tests {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         };
         assert!(matches!(
             store.put(record, None).await.unwrap(),

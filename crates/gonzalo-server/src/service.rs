@@ -484,6 +484,7 @@ mod tests {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         };
         let outcome = fs.put(record, None).await.unwrap();
         assert!(matches!(outcome, PutResult::Committed(_)));
@@ -735,6 +736,7 @@ mod tests {
             deleted_at: None,
             deleted_blob: None,
             key,
+            deleted_kind: None,
         }
     }
 

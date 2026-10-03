@@ -31,6 +31,7 @@ fn sample(key: RecordKey, payload: &[u8]) -> Record {
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     }
 }
 

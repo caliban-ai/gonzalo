@@ -186,6 +186,7 @@ mod tests {
             ancestors: Vec::new(),
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         }
     }
 
