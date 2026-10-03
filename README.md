@@ -14,8 +14,10 @@ behind a generic, versioned, conflict-aware core. It also hosts a tree-sitter co
 graph that agents query over MCP.
 
 **Guide:** <https://caliban-ai.github.io/gonzalo/>, covering the CLI, the MCP server,
-running `gonzalod`, storage backends, and the architecture decision log. Design specs
-live in `docs/superpowers/specs/`, per-milestone build notes in `docs/superpowers/plans/`.
+running `gonzalod`, generating a non-Rust client, storage backends, deletion and
+tombstones, the fleet access-control records, and the architecture decision log. Design
+specs live in `docs/superpowers/specs/`, per-milestone build notes in
+`docs/superpowers/plans/`.
 
 ## Ecosystem
 
@@ -23,7 +25,7 @@ live in `docs/superpowers/specs/`, per-milestone build notes in `docs/superpower
 |---|---|
 | [caliban](https://github.com/caliban-ai/caliban) | the agent |
 | [prospero](https://github.com/caliban-ai/prospero) | runs the caliban agent fleet |
-| [ariel](https://github.com/caliban-ai/ariel) | chat bridge for the fleet (Discord first, then Slack and Teams). In early implementation (Discord backend and prospero client landed; gonzalo integration not yet wired). Its identity, role grants, channel configuration and audit trail are gonzalo records; ariel stores nothing of its own. The record kinds shipped in 0.7.0 as the [fleet access-control records](docs/guide/src/fleet.md) (ADR 0022, ADR 0023). |
+| [ariel](https://github.com/caliban-ai/ariel) | chat bridge for the fleet (Discord today; Slack and Teams later). Shipping at v0.3.0, as `ghcr.io/caliban-ai/ariel`. **Gonzalo's first fleet-records consumer:** ariel's people, identity bindings, role grants, channel configuration, link tokens and audit trail are gonzalo records read and written over `gonzalod`, and ariel stores nothing of its own. The kinds shipped in 0.7.0 as the [fleet access-control records](docs/guide/src/fleet.md) (ADR 0022, ADR 0023), which ariel depends on gonzalo `0.7` for. |
 | **gonzalo** | persistence: records, stores, capability layers, daemon, code-graph MCP server |
 
 ## Architecture
@@ -40,7 +42,7 @@ surfacing, plus capability layers, all consumed through the `gonzalo` facade
 | `gonzalo-store-s3` `[s3]` | S3-compatible object-store substrate (needs atomic `If-Match`; RustFS qualified, ADR 0019) |
 | `gonzalo-store-server` `[remote]` | client substrate over a remote daemon (HTTP or gRPC) |
 | `gonzalo-domain` | typed views: `MemoryTier`, `Topic`, `Session`, `Checkpoint`, `Ticket`, fleet access-control records (`Person`, `IdentityBinding`, `RoleGrant`, `ChannelConfig`, `LinkToken`, `AuditEntry`; ADR 0022, ADR 0023) |
-| `gonzalo-vector` `[vector]` | `Embedder` + `VectorIndex` (exact in-memory index; approximate `hnsw` feature, ADR 0014) |
+| `gonzalo-vector` `[vector]` | `Embedder` + `VectorIndex`: exact in-memory index, approximate `hnsw` feature (ADR 0014), and `RecordVectorIndex`, a durable index over sharded content-addressed blobs (ADR 0027) |
 | `gonzalo-embed` | local CPU sentence embedder (Candle + all-MiniLM, ADR 0013) |
 | `gonzalo-knowledge` `[knowledge]` | knowledge store: `KnowledgeStore` over records + vector by `RecordKey` (ADR 0011) |
 | `gonzalo-graph` `[graph]` | tree-sitter code graph over 17 languages: symbols, references, imports, resolution, view diff |
@@ -53,9 +55,9 @@ surfacing, plus capability layers, all consumed through the `gonzalo` facade
 | `gonzalo-ticket-gitlab` `[ticket-gitlab]` | GitLab issue connector (`GitLabSource`, scoped-label workflow, read + write-back) |
 | `gonzalo-ticket-asana` `[ticket-asana]` | Asana task connector (`AsanaSource`, completed/section/field signals, read + write-back) |
 | `gonzalo-ticket-config` | multi-connection ticket config (`tickets.toml`) + provider registry |
-| `gonzalo-proto` / `gonzalo-server` | daemon (`gonzalod`): gRPC + HTTP/JSON over one service; fs or S3 substrate; namespace-scoped bearer auth (ADR 0015); `/healthz` + `/readyz` probes |
-| `gonzalo-mcp` | MCP server exposing the code graph to agents over stdio |
-| `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync`, `delete`/`reset`/`collect` (tombstones, ADR 0021), `index`/`gc`, `ticket sync`/`list`/`get`/`move` |
+| `gonzalo-proto` / `gonzalo-server` | daemon (`gonzalod`): gRPC + HTTP/JSON over one service; fs or S3 substrate; namespace-scoped bearer auth (ADR 0015); `/healthz` + `/readyz` probes. The `.proto` and `docs/api/openapi.json` are published per release so non-Rust clients are generated, not maintained (ADR 0020) |
+| `gonzalo-mcp` | MCP server over stdio: the code graph plus record reads, with `record_put`/`record_delete` behind `--allow-writes`; reads a local root or a running `gonzalod` |
+| `gonzalo-cli` | admin/ops CLI (`gonzalo`): `list`/`get`/`status`/`migrate`/`sync`, `delete`/`reset`/`collect` (tombstones, ADR 0021), `index`/`gc` (blob GC with an age rule, ADR 0024, ADR 0028), `ticket sync`/`list`/`get`/`move` |
 | `gonzalo-soak` | HA soak harness: stateless `gonzalod` replicas over S3 under replica-kill chaos |
 
 Every storage substrate passes a shared conformance suite shipped by
