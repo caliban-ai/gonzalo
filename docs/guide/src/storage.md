@@ -43,9 +43,11 @@ and the substrates. Every domain type lives under the module naming its domain:
 | `gonzalo::graph`, `::vector`, `::knowledge` | the feature-gated capability layers |
 
 So a program with its own `State` or `Actor` keeps them: gonzalo's are
-`gonzalo::ticket::State` and `gonzalo::ticket::Actor`. Before 0.8.0 all of these
-were exported flat at the root; see the 0.8.0 changelog for the full old→new
-table.
+`gonzalo::ticket::State` and `gonzalo::ticket::Actor`. Up to and including 0.7.0
+all of these were exported flat at the root; the grouping lands in the next
+release, with no deprecation window, and the changelog entry carries the full
+old→new table. Each `ticket-*` connector feature implies `ticket`, and
+`knowledge` implies `vector`.
 
 ## Choosing a substrate
 
