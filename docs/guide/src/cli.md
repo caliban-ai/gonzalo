@@ -86,11 +86,19 @@ writers settle rather than treating the run as a success.
 Blobs are content-addressed and shared — across views, and between records with
 identical content — so deleting a view's source, or a record, does not free them.
 `gc` marks against every record in the store (record bodies, the blobs tombstones
-pin, every view's manifest slices, and every shard blob a durable vector index's
-manifest names) and reports `scanned`, `freed`, `retained` and `deferred`. A
-deleted record's blob is pinned by its tombstone until `collect` removes it;
+pin, every view's manifest slices, every shard blob a durable vector index's
+manifest names, and everything named by the retained body of a *manifest*
+tombstone) and reports `scanned`, `freed`, `retained` and `deferred`. A deleted
+record's blob is pinned by its tombstone until `collect` removes it;
 [Deletion](./deletion.md#reclaiming-a-deleted-records-bytes) walks through the
 order.
+
+Deleting a manifest is the one case where the tombstone keeps the record's body
+rather than discarding it: a manifest names its blobs out of line, so dropping
+the body would both unpin the shards and destroy the mapping that says which
+blob held which shard. Keeping it means `gc` still marks through a deleted index,
+and `gonzalo undelete` can restore one until `collect` purges the tombstone
+([ADR 0029](./adr/0029-manifest-tombstone-pin.md)).
 
 `deferred` counts unreferenced blobs the sweep held back for being younger than
 `--min-age` (default `1h`). A blob is uploaded before the record or manifest that

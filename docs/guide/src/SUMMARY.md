@@ -52,3 +52,4 @@
   - [ADR 0026 · A grouped facade surface](./adr/0026-grouped-facade-surface.md)
   - [ADR 0027 · A durable vector index](./adr/0027-durable-vector-index.md)
   - [ADR 0028 · A grace period for blob garbage collection](./adr/0028-blob-gc-grace-period.md)
+  - [ADR 0029 · Manifest tombstones retain their body, and `undelete` restores it](./adr/0029-manifest-tombstone-pin.md)

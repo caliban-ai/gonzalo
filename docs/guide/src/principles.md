@@ -68,8 +68,9 @@ kept in sync when those are superseded.
 15. **Derived bytes are swept by marking from the records, never from a
     caller.** Blobs are shared, so nothing frees one implicitly. GC builds its
     mark set from the store's own records — record bodies, the blob a tombstone
-    pins, a graph manifest's slices, a vector manifest's shards — and a caller
-    cannot narrow it (ADR 0024). The sweep also spares anything younger than a
+    pins, a graph manifest's slices, a vector manifest's shards, and the retained
+    body of a manifest tombstone — and a caller cannot narrow it (ADR 0024,
+    ADR 0029). The sweep also spares anything younger than a
     grace period, because a blob is uploaded before the record that references
     it commits (ADR 0028).
 16. **Gonzalo stores; it does not decide.** The fleet access-control records
@@ -123,9 +124,12 @@ kept in sync when those are superseded.
     Only the raw surface exposes a tombstone, and that is the surface
     replication uses; a deleted key can never reappear in a listing (ADR 0021,
     ADR 0025).
-17. **A tombstone pins the deleted record's blob** until the tombstone itself is
-    collected, so a delete never destroys content a peer can still sync back
-    (ADR 0024).
+17. **A tombstone pins the blobs of the record it replaces** until the tombstone
+    itself is collected, so a delete never destroys content a peer can still
+    sync back (ADR 0024). A record whose body *is* a blob pins that blob; a
+    manifest, which names its blobs out of line, keeps its body in the tombstone
+    so the pin survives with the mapping that makes the bytes nameable — which
+    is also what lets `undelete` restore a deleted index (ADR 0029).
 18. **The daemon's surface stays described, not merely implemented** — the
     served-operation table is checked against the router's own source and
     against the published OpenAPI document, in both directions, so an operation
