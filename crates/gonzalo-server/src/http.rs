@@ -453,7 +453,8 @@ async fn get_blob(
 }
 
 /// `HEAD /v1/blobs/{hash}` — whether the blob exists: `200` or `404`, no body.
-/// Authorized `Write`-free: `Read` on `_blobs`, same as `GET`.
+/// Authorized `Read` on `_blobs`, the same as `GET`: presence is information,
+/// so a principal without the scope must not learn it.
 ///
 /// This exists so a writer confirming its referenced blobs survived a commit
 /// does not download them (ADR 0028, #329). It answers from

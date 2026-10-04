@@ -79,7 +79,7 @@ async fn assert_presence_without_download(store: ServerStore, stored: &ContentHa
         !store
             .has_blob(&absent)
             .await
-            .expect("an absent blob is a false, not an error"),
+            .expect("an absent blob is `false`, not an error"),
         "an unstored blob is absent"
     );
 }

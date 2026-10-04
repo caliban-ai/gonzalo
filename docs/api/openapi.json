@@ -320,7 +320,7 @@
       "head": {
         "tags": ["blobs"],
         "summary": "Whether a blob exists",
-        "description": "Requires `read` on `_blobs`. Answers from a presence check rather than a read, so a writer confirming its referenced blobs survived a commit does not download them (ADR 0028). `content-length` is therefore `0`, not the blob's size \u2014 `GET` the blob if you need its length.",
+        "description": "Requires `read` on `_blobs`. Answers from a presence check rather than a read, so a writer confirming its referenced blobs survived a commit does not download them (ADR 0028). `content-length` is therefore `0`, not the blob's size — `GET` the blob if you need its length.",
         "responses": {
           "200": { "description": "the blob is stored" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
