@@ -28,6 +28,20 @@ use tonic::transport::Channel;
 pub const DAEMON_PREDATES_REPLICATION: &str =
     "daemon predates replication reads (gonzalo#203); upgrade gonzalod";
 
+/// The error `has_blob` returns against a daemon whose gRPC service has no
+/// `HasBlob` RPC (`Unimplemented`).
+///
+/// There is deliberately **no fallback** to `GetBlob`. It would answer
+/// correctly while silently reinstating the per-blob download this check
+/// exists to remove (ADR 0028, gonzalo#329), so a mixed-version deployment
+/// would keep paying the cost with nothing to show why.
+///
+/// HTTP needs no such message: axum serves `HEAD` from a route's `GET`
+/// handler, so an older daemon answers `HEAD /v1/blobs/{hash}` correctly
+/// anyway — it just reads the blob to do it. Only gRPC can see the gap.
+pub const DAEMON_PREDATES_BLOB_PRESENCE: &str =
+    "daemon predates the blob presence check (gonzalo#329); upgrade gonzalod";
+
 enum Backend {
     Http {
         base: reqwest::Url,
@@ -577,7 +591,7 @@ impl BlobStore for ServerStore {
                 Ok(client
                     .has_blob(req)
                     .await
-                    .map_err(status)?
+                    .map_err(presence_status)?
                     .into_inner()
                     .found)
             }
@@ -825,6 +839,16 @@ fn replication_status(s: tonic::Status) -> CoreError {
     }
 }
 
+/// Map a gRPC failure on `HasBlob`: `Unimplemented` means the daemon predates
+/// the presence check → [`DAEMON_PREDATES_BLOB_PRESENCE`].
+fn presence_status(s: tonic::Status) -> CoreError {
+    if s.code() == tonic::Code::Unimplemented {
+        CoreError::Backend(DAEMON_PREDATES_BLOB_PRESENCE.into())
+    } else {
+        status(s)
+    }
+}
+
 /// Map a gRPC failure on `Put`: `FailedPrecondition` is the daemon's
 /// `CoreError::NotFound`, restored as `NotFound(key)`.
 fn put_status(s: tonic::Status, key: &RecordKey) -> CoreError {
@@ -916,6 +940,7 @@ fn status(s: tonic::Status) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gonzalo_core::BlobStore as _;
     use gonzalo_core::store::Conflict;
     use gonzalo_core::{Body, ContentHash, Identity, Meta, Record, RecordKind};
     use reqwest::StatusCode;
@@ -1291,6 +1316,32 @@ mod tests {
             assert_eq!(err.to_string(), upgrade_error());
         }
         server.verify().await;
+    }
+
+    /// A daemon predating `HasBlob` answers it `Unimplemented`.
+    ///
+    /// Falling back to a download would answer correctly while quietly
+    /// reinstating the per-blob cost this check exists to remove — an
+    /// invisible regression on a mixed-version deployment. So the client says
+    /// what to do instead, as it does for the replication RPCs (#329).
+    #[tokio::test]
+    async fn grpc_old_daemon_has_blob_asks_for_an_upgrade() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let store = ServerStore::grpc(format!("http://{addr}")).await.unwrap();
+        let err = store
+            .has_blob(&ContentHash::of(b"anything"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            CoreError::Backend(DAEMON_PREDATES_BLOB_PRESENCE.into()).to_string()
+        );
     }
 
     /// A tonic server with no services answers every RPC `Unimplemented`,

@@ -14,7 +14,7 @@
 //! and it holds over both transports without measuring anything.
 
 use gonzalo_core::{BlobEntry, BlobStore, ContentHash, CoreError, DEFAULT_ANCESTOR_CAP, Result};
-use gonzalo_server::{Auth, Service, serve_grpc, serve_http};
+use gonzalo_server::{Auth, Principal, Service, serve_grpc, serve_http};
 use gonzalo_store_fs::FsStore;
 use gonzalo_store_server::ServerStore;
 use std::sync::Arc;
@@ -103,4 +103,60 @@ async fn grpc_server_store_has_blob_does_not_download() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let store = ServerStore::grpc(format!("http://{addr}")).await.unwrap();
     assert_presence_without_download(store, &stored).await;
+}
+
+/// A refusal is not an absence.
+///
+/// `has_blob` reports presence as a bool, so a denied request must surface as
+/// an error rather than `false`. Reading a `403` as "absent" would tell a
+/// writer the blob it just referenced had vanished — a wrong answer, where an
+/// error is merely a failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_server_store_has_blob_does_not_read_a_refusal_as_absence() {
+    let (service, stored) = presence_only_service().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // `wtok` may read and write `memory`, and so holds no scope on `_blobs`.
+    let auth = Arc::new(Auth::Enabled(std::collections::HashMap::from([(
+        "wtok".to_string(),
+        Principal::new("writer", vec!["memory".into()], vec!["memory".into()]),
+    )])));
+    tokio::spawn(serve_http(listener, service, auth));
+    let store = ServerStore::http_with_token(&format!("http://{addr}"), "wtok").unwrap();
+
+    let msg = store
+        .has_blob(&stored)
+        .await
+        .expect_err("a principal without `_blobs` read is refused, not told `false`")
+        .to_string();
+    assert!(msg.contains("403"), "{msg}");
+}
+
+/// As above, over gRPC: `PermissionDenied` is an error, and must not be
+/// confused with the "upgrade gonzalod" message a missing RPC earns.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_server_store_has_blob_does_not_read_a_refusal_as_absence() {
+    let (service, stored) = presence_only_service().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = Arc::new(Auth::Enabled(std::collections::HashMap::from([(
+        "wtok".to_string(),
+        Principal::new("writer", vec!["memory".into()], vec!["memory".into()]),
+    )])));
+    tokio::spawn(serve_grpc(listener, service, auth));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let store = ServerStore::grpc_with_token(format!("http://{addr}"), "wtok")
+        .await
+        .unwrap();
+
+    let msg = store
+        .has_blob(&stored)
+        .await
+        .expect_err("a principal without `_blobs` read is refused, not told `false`")
+        .to_string();
+    assert!(msg.contains("PermissionDenied"), "{msg}");
+    assert!(
+        !msg.contains(gonzalo_store_server::DAEMON_PREDATES_BLOB_PRESENCE),
+        "a refusal is not a missing RPC: {msg}"
+    );
 }
