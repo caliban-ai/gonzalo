@@ -940,7 +940,6 @@ fn status(s: tonic::Status) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gonzalo_core::BlobStore as _;
     use gonzalo_core::store::Conflict;
     use gonzalo_core::{Body, ContentHash, Identity, Meta, Record, RecordKind};
     use reqwest::StatusCode;
