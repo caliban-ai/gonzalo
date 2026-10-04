@@ -25,9 +25,24 @@ the patch version for fixes.
   ([ADR 0029](docs/adr/0029-manifest-tombstone-pin.md),
   #327)
 - **`BlobStore::has_blob`.** A defaulted method (`get_blob(..).is_some()`),
-  overridden by the filesystem store with `try_exists` and by S3 with
-  `HeadObject`. A failure that is not "no such key" is an error, not `false`.
-  Over the daemon it downloads the blob. (#325)
+  overridden by the filesystem store with `try_exists`, by S3 with
+  `HeadObject`, and by the remote store with the presence route below. A
+  failure that is not "no such key" is an error, not `false`. (#325, #329)
+- **`HEAD /v1/blobs/{hash}` and the `HasBlob` gRPC RPC** answer whether a blob
+  exists without reading it, and `ServerStore::has_blob` now uses them instead
+  of the downloading default. A writer confirming its referenced blobs survived
+  a commit previously pulled every one of them over the daemon — 600 KB a shard
+  for a vector index, on every interactive upsert. Additive on both surfaces.
+  Two notes for existing callers: `HEAD /v1/blobs/{hash}` already answered
+  `200`/`404`, because axum serves `HEAD` from the `GET` handler and discards
+  the body; it now reports `content-length: 0` rather than the blob's size,
+  since a size needs the read the route exists to avoid. `GET` the blob if you
+  need its length. Over gRPC a daemon with no `HasBlob` RPC earns
+  `DAEMON_PREDATES_BLOB_PRESENCE` ("upgrade gonzalod") rather than a silent
+  fall back to downloading, which would keep paying the cost with nothing to
+  show why; over HTTP no such message is needed, because axum serves `HEAD`
+  from a route's `GET` handler and an older daemon therefore answers anyway.
+  ([ADR 0028](docs/adr/0028-blob-gc-grace-period.md), #329)
 - **A sweep policy for blob GC.** `SweepPolicy`, `DEFAULT_MIN_AGE` (one hour),
   `sweep_blobs_with` and `gc_blobs_with` let a caller set the minimum blob age
   explicitly; `gc_blobs` and `sweep_blobs` keep their signatures and use the

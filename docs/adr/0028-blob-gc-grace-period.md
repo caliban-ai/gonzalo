@@ -192,9 +192,15 @@ enough margin for upload and ordinary skew without leaving garbage for days.
 - **Negative:** **listing blobs now costs a `stat` per blob.** `list_blobs` went
   from one `read_dir` to `read_dir` plus a `stat` of every blob, a real
   per-sweep cost on a large store under `--watch --gc`.
-- **Negative:** **`ServerStore::has_blob` downloads the blob**, so the daemon
-  path pays bandwidth for each newly referenced blob. A `HEAD` route is a
-  follow-up.
+- **Negative, resolved:** **`ServerStore::has_blob` downloaded the blob**, so
+  the daemon path paid bandwidth for each newly referenced blob. The `HEAD`
+  route named here as a follow-up landed in
+  [gonzalo#329](https://github.com/caliban-ai/gonzalo/issues/329):
+  `HEAD /v1/blobs/{hash}` and the `HasBlob` RPC answer from the daemon's own
+  presence check, and `ServerStore` overrides the default to use them. The
+  check costs a stat on both sides now. One consequence of answering from
+  presence: `HEAD` reports `content-length: 0`, not the blob's size, because a
+  size would need the read the route exists to avoid.
 - **Negative:** **#198's drift check compares paths and methods, not response
   schemas**, so the changed `GET /v1/blobs` response in `docs/api/openapi.json`
   is not guarded by a test. What pins it is the `http.rs` test that reads the

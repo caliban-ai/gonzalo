@@ -13,8 +13,8 @@ use gonzalo_proto::http::{
     DeleteBody, DeleteOutcome, PurgeBody, PutBody, PutOutcome, RawRecordBody,
 };
 use gonzalo_proto::v1::{
-    DeleteBlobRequest, DeleteRequest, GetBlobRequest, GetRequest, ListBlobsRequest, ListRequest,
-    ListResponse, PurgeRequest, PutBlobRequest, PutRequest, PutResponse,
+    DeleteBlobRequest, DeleteRequest, GetBlobRequest, GetRequest, HasBlobRequest, ListBlobsRequest,
+    ListRequest, ListResponse, PurgeRequest, PutBlobRequest, PutRequest, PutResponse,
     gonzalo_client::GonzaloClient,
 };
 use tonic::transport::Channel;
@@ -27,6 +27,20 @@ use tonic::transport::Channel;
 /// deleted records (spec §3.6).
 pub const DAEMON_PREDATES_REPLICATION: &str =
     "daemon predates replication reads (gonzalo#203); upgrade gonzalod";
+
+/// The error `has_blob` returns against a daemon whose gRPC service has no
+/// `HasBlob` RPC (`Unimplemented`).
+///
+/// There is deliberately **no fallback** to `GetBlob`. It would answer
+/// correctly while silently reinstating the per-blob download this check
+/// exists to remove (ADR 0028, gonzalo#329), so a mixed-version deployment
+/// would keep paying the cost with nothing to show why.
+///
+/// HTTP needs no such message: axum serves `HEAD` from a route's `GET`
+/// handler, so an older daemon answers `HEAD /v1/blobs/{hash}` correctly
+/// anyway — it just reads the blob to do it. Only gRPC can see the gap.
+pub const DAEMON_PREDATES_BLOB_PRESENCE: &str =
+    "daemon predates the blob presence check (gonzalo#329); upgrade gonzalod";
 
 enum Backend {
     Http {
@@ -540,6 +554,50 @@ impl BlobStore for ServerStore {
         }
     }
 
+    /// Presence over the wire, without the bytes.
+    ///
+    /// The trait default fetches the blob and discards it, which over a daemon
+    /// means a full download per newly referenced blob on every commit — 600 KB
+    /// a shard for a vector index (ADR 0028, #329). `HEAD /v1/blobs/{hash}` and
+    /// the `HasBlob` RPC answer from the daemon's own presence check instead.
+    ///
+    /// A `404` is `false`, not an error: absence is the answer, not a failure.
+    async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::blobs_url(base, Some(&hash.0))?;
+                let resp = maybe_auth(client.head(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(false);
+                }
+                ensure_read_ok(resp).await?;
+                Ok(true)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    HasBlobRequest {
+                        hash: hash.0.clone(),
+                    },
+                    token,
+                )?;
+                Ok(client
+                    .has_blob(req)
+                    .await
+                    .map_err(presence_status)?
+                    .into_inner()
+                    .found)
+            }
+        }
+    }
+
     async fn list_blobs(&self) -> Result<Vec<BlobEntry>> {
         match &self.backend {
             Backend::Http {
@@ -776,6 +834,16 @@ fn classify_purge_response(status: reqwest::StatusCode, body: &str) -> Result<De
 fn replication_status(s: tonic::Status) -> CoreError {
     if s.code() == tonic::Code::Unimplemented {
         upgrade_required()
+    } else {
+        status(s)
+    }
+}
+
+/// Map a gRPC failure on `HasBlob`: `Unimplemented` means the daemon predates
+/// the presence check → [`DAEMON_PREDATES_BLOB_PRESENCE`].
+fn presence_status(s: tonic::Status) -> CoreError {
+    if s.code() == tonic::Code::Unimplemented {
+        CoreError::Backend(DAEMON_PREDATES_BLOB_PRESENCE.into())
     } else {
         status(s)
     }
@@ -1247,6 +1315,32 @@ mod tests {
             assert_eq!(err.to_string(), upgrade_error());
         }
         server.verify().await;
+    }
+
+    /// A daemon predating `HasBlob` answers it `Unimplemented`.
+    ///
+    /// Falling back to a download would answer correctly while quietly
+    /// reinstating the per-blob cost this check exists to remove — an
+    /// invisible regression on a mixed-version deployment. So the client says
+    /// what to do instead, as it does for the replication RPCs (#329).
+    #[tokio::test]
+    async fn grpc_old_daemon_has_blob_asks_for_an_upgrade() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let store = ServerStore::grpc(format!("http://{addr}")).await.unwrap();
+        let err = store
+            .has_blob(&ContentHash::of(b"anything"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            CoreError::Backend(DAEMON_PREDATES_BLOB_PRESENCE.into()).to_string()
+        );
     }
 
     /// A tonic server with no services answers every RPC `Unimplemented`,

@@ -52,6 +52,7 @@ pub const SERVED_OPERATIONS: &[(&str, &str)] = &[
     ("GET", "/v1/graph/impact"),
     ("GET", "/v1/blobs"),
     ("GET", "/v1/blobs/{hash}"),
+    ("HEAD", "/v1/blobs/{hash}"),
     ("PUT", "/v1/blobs/{hash}"),
     ("DELETE", "/v1/blobs/{hash}"),
 ];
@@ -65,7 +66,10 @@ pub fn router(service: Service, auth: Arc<Auth>) -> Router {
     let blob_routes = Router::new()
         .route(
             "/v1/blobs/{hash}",
-            get(get_blob).put(put_blob).delete(delete_blob),
+            get(get_blob)
+                .head(head_blob)
+                .put(put_blob)
+                .delete(delete_blob),
         )
         .route("/v1/blobs", get(list_blobs))
         .layer(DefaultBodyLimit::max(max_blob));
@@ -448,6 +452,31 @@ async fn get_blob(
     }
 }
 
+/// `HEAD /v1/blobs/{hash}` — whether the blob exists: `200` or `404`, no body.
+/// Authorized `Read` on `_blobs`, the same as `GET`: presence is information,
+/// so a principal without the scope must not learn it.
+///
+/// This exists so a writer confirming its referenced blobs survived a commit
+/// does not download them (ADR 0028, #329). It answers from
+/// [`Service::has_blob`] — a stat, not a read — and therefore reports
+/// `content-length: 0` rather than the blob's size. Without this handler axum
+/// would answer `HEAD` by running [`get_blob`] and discarding the body, which
+/// reports the true size but pays the whole read.
+async fn head_blob(
+    State(svc): State<Arc<Service>>,
+    Extension(principal): Extension<Principal>,
+    Path(hash): Path<String>,
+) -> Response {
+    if !principal.allows(Access::Read, BLOB_NS) {
+        return forbidden(&principal, Access::Read, BLOB_NS);
+    }
+    match svc.has_blob(&ContentHash(hash)).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => server_error(e),
+    }
+}
+
 /// `PUT /v1/blobs/{hash}` — store raw body content, write-if-absent. The server
 /// recomputes the content hash and rejects a mismatch with the URL `{hash}`
 /// (`400`) before writing, so the address is authoritative. Authorized `Write`
@@ -626,7 +655,9 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use gonzalo_core::{CoreError, Record, Result as CoreResult, Revision, Store};
+    use gonzalo_core::{
+        BlobStore, ContentHash, CoreError, Record, Result as CoreResult, Revision, Store,
+    };
     use gonzalo_store_fs::FsStore;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
@@ -753,7 +784,7 @@ mod tests {
                 }
             }
             let chain = &rest[..end];
-            for verb in ["get", "put", "delete", "post", "patch"] {
+            for verb in ["get", "head", "put", "delete", "post", "patch"] {
                 if chain.contains(&format!("{verb}(")) {
                     out.push((verb.to_uppercase(), path.to_string()));
                 }
@@ -780,6 +811,13 @@ mod tests {
         assert!(
             found.contains(&("POST".into(), "/v1/tickets/sync".into())),
             "a fully-qualified axum::routing::post route"
+        );
+        // A verb the parser does not know is a route the drift checks cannot
+        // see, in either direction — which is how an undocumented operation
+        // gets served (#329).
+        assert!(
+            found.contains(&("HEAD".into(), "/v1/blobs/{hash}".into())),
+            "HEAD on the hash-addressed blob route"
         );
         assert!(
             !found.iter().any(|(_, p)| p.is_empty() || p.contains('…')),
@@ -1291,6 +1329,150 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         let (s, _) = call(svc, scoped(), "GET", "/v1/blobs", Some("atok"), None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    /// A blob store that stores, lists, deletes and reports presence normally
+    /// but refuses to hand back bytes.
+    ///
+    /// `HEAD /v1/blobs/{hash}` answered through it proves the route consults
+    /// presence rather than reading the blob (#329). Without an explicit `head`
+    /// route, axum answers `HEAD` by running the `GET` handler and discarding
+    /// the body, so the read still happens — here that surfaces as a `500`.
+    struct PresenceOnlyBlobs(FsStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for PresenceOnlyBlobs {
+        async fn put_blob(&self, content: &[u8]) -> CoreResult<ContentHash> {
+            self.0.put_blob(content).await
+        }
+        async fn get_blob(&self, _hash: &ContentHash) -> CoreResult<Option<Vec<u8>>> {
+            Err(CoreError::Backend("get_blob must not be called".into()))
+        }
+        async fn list_blobs(&self) -> CoreResult<Vec<gonzalo_core::BlobEntry>> {
+            self.0.list_blobs().await
+        }
+        async fn has_blob(&self, hash: &ContentHash) -> CoreResult<bool> {
+            self.0.has_blob(hash).await
+        }
+        async fn delete_blob(&self, hash: &ContentHash) -> CoreResult<()> {
+            self.0.delete_blob(hash).await
+        }
+    }
+
+    #[tokio::test]
+    async fn head_blob_answers_presence_without_reading_the_blob() {
+        let dir = TempDir::new().unwrap();
+        let blobs = Arc::new(PresenceOnlyBlobs(FsStore::new(dir.path())));
+        let hash = blobs
+            .put_blob(b"bytes that must stay on disk")
+            .await
+            .unwrap()
+            .0;
+        let svc = Service::new(Arc::new(FsStore::new(dir.path())), blobs);
+
+        let (s, body) = call(
+            svc.clone(),
+            open(),
+            "HEAD",
+            &format!("/v1/blobs/{hash}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "a stored blob is present");
+        assert!(body.is_empty(), "HEAD never carries a body");
+
+        let absent = ContentHash::of(b"never stored").0;
+        let (s, _) = call(
+            svc,
+            open(),
+            "HEAD",
+            &format!("/v1/blobs/{absent}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "an unstored blob is absent");
+    }
+
+    /// `HEAD` reads presence, so it cannot report a size without the read it
+    /// exists to avoid: `content-length` is `0`, not the blob's length.
+    ///
+    /// Deliberate, and a change from the `HEAD` axum used to synthesize from
+    /// the `GET` handler, which reported the real size. Nothing in this repo
+    /// reads it; a caller that needs a size should `GET`. Pinned so reinstating
+    /// one is a decision rather than an accident (#329).
+    #[tokio::test]
+    async fn head_blob_does_not_report_the_blob_size() {
+        let (svc, _d) = fs_service();
+        let content = b"sixteen bytes!!!".to_vec();
+        let hash = ContentHash::of(&content).0;
+        let (s, _) = call(
+            svc.clone(),
+            open(),
+            "PUT",
+            &format!("/v1/blobs/{hash}"),
+            None,
+            Some(content),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let req = HttpRequest::builder()
+            .method("HEAD")
+            .uri(format!("/v1/blobs/{hash}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(svc, open()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_LENGTH)
+                .map(|v| v.to_str().unwrap().to_string()),
+            Some("0".to_string()),
+        );
+    }
+
+    /// `HEAD` is a read of `_blobs`: a principal without that scope must not
+    /// learn whether a blob exists.
+    #[tokio::test]
+    async fn head_blob_requires_blobs_read_scope() {
+        let (svc, _d) = fs_service();
+        let content = b"scoped presence".to_vec();
+        let hash = ContentHash::of(&content).0;
+        let (s, _) = call(
+            svc.clone(),
+            scoped(),
+            "PUT",
+            &format!("/v1/blobs/{hash}"),
+            Some("atok"),
+            Some(content),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // `scoped()` grants read/write on `memory` only — not `_blobs`.
+        let (s, _) = call(
+            svc.clone(),
+            scoped(),
+            "HEAD",
+            &format!("/v1/blobs/{hash}"),
+            Some("wtok"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        let (s, _) = call(
+            svc,
+            scoped(),
+            "HEAD",
+            &format!("/v1/blobs/{hash}"),
+            Some("atok"),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
     }
 
