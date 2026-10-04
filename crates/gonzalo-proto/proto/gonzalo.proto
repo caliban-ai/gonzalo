@@ -30,6 +30,9 @@ service Gonzalo {
   // Content-addressed blobs (gonzalo#184). Bodies ride as raw bytes, not JSON.
   rpc PutBlob(PutBlobRequest) returns (PutBlobResponse);
   rpc GetBlob(GetBlobRequest) returns (GetBlobResponse);
+  // Presence only, so a writer confirming its referenced blobs survived a
+  // commit does not download them (ADR 0028, gonzalo#329).
+  rpc HasBlob(HasBlobRequest) returns (HasBlobResponse);
   rpc ListBlobs(ListBlobsRequest) returns (ListBlobsResponse);
   rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse);
 }
@@ -141,6 +144,12 @@ message GetBlobRequest {
 message GetBlobResponse {
   bool found = 1;
   bytes content = 2;
+}
+message HasBlobRequest {
+  string hash = 1;
+}
+message HasBlobResponse {
+  bool found = 1;
 }
 message ListBlobsRequest {}
 message BlobEntry {

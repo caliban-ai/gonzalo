@@ -10,9 +10,9 @@ use gonzalo_core::{
 use gonzalo_proto::v1::{
     DeleteBlobRequest, DeleteBlobResponse, DeleteRequest, DeleteResponse, GetBlobRequest,
     GetBlobResponse, GetRequest, GetResponse, GraphLocatedResponse, GraphNamesResponse,
-    GraphQueryRequest, ListBlobsRequest, ListBlobsResponse, ListRequest, ListResponse,
-    PurgeRequest, PurgeResponse, PutBlobRequest, PutBlobResponse, PutRequest, PutResponse,
-    TicketSyncRequest, TicketSyncResponse,
+    GraphQueryRequest, HasBlobRequest, HasBlobResponse, ListBlobsRequest, ListBlobsResponse,
+    ListRequest, ListResponse, PurgeRequest, PurgeResponse, PutBlobRequest, PutBlobResponse,
+    PutRequest, PutResponse, TicketSyncRequest, TicketSyncResponse,
     gonzalo_server::{Gonzalo, GonzaloServer},
 };
 use serde::Serialize;
@@ -427,6 +427,20 @@ impl Gonzalo for GrpcAdapter {
             },
         };
         Ok(Response::new(resp))
+    }
+
+    async fn has_blob(
+        &self,
+        req: Request<HasBlobRequest>,
+    ) -> Result<Response<HasBlobResponse>, Status> {
+        let (metadata, _ext, r) = req.into_parts();
+        self.authorize(&metadata, Access::Read, BLOB_NS)?;
+        let found = self
+            .service
+            .has_blob(&ContentHash(r.hash))
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(HasBlobResponse { found }))
     }
 
     async fn list_blobs(
@@ -960,6 +974,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// `HasBlob` reports presence and nothing else — there is no content field
+    /// to fill, so a client confirming a blob survived a commit cannot be made
+    /// to pay for its bytes (#329).
+    #[tokio::test]
+    async fn grpc_has_blob_reports_presence() {
+        let fs = Arc::new(FsStore::new(tempfile::tempdir().unwrap().keep()));
+        let adapter = GrpcAdapter::new(Service::new(fs.clone(), fs));
+        let content = b"grpc presence".to_vec();
+        let hash = gonzalo_core::ContentHash::of(&content).0;
+
+        let before = adapter
+            .has_blob(Request::new(HasBlobRequest { hash: hash.clone() }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!before.found, "nothing stored yet");
+
+        adapter
+            .put_blob(Request::new(PutBlobRequest {
+                hash: hash.clone(),
+                content,
+            }))
+            .await
+            .unwrap();
+
+        let after = adapter
+            .has_blob(Request::new(HasBlobRequest { hash }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(after.found, "the blob just written is present");
+    }
+
+    /// Presence is a read of `_blobs`: without that scope a principal must not
+    /// learn whether a blob exists.
+    #[tokio::test]
+    async fn grpc_has_blob_requires_blobs_scope() {
+        // `scoped_auth()` grants `memory` only, not `_blobs`.
+        let adapter = fs_adapter(scoped_auth());
+        let content = b"scoped presence".to_vec();
+        let hash = gonzalo_core::ContentHash::of(&content).0;
+        adapter
+            .put_blob(with_token(
+                PutBlobRequest {
+                    hash: hash.clone(),
+                    content,
+                },
+                "atok",
+            ))
+            .await
+            .unwrap();
+
+        let denied = adapter
+            .has_blob(with_token(HasBlobRequest { hash: hash.clone() }, "wtok"))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let allowed = adapter
+            .has_blob(with_token(HasBlobRequest { hash }, "atok"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(allowed.found);
     }
 
     #[tokio::test]
