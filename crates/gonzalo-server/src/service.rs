@@ -86,6 +86,14 @@ impl Service {
         self.blobs.delete_blob(hash).await
     }
 
+    /// Whether `hash` is stored, without reading it. Substrates answer with a
+    /// cheap existence check (`try_exists` on a filesystem, `HeadObject` on
+    /// S3), which is what lets `HEAD /v1/blobs/{hash}` and the `HasBlob` RPC
+    /// cost a stat rather than a read (#329).
+    pub async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        self.blobs.has_blob(hash).await
+    }
+
     /// Serve code-graph queries from persistent SQLite graphs rooted at
     /// `graph_root` (matching `gonzalo index`'s `<store_root>/graphs`), falling
     /// back to slice assembly for views without an indexed db.
