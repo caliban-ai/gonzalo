@@ -56,6 +56,9 @@ pub use reset::{ResetReport, reset, reset_as};
 pub mod collect;
 pub use collect::{CollectReport, collect};
 
+pub mod undelete;
+pub use undelete::undelete;
+
 #[cfg(any(test, feature = "conformance"))]
 pub mod memstore;
 

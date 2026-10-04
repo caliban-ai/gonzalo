@@ -473,8 +473,10 @@ fn merge_non_ff(
             // remote's revision is in its chain, so there is nothing to take.
             (Some(local), Some(remote)) if local.ancestors.contains(&remote.revision) => {}
             // Two diverged tombstones: the higher (counter, hash) wins, carrying
-            // both chains. Checked by kind, because two tombstones always have
-            // equal (empty) bodies and the body guard below would skip them.
+            // both chains. Checked by kind, and this arm must stay ahead of the
+            // body guard below: a manifest tombstone retains its body, so two
+            // diverged ones have differing bodies and would otherwise reach
+            // `merge(Opaque, ..)` and be reported as a spurious conflict.
             (Some(local), Some(remote)) if local.is_tombstone() && remote.is_tombstone() => {
                 let winner = tombstone_winner(&local, &remote, cap);
                 stage_record(&mut index, &path, &winner)?;

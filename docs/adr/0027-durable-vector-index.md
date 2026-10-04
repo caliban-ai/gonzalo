@@ -294,9 +294,10 @@ correctly starts with empty counts.
   only durable leases would close both. Running `gonzalo gc` while vector
   writes are in flight is therefore much less risky than before, not risk-free.
   **Deleting a vector manifest
-  does not pin its shards** (open work: #327): a tombstone pins only `Body::Blob`, and a
-  manifest's body is inline, so `delete` followed by `gc` sweeps the shards
-  while the tombstone naming them still exists. **`sync` does not copy
+  pins its shards** ([ADR 0029](0029-manifest-tombstone-pin.md)): the tombstone
+  retains the manifest body, so `gc` marks the shards live until `collect`
+  removes it, and `gonzalo undelete` can restore the index within that horizon.
+  **`sync` does not copy
   blobs**, so an index synced to a peer opens there with a missing-blob
   error — graph manifests share this same sync gap.
 

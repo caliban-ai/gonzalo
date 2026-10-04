@@ -91,12 +91,24 @@ pub fn tombstone_of(
         meta.author = author.clone();
     }
     meta.updated = now_ms;
+    // A manifest's body names its blobs out of line, so it is the only record
+    // of which blob was which shard. Discarding it would drop the hashes out of
+    // the GC mark set AND lose the mapping, leaving any pinned bytes
+    // unnameable — so these kinds keep their body (ADR 0029).
+    let retains_body = matches!(
+        current.kind,
+        RecordKind::GraphManifest | RecordKind::VectorManifest
+    );
     Record {
         key: current.key.clone(),
         kind: RecordKind::Tombstone,
         revision,
         parent: Some(current.revision.clone()),
-        body: Body::Inline(Vec::new()),
+        body: if retains_body {
+            current.body.clone()
+        } else {
+            Body::Inline(Vec::new())
+        },
         meta,
         links: Vec::new(),
         ancestors,
@@ -110,6 +122,7 @@ pub fn tombstone_of(
             Body::Blob { hash, .. } => Some(hash.clone()),
             Body::Inline(_) => None,
         },
+        deleted_kind: retains_body.then_some(current.kind),
     }
 }
 
@@ -192,6 +205,9 @@ pub fn plan_put(
                 // The recreated record is live and carries its own body, so it
                 // pins nothing on the tombstone's behalf (gonzalo#292).
                 record.deleted_blob = None;
+                // `deleted_kind` is set on tombstones only; a client-supplied
+                // record must not smuggle one onto a live record.
+                record.deleted_kind = None;
                 // A recreation starts a new life at this key: the deleted
                 // record's `created` does not carry over.
                 record.meta.created = now_ms;
@@ -377,6 +393,7 @@ mod tests {
             ancestors,
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         }
     }
 
@@ -605,6 +622,121 @@ mod tests {
         );
     }
 
+    fn vector_manifest_record() -> Record {
+        let mut m = crate::VectorManifest::new("space-a", 3, 256);
+        m.entries.insert(0, ContentHash::of(b"shard-zero"));
+        m.entries.insert(9, ContentHash::of(b"shard-nine"));
+        Record::create(
+            crate::VectorManifest::key("ns", "memories"),
+            RecordKind::VectorManifest,
+            m.to_body(),
+            Meta::new(Identity::new("tester"), "test"),
+        )
+    }
+
+    // The whole point: a manifest's body names its blobs out of line, so
+    // discarding it loses both the pin and the shard-to-blob mapping.
+    #[test]
+    fn a_vector_manifest_tombstone_keeps_its_body_and_kind() {
+        let live = vector_manifest_record();
+        let t = tombstone_of(&live, 1_000, 8, None);
+
+        assert!(t.is_tombstone());
+        assert_eq!(t.body, live.body, "the manifest body is retained verbatim");
+        assert_eq!(t.deleted_kind, Some(RecordKind::VectorManifest));
+        assert_eq!(t.deleted_blob, None, "an inline body pins nothing this way");
+        assert_eq!(t.deleted_at, Some(1_000));
+    }
+
+    #[test]
+    fn a_graph_manifest_tombstone_keeps_its_body_and_kind() {
+        let mut gm = crate::Manifest::new();
+        gm.insert("src/lib.rs", ContentHash::of(b"slice"));
+        let live = Record::create(
+            crate::Manifest::key("repo", "main"),
+            RecordKind::GraphManifest,
+            gm.to_body(),
+            Meta::new(Identity::new("tester"), "test"),
+        );
+        let t = tombstone_of(&live, 1_000, 8, None);
+        assert_eq!(t.body, live.body);
+        assert_eq!(t.deleted_kind, Some(RecordKind::GraphManifest));
+    }
+
+    // Nothing else moves. A blob-bodied record still pins through deleted_blob
+    // and still gets an empty body.
+    #[test]
+    fn a_blob_bodied_tombstone_is_unchanged() {
+        let live = Record::create(
+            RecordKey::new("ns", "coll", "doc"),
+            RecordKind::Topic,
+            Body::blob(b"out of line"),
+            Meta::new(Identity::new("tester"), "test"),
+        );
+
+        let t = tombstone_of(&live, 1_000, 8, None);
+        assert_eq!(t.body, Body::Inline(Vec::new()));
+        assert_eq!(t.deleted_blob, Some(ContentHash::of(b"out of line")));
+        assert_eq!(t.deleted_kind, None);
+    }
+
+    #[test]
+    fn an_inline_non_manifest_tombstone_is_unchanged() {
+        let live = Record::create(
+            RecordKey::new("ns", "coll", "topic"),
+            RecordKind::Topic,
+            Body::Inline(b"{}".to_vec()),
+            Meta::new(Identity::new("tester"), "test"),
+        );
+        let t = tombstone_of(&live, 1_000, 8, None);
+        assert_eq!(t.body, Body::Inline(Vec::new()));
+        assert_eq!(t.deleted_kind, None);
+        assert_eq!(t.deleted_blob, None);
+    }
+
+    // Replication depends on this: two peers deleting the same revision must
+    // produce the same bytes, or sync sees a divergence that isn't one.
+    #[test]
+    fn two_peers_deleting_one_manifest_revision_agree_byte_for_byte() {
+        let live = vector_manifest_record();
+        let a = tombstone_of(&live, 1_000, 8, None);
+        let b = tombstone_of(&live, 1_000, 8, None);
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap()
+        );
+    }
+
+    // Review Focus 2: a second delete must not rewrite the tombstone and throw
+    // the retained body away, which would silently unpin every shard. The
+    // store's own guard is `plan_delete`, pinned by the existing conformance
+    // case `delete_of_tombstone_is_noop`; this test documents what the
+    // function itself does if a future caller reaches it directly.
+    #[test]
+    fn tombstoning_a_tombstone_retains_nothing() {
+        let live = vector_manifest_record();
+        let first = tombstone_of(&live, 1_000, 8, None);
+        let again = tombstone_of(&first, 2_000, 8, None);
+        assert_eq!(
+            again.body,
+            Body::Inline(Vec::new()),
+            "a tombstone is not a manifest kind, so this path retains nothing"
+        );
+        assert_eq!(again.deleted_kind, None);
+    }
+
+    // Every tombstone already on disk predates the field.
+    #[test]
+    fn a_tombstone_without_deleted_kind_deserialises() {
+        let json = r#"{"key":{"namespace":"ns","collection":"coll","id":"x"},
+            "kind":"Tombstone","revision":{"counter":1,"hash":"b90c7f9ba262c46461403ddcc4aa254d6b28dd54b2c95f783fbb9562c754ed65"},
+            "body":{"Inline":[]},"meta":{"author":{"id":"t","display":null},
+            "origin_system":"test","created":0,"updated":0,"labels":{}},
+            "links":[],"deleted_at":1}"#;
+        let r: Record = serde_json::from_str(json).unwrap();
+        assert_eq!(r.deleted_kind, None);
+    }
+
     fn tomb(counter: u64) -> Record {
         let prior = live(counter - 1, b"was", vec![]);
         tombstone_of(&prior, 42, 32, None)
@@ -674,6 +806,21 @@ mod tests {
         // The key is live again, so the old content stops being pinned: the
         // recreated record's own body is what keeps a blob alive (gonzalo#292).
         assert_eq!(stored.deleted_blob, None);
+    }
+
+    #[test]
+    fn recreating_over_a_tombstone_clears_deleted_kind() {
+        // `deleted_kind` is documented as set on tombstones only. Records cross
+        // the daemon as full JSON, so an incoming live record can carry one;
+        // the recreation arm must not persist it.
+        let t = tomb(3);
+        let mut fresh = live(0, b"again", vec![]);
+        fresh.deleted_kind = Some(RecordKind::VectorManifest);
+        let PutPlan::Write(stored) = plan_put(Some(&t), fresh, None, 32) else {
+            panic!("expected Write");
+        };
+        assert!(!stored.is_tombstone());
+        assert_eq!(stored.deleted_kind, None);
     }
 
     #[test]
@@ -935,6 +1082,7 @@ pub fn reconciled_record(
         // A reconciled record is live, so it pins nothing: its own body is the
         // reference that keeps a blob alive (gonzalo#292).
         deleted_blob: None,
+        deleted_kind: None,
     }
 }
 
@@ -969,6 +1117,7 @@ mod reconcile_tests {
             ancestors,
             deleted_at: None,
             deleted_blob: None,
+            deleted_kind: None,
         }
     }
 

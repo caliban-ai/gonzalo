@@ -117,6 +117,7 @@ async fn seed(store: &S3Store, key: &RecordKey) -> Revision {
         deleted_at: None,
         deleted_blob: None,
         key: key.clone(),
+        deleted_kind: None,
     };
     match store.put(record, None).await.expect("put") {
         PutResult::Committed(rev) => rev,

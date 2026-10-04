@@ -105,6 +105,7 @@ async fn put_record_syncs_and_leaves_no_temp_file() {
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     };
     let PutResult::Committed(rev) = store.put(rec.clone(), None).await.unwrap() else {
         panic!("expected Committed");
@@ -164,6 +165,7 @@ async fn record_with_blob_body_roundtrips_through_store() {
         ancestors: Vec::new(),
         deleted_at: None,
         deleted_blob: None,
+        deleted_kind: None,
     };
     let PutResult::Committed(rev) = store.put(rec.clone(), None).await.unwrap() else {
         panic!("expected Committed");

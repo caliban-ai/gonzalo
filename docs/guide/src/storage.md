@@ -143,6 +143,12 @@ record bodies, tombstone pins and manifest slices alike
 ([ADR 0024](./adr/0024-blob-garbage-collection.md)). [Deletion](./deletion.md#reclaiming-a-deleted-records-bytes)
 walks through the order.
 
+Deleting a vector index (or a code-graph view) is recoverable within the
+collection horizon: the manifest's tombstone keeps the manifest body, so its
+shards stay marked and `gonzalo undelete` restores it
+([ADR 0029](./adr/0029-manifest-tombstone-pin.md)). Reopening the deleted key
+first defeats this; see [Deletion](./deletion.md#deleting-an-index-and-getting-it-back).
+
 ## Vector search and embeddings
 
 `gonzalo-vector` defines the `Embedder` trait and an exact in-memory index,

@@ -3,6 +3,8 @@
 - **Status:** accepted
 - **Date:** 2026-09-13
 - **Source:** [`docs/superpowers/specs/2026-09-13-tombstone-replication-design.md`](../superpowers/specs/2026-09-13-tombstone-replication-design.md)
+- **Amended by:** [ADR 0029](0029-manifest-tombstone-pin.md), under which a
+  manifest-kind tombstone retains the deleted body instead of discarding it.
 
 ## Context
 

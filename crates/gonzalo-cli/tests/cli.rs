@@ -566,3 +566,98 @@ fn plain_gc_succeeds_with_the_default_min_age_and_reports_deferred() {
         stdout(&out)
     );
 }
+
+#[test]
+fn undelete_restores_a_deleted_manifest_and_refuses_a_live_one() {
+    let root = TempDir::new().unwrap();
+    seed(root.path(), "ns", "col", &["note.md"]);
+
+    // Make it a retaining kind: only manifest kinds keep their body (#327).
+    let body = serde_json::to_value(gonzalo_core::Manifest::new().to_body()).unwrap();
+    edit_record_file(
+        &record_file(root.path(), "ns", "col", "note.md"),
+        |record| {
+            record.insert("kind".into(), serde_json::json!("GraphManifest"));
+            record.insert("body".into(), body);
+        },
+    );
+
+    let args = [
+        "undelete",
+        "--namespace",
+        "ns",
+        "--collection",
+        "col",
+        "--id",
+        "note.md",
+    ];
+
+    // A live record cannot be restored.
+    let live = run(root.path(), &args);
+    assert_eq!(live.status.code(), Some(1), "{live:?}");
+    assert!(
+        stderr(&live).contains("ns/col/note.md"),
+        "the refusal names the key, got {:?}",
+        stderr(&live)
+    );
+
+    let del = run(
+        root.path(),
+        &[
+            "delete",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+            "--id",
+            "note.md",
+        ],
+    );
+    assert_eq!(del.status.code(), Some(0), "{del:?}");
+    assert!(
+        !run(root.path(), &["get", "ns", "col", "note.md"])
+            .status
+            .success()
+    );
+
+    let out = run(root.path(), &args);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        stdout(&out).starts_with("restored: ns/col/note.md"),
+        "got {:?}",
+        stdout(&out)
+    );
+    assert!(
+        run(root.path(), &["get", "ns", "col", "note.md"])
+            .status
+            .success(),
+        "the record reads as present again"
+    );
+
+    // Restoring twice refuses, because the record is live again.
+    let again = run(root.path(), &args);
+    assert_eq!(again.status.code(), Some(1), "{again:?}");
+}
+
+#[test]
+fn undelete_of_a_key_that_was_never_written_exits_nonzero() {
+    let root = TempDir::new().unwrap();
+    let out = run(
+        root.path(),
+        &[
+            "undelete",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+            "--id",
+            "nope",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout when nothing was restored"
+    );
+    assert!(stderr(&out).contains("not found"), "got {:?}", stderr(&out));
+}

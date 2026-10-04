@@ -482,7 +482,7 @@
         "type": "string",
         "enum": [
           "MemoryTier", "Topic", "Session", "Checkpoint", "Ticket", "TicketEvent", "GraphManifest",
-          "Person", "IdentityBinding", "RoleGrant", "ChannelConfig", "LinkToken", "AuditEntry",
+          "VectorManifest", "Person", "IdentityBinding", "RoleGrant", "ChannelConfig", "LinkToken", "AuditEntry",
           "Tombstone"
         ]
       },
@@ -514,6 +514,10 @@
           "deleted_blob": {
             "description": "tombstones only: the blob the deleted body referenced. A tombstone pins its blob until collected (ADR 0024).",
             "oneOf": [{ "$ref": "#/components/schemas/ContentHash" }, { "type": "null" }]
+          },
+          "deleted_kind": {
+            "description": "tombstones only: the kind of the record that was deleted, set when its body is retained (the manifest kinds, GraphManifest and VectorManifest). GC marks through a retained body and undelete restores from it (ADR 0029). Absent when the body was discarded.",
+            "oneOf": [{ "$ref": "#/components/schemas/RecordKind" }, { "type": "null" }]
           }
         }
       },
