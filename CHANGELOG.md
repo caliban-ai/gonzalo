@@ -34,8 +34,8 @@ the patch version for fixes.
   default. `GcReport` gains `deferred`, the unreferenced blobs held back for
   being too young, and `freed` now comes back in hash order. (#325)
 - **`gonzalo gc --min-age <duration>`** (default `1h`, same spellings as
-  `collect --horizon`). The `gc` and `index --gc` summaries print `deferred`.
-  (#325)
+  `collect --older-than`: one positive whole number and one unit of `d`, `h`,
+  `m` or `s`). The `gc` and `index --gc` summaries print `deferred`. (#325)
 - **Vectors now survive the process that built them.** A new
   `RecordVectorIndex` persists a `VectorIndex` behind sharded,
   content-addressed blobs named by a new `RecordKind::VectorManifest` record

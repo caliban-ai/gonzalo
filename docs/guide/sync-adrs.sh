@@ -19,7 +19,20 @@ is_adr() {
 }
 
 mkdir -p "$DEST"
-cp "$ADR_SRC"/*.md "$DEST"/
+
+# Copy the ADRs, rewriting the one link class that cannot survive the move.
+# An ADR cites its design spec as `../superpowers/specs/<name>.md`, which is
+# correct in `docs/adr/` on GitHub. The specs and plans are build notes and are
+# deliberately NOT ingested into the book, so inside `src/adr/` that path
+# resolves to nothing and every such link 404s on the published guide. Point
+# them at the repository instead. The ADR log itself is append-only and stays
+# untouched (ADR 0001); this rewrite lives here, on the way in.
+# BSD (macOS) and GNU sed agree on this subset: plain `s|…|…|g`, no -i.
+REPO_BLOB="https://github.com/caliban-ai/gonzalo/blob/main/docs"
+for f in "$ADR_SRC"/*.md; do
+  sed -e "s|](../superpowers/|]($REPO_BLOB/superpowers/|g" \
+      "$f" > "$DEST/$(basename "$f")"
+done
 
 # Build an ADR index page from the file titles (first markdown H1 of each file).
 {

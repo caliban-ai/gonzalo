@@ -70,7 +70,7 @@ writers settle rather than treating the run as a success.
 | command | does |
 |---|---|
 | `gonzalo index --root R --repo OWNER/NAME [--view V] <src>` | index a source tree into a view (`--view` defaults to `main`) |
-| `gonzalo gc --root R` | sweep blobs no record references |
+| `gonzalo gc --root R [--min-age 1h]` | sweep blobs no record references and old enough to be safe |
 
 `index` flags:
 
@@ -79,17 +79,37 @@ writers settle rather than treating the run as a success.
 | `--watch` | keep running and re-index on filesystem changes until Ctrl-C |
 | `--debounce-ms N` | with `--watch`, quiet period after the last change (default 500) |
 | `--reconcile-secs N` | with `--watch`, seconds between full reconciles (default 300) |
-| `--gc` | after indexing, run a whole-store GC (also applied on each reconcile under `--watch`) |
+| `--gc` | after indexing, run a whole-store GC (also applied on each reconcile under `--watch`), reporting `gc.freed`, `gc.retained` and `gc.deferred` |
 | `--include PATH` | index a path a built-in rule would skip, such as vendored code. Repeatable. Cannot override `.gitignore`. |
 | `--require-parse-worker` | fail instead of falling back to in-process parsing when no `gonzalo-parse-worker` is found |
 
 Blobs are content-addressed and shared — across views, and between records with
 identical content — so deleting a view's source, or a record, does not free them.
 `gc` marks against every record in the store (record bodies, the blobs tombstones
-pin, and every view's manifest slices) and reports `scanned`, `freed` and
-`retained`. A deleted record's blob is pinned by its tombstone until `collect`
-removes it; [Deletion](./deletion.md#reclaiming-a-deleted-records-bytes) walks
-through the order.
+pin, every view's manifest slices, every shard blob a durable vector index's
+manifest names, and everything named by the retained body of a *manifest*
+tombstone) and reports `scanned`, `freed`, `retained` and `deferred`. A deleted
+record's blob is pinned by its tombstone until `collect` removes it;
+[Deletion](./deletion.md#reclaiming-a-deleted-records-bytes) walks through the
+order.
+
+Deleting a manifest is the one case where the tombstone keeps the record's body
+rather than discarding it: a manifest names its blobs out of line, so dropping
+the body would both unpin the shards and destroy the mapping that says which
+blob held which shard. Keeping it means `gc` still marks through a deleted index,
+and `gonzalo undelete` can restore one until `collect` purges the tombstone
+([ADR 0029](./adr/0029-manifest-tombstone-pin.md)).
+
+`deferred` counts unreferenced blobs the sweep held back for being younger than
+`--min-age` (default `1h`). A blob is uploaded before the record or manifest that
+references it commits, so a sweep that ran in that window used to delete a blob
+its writer was about to point at — and for a vector shard that loss is
+unrecoverable. The age rule closes most of that window
+([ADR 0028](./adr/0028-blob-gc-grace-period.md)); `--min-age` takes one positive
+number and one unit (`d`, `h`, `m`, `s`), the same spellings as
+`collect --older-than`, and `--min-age 0s` is rejected. A nonzero `deferred` is
+normal and is the difference between "nothing to reclaim" and "not yet safe to
+reclaim".
 
 [The MCP server](./mcp.md#index) explains `index` output line by line, which languages
 are parsed, and how to keep a view fresh.
