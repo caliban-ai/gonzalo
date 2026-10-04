@@ -772,12 +772,10 @@ mod tests {
     #[test]
     fn detects_lifecycle_key_vanished_everywhere() {
         let mut s = clean_stats();
-        for r in &mut s.lifecycle[0].replicas {
-            *r = ReplicaView {
-                raw: RawState::Absent,
-                consumer_live: Some(false),
-            };
-        }
+        s.lifecycle[0].replicas.fill(ReplicaView {
+            raw: RawState::Absent,
+            consumer_live: Some(false),
+        });
         assert_eq!(
             check(&s),
             vec![Violation::LifecycleKeyVanished {
