@@ -13,8 +13,8 @@ use gonzalo_proto::http::{
     DeleteBody, DeleteOutcome, PurgeBody, PutBody, PutOutcome, RawRecordBody,
 };
 use gonzalo_proto::v1::{
-    DeleteBlobRequest, DeleteRequest, GetBlobRequest, GetRequest, ListBlobsRequest, ListRequest,
-    ListResponse, PurgeRequest, PutBlobRequest, PutRequest, PutResponse,
+    DeleteBlobRequest, DeleteRequest, GetBlobRequest, GetRequest, HasBlobRequest, ListBlobsRequest,
+    ListRequest, ListResponse, PurgeRequest, PutBlobRequest, PutRequest, PutResponse,
     gonzalo_client::GonzaloClient,
 };
 use tonic::transport::Channel;
@@ -536,6 +536,50 @@ impl BlobStore for ServerStore {
                 )?;
                 let resp = client.get_blob(req).await.map_err(status)?.into_inner();
                 Ok(resp.found.then_some(resp.content))
+            }
+        }
+    }
+
+    /// Presence over the wire, without the bytes.
+    ///
+    /// The trait default fetches the blob and discards it, which over a daemon
+    /// means a full download per newly referenced blob on every commit — 600 KB
+    /// a shard for a vector index (ADR 0028, #329). `HEAD /v1/blobs/{hash}` and
+    /// the `HasBlob` RPC answer from the daemon's own presence check instead.
+    ///
+    /// A `404` is `false`, not an error: absence is the answer, not a failure.
+    async fn has_blob(&self, hash: &ContentHash) -> Result<bool> {
+        match &self.backend {
+            Backend::Http {
+                base,
+                client,
+                token,
+            } => {
+                let url = Self::blobs_url(base, Some(&hash.0))?;
+                let resp = maybe_auth(client.head(url), token)
+                    .send()
+                    .await
+                    .map_err(be)?;
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(false);
+                }
+                ensure_read_ok(resp).await?;
+                Ok(true)
+            }
+            Backend::Grpc { client, token } => {
+                let mut client = client.clone();
+                let req = grpc_request(
+                    HasBlobRequest {
+                        hash: hash.0.clone(),
+                    },
+                    token,
+                )?;
+                Ok(client
+                    .has_blob(req)
+                    .await
+                    .map_err(status)?
+                    .into_inner()
+                    .found)
             }
         }
     }
