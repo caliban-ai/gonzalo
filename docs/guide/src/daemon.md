@@ -127,6 +127,7 @@ for the full authorship rules.
 | `GET /v1/raw/keys?namespace=&collection=` | list keys including tombstoned ones, both filters optional |
 | `POST /v1/purge/{ns}/{col}/{id}` | body `{"expected": <revision>}`; physically removes the record |
 | `GET`, `PUT`, `DELETE /v1/blobs/{hash}` | content-addressed blob bytes |
+| `HEAD /v1/blobs/{hash}` | whether the blob exists: `200` or `404`, no body. Answered from a presence check, so `content-length` is `0` rather than the blob's size |
 | `GET /v1/blobs` | list blobs, as objects carrying each blob's hash and modified time |
 | `POST /v1/tickets/sync` | sync one ticket connection; the body is one `[[connection]]` entry from `tickets.toml`, as JSON |
 | `GET /v1/graph/{definitions,references,callers,callees,impact}?repo=&view=&name=` | code-graph queries against an indexed view |
@@ -151,7 +152,7 @@ GitHub Release. Generate a client from it rather than hand-writing one — see
 
 The `gonzalo` service in `gonzalo-proto` carries the same operations: `Get`, `Put`,
 `Delete`, `List`, `GetRaw`, `ListRaw`, `PutRaw`, `Purge`, `PutBlob`, `GetBlob`,
-`ListBlobs`, `DeleteBlob`, `TicketSync`, and `GraphDefinitions`, `GraphReferencesTo`,
+`HasBlob`, `ListBlobs`, `DeleteBlob`, `TicketSync`, and `GraphDefinitions`, `GraphReferencesTo`,
 `GraphCallersOf`, `GraphCallees`, `GraphImpact`. Authorization is identical to
 HTTP, and the `.proto` is published per release alongside the OpenAPI document
 ([Generating a client](./clients.md)).
