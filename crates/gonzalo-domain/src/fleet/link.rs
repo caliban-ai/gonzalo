@@ -36,7 +36,12 @@ impl LinkSecret {
             return Err(LinkSecretError);
         }
         let mut bytes = [0u8; 32];
-        for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+        // `digits.len() == 64` is checked above, so every pair is complete and
+        // the remainder is empty. `as_chunks` gives `&[u8; 2]` rather than a
+        // slice, so the pair's length is in the type (clippy 1.99's
+        // `chunks_exact_to_as_chunks`).
+        let (pairs, _remainder) = digits.as_chunks::<2>();
+        for (byte, pair) in bytes.iter_mut().zip(pairs) {
             let pair = std::str::from_utf8(pair).map_err(|_| LinkSecretError)?;
             *byte = u8::from_str_radix(pair, 16).map_err(|_| LinkSecretError)?;
         }

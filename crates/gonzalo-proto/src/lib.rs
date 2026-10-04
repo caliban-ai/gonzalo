@@ -4,6 +4,14 @@
 pub mod http;
 
 pub mod v1 {
+    // tonic generates every service method as
+    // `Result<Response<T>, tonic::Status>`, and `Status` is wide enough to trip
+    // clippy 1.99's `result_large_err` (18 hits). This is build-script output,
+    // so there is nothing here to edit and the type is upstream's choice. The
+    // allow is scoped to the generated module alone, so hand-written code in
+    // this crate is still linted.
+    #![allow(clippy::result_large_err)]
+
     tonic::include_proto!("gonzalo.v1");
 }
 

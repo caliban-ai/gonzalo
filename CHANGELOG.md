@@ -130,6 +130,28 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: `IngestError::Conflict` is a boxed tuple variant.** It was
+  `Conflict { key, expected, current }` with the fields inlined, which made the
+  error path of every `Result` in `gonzalo-ticket`'s ingest module 136 bytes
+  wide — clippy 1.99's `result_large_err`. It is now
+  `Conflict(Box<gonzalo_core::Conflict>)`, the same shape `PutResult::Conflict`
+  already returns, so the ingest path stops unboxing and re-inlining and callers
+  get the whole conflicting record rather than its revision alone. Code that
+  matches on the struct variant's fields must match the boxed value instead.
+  (#336)
+- **The pinned Rust toolchain is 1.99.0.** `rust-toolchain.toml` moved from
+  1.95.0, four releases behind. Getting the gate green on it needed five fixes
+  across four crates, each hidden behind the previous because clippy stops at
+  the first failing crate: `async-trait` 0.1.89 → 0.1.92 (upstream stopped
+  emitting the `#[must_use]` that made clippy's `double_must_use` fire on 14
+  desugared `async fn`s in `gonzalo-core` — preferred to an `#[allow]`, which
+  would also have masked the lint for hand-written code, and it pulls in
+  `syn 3.0.6`); `as_chunks::<2>()` for `chunks_exact(2)` in
+  `gonzalo-domain`'s hex parser; the `IngestError` boxing above; a
+  `result_large_err` allow scoped to `gonzalo-proto`'s generated `v1` module,
+  where tonic's `Result<_, Status>` signatures are build-script output and not
+  editable; and `slice::fill` for a manual loop in `gonzalo-soak`'s oracle
+  tests. (#336)
 - **BREAKING: `BlobStore::list_blobs` returns `Vec<BlobEntry>`.** Each entry
   carries the blob's hash and `modified_unix_ms`, which the sweep needs to tell
   a freshly uploaded blob from an abandoned one. Any out-of-tree `BlobStore`

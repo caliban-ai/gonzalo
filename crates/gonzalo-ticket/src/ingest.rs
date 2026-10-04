@@ -22,12 +22,15 @@ pub enum IngestError {
     Source(#[from] crate::SourceError),
     #[error("store: {0}")]
     Store(#[from] gonzalo_core::CoreError),
-    #[error("write conflict on {key}: expected {expected:?}, store has {current:?}")]
-    Conflict {
-        key: gonzalo_core::RecordKey,
-        expected: Option<Revision>,
-        current: Revision,
-    },
+    /// Boxed because inlining a `RecordKey` and two revisions made every
+    /// `Result<_, IngestError>` in this module 136 bytes wide on its error
+    /// path (clippy 1.99's `result_large_err`). `PutResult::Conflict` already
+    /// hands back a `Box<Conflict>`, so carrying it through costs nothing and
+    /// gives callers the whole conflicting record rather than its revision
+    /// alone. The message still prints only the revision — a `Record`'s
+    /// `Debug` would include its body.
+    #[error("write conflict on {}: expected {:?}, store has {:?}", .0.key, .0.expected, .0.current.revision)]
+    Conflict(Box<gonzalo_core::Conflict>),
 }
 
 /// Pull all changed tickets from `source` and upsert them into `store`,
@@ -98,11 +101,7 @@ async fn upsert(
         } else {
             Outcome::Imported
         }),
-        PutResult::Conflict(c) => Err(IngestError::Conflict {
-            key: c.key,
-            expected: c.expected,
-            current: c.current.revision,
-        }),
+        PutResult::Conflict(c) => Err(IngestError::Conflict(c)),
     }
 }
 
@@ -339,6 +338,6 @@ mod tests {
         let err = ingest(&src, &ConflictStore, "tester", None)
             .await
             .unwrap_err();
-        assert!(matches!(err, IngestError::Conflict { .. }));
+        assert!(matches!(err, IngestError::Conflict(_)));
     }
 }
