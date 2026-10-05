@@ -29,34 +29,6 @@ pub struct GcReport {
     pub deferred: usize,
 }
 
-/// The slice hashes referenced by any of the `manifests` (ADR 0012).
-///
-/// This is one of the three sources [`live_blob_hashes`] unions; call that
-/// instead when marking a whole store, or a manifest's slices would be the only
-/// blobs kept and every record body swept.
-pub fn live_slice_hashes<'a>(
-    manifests: impl IntoIterator<Item = &'a Manifest>,
-) -> BTreeSet<ContentHash> {
-    manifests
-        .into_iter()
-        .flat_map(|m| m.entries.values().cloned())
-        .collect()
-}
-
-/// The sweep set: hashes present in `all` but not in the live set, returned
-/// sorted and deduplicated (`all - live`).
-///
-/// This is **age-unaware**: it must not be used to build a delete list. Feeding
-/// it the hashes of `list_blobs()` rebuilds the unsafe sweep that deleted blobs
-/// a writer was about to reference; use `sweep_blobs_with` / `gc_blobs_with`.
-pub fn unreferenced_slices(all: &[ContentHash], live: &BTreeSet<ContentHash>) -> Vec<ContentHash> {
-    let mut garbage: Vec<ContentHash> =
-        all.iter().filter(|h| !live.contains(*h)).cloned().collect();
-    garbage.sort();
-    garbage.dedup();
-    garbage
-}
-
 /// The mark set: every blob hash these records still need. `records` must be
 /// the store's **raw** records, tombstones included.
 ///
@@ -278,48 +250,6 @@ mod tests {
 
     fn blob_body(content: &str) -> Body {
         Body::blob(content.as_bytes())
-    }
-
-    #[test]
-    fn live_set_unions_all_manifest_references() {
-        let mut a = Manifest::new();
-        a.insert("x.rs", h("1"));
-        a.insert("y.rs", h("2"));
-        let mut b = Manifest::new();
-        b.insert("z.rs", h("2")); // shared slice, counted once
-        b.insert("w.rs", h("3"));
-
-        let live = live_slice_hashes([&a, &b]);
-        assert_eq!(live, BTreeSet::from([h("1"), h("2"), h("3")]));
-    }
-
-    #[test]
-    fn live_set_of_no_manifests_is_empty() {
-        assert!(live_slice_hashes([]).is_empty());
-    }
-
-    #[test]
-    fn unreferenced_is_all_minus_live_sorted() {
-        let all = vec![h("keep"), h("drop"), h("keep2")];
-        let live = BTreeSet::from([h("keep"), h("keep2")]);
-        let garbage = unreferenced_slices(&all, &live);
-        let mut want = vec![h("drop")];
-        want.sort();
-        assert_eq!(garbage, want);
-    }
-
-    #[test]
-    fn unreferenced_dedups_repeated_input_hashes() {
-        let all = vec![h("dup"), h("dup"), h("live")];
-        let live = BTreeSet::from([h("live")]);
-        assert_eq!(unreferenced_slices(&all, &live), vec![h("dup")]);
-    }
-
-    #[test]
-    fn nothing_unreferenced_when_all_are_live() {
-        let all = vec![h("a"), h("b")];
-        let live = BTreeSet::from([h("a"), h("b")]);
-        assert!(unreferenced_slices(&all, &live).is_empty());
     }
 
     #[test]
