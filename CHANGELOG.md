@@ -145,6 +145,27 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: `gonzalo_core::unreferenced_slices` and
+  `gonzalo_core::live_slice_hashes` are removed.** After #325 rewrote the
+  sweep, neither had a caller outside its own unit tests — `live_blob_hashes`
+  inlines the manifest-entry logic rather than calling `live_slice_hashes`, and
+  `sweep_blobs_with` does its own retain loop. Both were also footguns:
+  `unreferenced_slices` is age-unaware, so mapping `list_blobs()` down to
+  hashes and feeding it rebuilt the unsafe delete list #325 removed, and
+  `live_slice_hashes` used alone as a mark set keeps only manifest slices and
+  sweeps every record body. Use `gc_blobs_with` / `sweep_blobs_with` to sweep
+  and `live_blob_hashes` to mark. The `gonzalo` facade never re-exported
+  either, so only a direct `gonzalo-core` dependant is affected. (#331)
+- **BREAKING: the indexing knobs move into `gonzalo_cli::IndexOptions`.**
+  `index_with_gc_filtered` and `index_with_gc_filtered_worker` are replaced by
+  `index_with_options(root, src, repo, view, &IndexOptions)`, which carries
+  `{gc_after, min_age, filter, worker}`. The eight-argument worker variant
+  needed `#[allow(clippy::too_many_arguments)]` and respelled every argument at
+  each fan-out layer, so a new knob cost six edit sites; it is now a field.
+  `index_with_gc` is unchanged. `IndexOptions::default()` deliberately sets
+  `min_age` to `DEFAULT_MIN_AGE` rather than the derived `Duration::ZERO` — a
+  zero default would let a caller who sets `gc_after` reinstate the
+  age-unaware sweep ADR 0028 removed. (#331)
 - **BREAKING: `IngestError::Conflict` is a boxed tuple variant.** It was
   `Conflict { key, expected, current }` with the fields inlined, which made the
   error path of every `Result` in `gonzalo-ticket`'s ingest module 136 bytes
