@@ -3,9 +3,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
-    DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, WatchConfig, collect, delete, gc, get,
-    index_with_gc_filtered, list, migrate, parse_duration, parse_horizon, parse_revision, reset,
-    reset_exit_code, resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap,
+    DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, IndexOptions, WatchConfig, collect, delete,
+    gc, get, index_with_options, list, migrate, parse_duration, parse_horizon, parse_revision,
+    reset, reset_exit_code, resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap,
     ticket_move, ticket_sync, undelete, watch,
 };
 use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
@@ -416,14 +416,16 @@ async fn main() -> Result<ExitCode> {
                 watch(&root, &src, &repo, &view, config, gc).await?;
                 return Ok(ExitCode::SUCCESS);
             }
-            let (summary, swept) = index_with_gc_filtered(
+            let (summary, swept) = index_with_options(
                 &root,
                 &src,
                 &repo,
                 &view,
-                gc,
-                gonzalo_core::DEFAULT_MIN_AGE,
-                &filter,
+                &IndexOptions {
+                    gc_after: gc,
+                    filter,
+                    ..IndexOptions::default()
+                },
             )
             .await?;
             println!(

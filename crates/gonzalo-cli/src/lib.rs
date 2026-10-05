@@ -970,12 +970,73 @@ pub async fn gc(root: &Path, min_age: Duration) -> Result<GcSummary> {
     })
 }
 
-/// [`index`] the `(repo, view)` view, then — when `gc_after` — sweep
+/// The optional knobs of an indexing run (#331).
+///
+/// Collapsed into one struct so a new knob is a field rather than an argument
+/// respelled at every fan-out layer and call site.
+#[derive(Debug, Clone)]
+pub struct IndexOptions {
+    /// Sweep unreferenced blobs after a successful index.
+    pub gc_after: bool,
+    /// Blobs younger than this are never swept (ADR 0028).
+    pub min_age: Duration,
+    /// Which repo-relative paths are eligible for indexing (#209).
+    pub filter: IndexFilter,
+    /// Pin the parse worker rather than resolving one.
+    pub worker: Option<PathBuf>,
+}
+
+impl Default for IndexOptions {
+    /// Written out rather than derived: a derived `min_age` would be
+    /// `Duration::ZERO`, so a caller who sets `gc_after` and leaves the rest
+    /// alone would reinstate the age-unaware sweep ADR 0028 removed. The
+    /// default is the same floor `gc` uses.
+    fn default() -> Self {
+        Self {
+            gc_after: false,
+            min_age: gonzalo_core::DEFAULT_MIN_AGE,
+            filter: IndexFilter::default(),
+            worker: None,
+        }
+    }
+}
+
+/// [`index`] the `(repo, view)` view, then — when `opts.gc_after` — sweep
 /// unreferenced blobs. The opt-in post-index trigger of gonzalo#104: the sweep
 /// runs only after a successful index and always goes through [`gc`], which
 /// marks against *every* record in the store (never a per-view subset), so a
 /// slice the just-indexed view dropped but another view still references is
 /// preserved.
+///
+/// The optional knobs ride in [`IndexOptions`] rather than as positional
+/// arguments, so adding one is a field rather than an edit at every layer
+/// between here and the call sites (#331).
+pub async fn index_with_options(
+    root: &Path,
+    src: &Path,
+    repo: &str,
+    view: &str,
+    opts: &IndexOptions,
+) -> Result<(IndexSummary, Option<GcSummary>)> {
+    let resolved;
+    let worker = match &opts.worker {
+        Some(path) => Some(path.as_path()),
+        None => {
+            resolved = resolve_parse_worker();
+            resolved.worker()
+        }
+    };
+    let summary = index_with_worker(root, src, repo, view, &opts.filter, worker).await?;
+    let swept = if opts.gc_after {
+        Some(gc(root, opts.min_age).await?)
+    } else {
+        None
+    };
+    Ok((summary, swept))
+}
+
+/// [`index_with_options`] for the common case: default filter, resolved parse
+/// worker, and the sweep governed by `gc_after` / `min_age`.
 pub async fn index_with_gc(
     root: &Path,
     src: &Path,
@@ -984,64 +1045,18 @@ pub async fn index_with_gc(
     gc_after: bool,
     min_age: Duration,
 ) -> Result<(IndexSummary, Option<GcSummary>)> {
-    index_with_gc_filtered(
+    index_with_options(
         root,
         src,
         repo,
         view,
-        gc_after,
-        min_age,
-        &IndexFilter::default(),
+        &IndexOptions {
+            gc_after,
+            min_age,
+            ..IndexOptions::default()
+        },
     )
     .await
-}
-
-/// [`index_with_gc`], with control over which paths enter the view (#209).
-pub async fn index_with_gc_filtered(
-    root: &Path,
-    src: &Path,
-    repo: &str,
-    view: &str,
-    gc_after: bool,
-    min_age: Duration,
-    filter: &IndexFilter,
-) -> Result<(IndexSummary, Option<GcSummary>)> {
-    let mode = resolve_parse_worker();
-    index_with_gc_filtered_worker(
-        root,
-        src,
-        repo,
-        view,
-        gc_after,
-        min_age,
-        filter,
-        mode.worker(),
-    )
-    .await
-}
-
-/// [`index_with_gc_filtered`], with the parse worker pinned rather than
-/// resolved — see [`index_with_worker`].
-// Eight parameters: the index/GC/worker knobs are independent and every caller
-// spells them out; a params struct would be churn for one internal-ish seam.
-#[allow(clippy::too_many_arguments)]
-pub async fn index_with_gc_filtered_worker(
-    root: &Path,
-    src: &Path,
-    repo: &str,
-    view: &str,
-    gc_after: bool,
-    min_age: Duration,
-    filter: &IndexFilter,
-    worker: Option<&Path>,
-) -> Result<(IndexSummary, Option<GcSummary>)> {
-    let summary = index_with_worker(root, src, repo, view, filter, worker).await?;
-    let swept = if gc_after {
-        Some(gc(root, min_age).await?)
-    } else {
-        None
-    };
-    Ok((summary, swept))
 }
 
 // ─── watch (debounce core) ──────────────────────────────────────────────────
@@ -1393,6 +1408,23 @@ fn select_connection<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// `IndexOptions::default()` must not mean "sweep everything immediately".
+    ///
+    /// `gc_after` is off by default, but a caller who turns it on and leaves
+    /// `min_age` alone would otherwise reinstate exactly the age-unaware sweep
+    /// #325 removed — blobs deleted out from under a writer about to reference
+    /// them. The default is the same floor `gc` uses.
+    #[test]
+    fn default_index_options_keep_the_gc_grace_period() {
+        let opts = IndexOptions::default();
+        assert!(!opts.gc_after, "a sweep is opt-in");
+        assert_eq!(
+            opts.min_age,
+            gonzalo_core::DEFAULT_MIN_AGE,
+            "a defaulted min_age of zero sweeps blobs a writer is about to reference"
+        );
+    }
     use super::*;
     use gonzalo_graph::GraphStore;
     use tempfile::TempDir;
@@ -1435,15 +1467,16 @@ mod tests {
         gc_after: bool,
         min_age: Duration,
     ) -> Result<(IndexSummary, Option<GcSummary>)> {
-        index_with_gc_filtered_worker(
+        index_with_options(
             root,
             src,
             repo,
             view,
-            gc_after,
-            min_age,
-            &IndexFilter::default(),
-            None,
+            &IndexOptions {
+                gc_after,
+                min_age,
+                ..IndexOptions::default()
+            },
         )
         .await
     }
