@@ -596,7 +596,7 @@ mod tests {
         Revision, Store,
     };
     use gonzalo_store_fs::FsStore;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -860,6 +860,155 @@ mod tests {
         let keys = reopened.keys(&KeyPrefix::default()).await.unwrap();
         assert_eq!(keys, vec![k]);
         assert!(fs(&dir).has_blob(&b1).await.unwrap());
+    }
+
+    /// Which way the re-upload inside `verify_shard_blobs` is made to fail.
+    enum ReuploadFault {
+        /// The bytes are stored, but `put_blob` reports a hash that is not
+        /// theirs — standing in for a re-encode that does not reproduce the
+        /// committed shard.
+        WrongHash,
+        /// `put_blob` fails outright.
+        Error,
+    }
+
+    /// Sabotages only the re-upload that `verify_shard_blobs` performs.
+    ///
+    /// `verify_shard_blobs` is the sole caller of `has_blob` in this module,
+    /// and the commit path reaches `put_blob` without ever asking about
+    /// presence. So "start misbehaving once `has_blob` has been asked" targets
+    /// the verify path exactly, leaving the commit that precedes it honest —
+    /// without which the shard hashes under verification would themselves be
+    /// the corrupt ones, and the guard would never fire.
+    ///
+    /// `has_blob` also answers `false`, which is what a swept shard looks like
+    /// and what makes verify take the re-encode branch at all.
+    struct FailsTheReupload {
+        inner: FsStore,
+        fault: ReuploadFault,
+        verifying: AtomicBool,
+    }
+
+    impl FailsTheReupload {
+        fn new(inner: FsStore, fault: ReuploadFault) -> Self {
+            Self {
+                inner,
+                fault,
+                verifying: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Store for FailsTheReupload {
+        async fn get(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.inner.get(key).await
+        }
+        async fn put(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            self.inner.put(record, expected).await
+        }
+        async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete_as(
+            &self,
+            key: &RecordKey,
+            expected: Option<Revision>,
+            author: Option<Identity>,
+        ) -> Result<DeleteResult> {
+            self.inner.delete_as(key, expected, author).await
+        }
+        async fn get_raw(&self, key: &RecordKey) -> Result<Option<Record>> {
+            self.inner.get_raw(key).await
+        }
+        async fn list_raw(&self, prefix: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.list_raw(prefix).await
+        }
+        async fn put_raw(&self, record: Record, expected: Option<Revision>) -> Result<PutResult> {
+            self.inner.put_raw(record, expected).await
+        }
+        async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+            self.inner.purge(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for FailsTheReupload {
+        async fn put_blob(&self, content: &[u8]) -> Result<ContentHash> {
+            if !self.verifying.load(Ordering::SeqCst) {
+                return self.inner.put_blob(content).await;
+            }
+            match self.fault {
+                ReuploadFault::WrongHash => {
+                    self.inner.put_blob(content).await?;
+                    Ok(ContentHash::of(b"not the bytes that were stored"))
+                }
+                ReuploadFault::Error => Err(CoreError::Backend("blob store is unreachable".into())),
+            }
+        }
+
+        async fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {
+            self.inner.get_blob(hash).await
+        }
+
+        /// Answers `false` — a swept shard — and arms the fault.
+        async fn has_blob(&self, _hash: &ContentHash) -> Result<bool> {
+            self.verifying.store(true, Ordering::SeqCst);
+            Ok(false)
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<gonzalo_core::BlobEntry>> {
+            self.inner.list_blobs().await
+        }
+
+        async fn delete_blob(&self, hash: &ContentHash) -> Result<()> {
+            self.inner.delete_blob(hash).await
+        }
+    }
+
+    /// A shard swept after the manifest landed, whose re-encode does not
+    /// reproduce the committed bytes, leaves the index unrecoverable: the
+    /// manifest names a hash no one can now produce. The commit must say so
+    /// rather than report success over an index that will not open.
+    #[tokio::test]
+    async fn a_reupload_that_hashes_differently_is_unrecoverable() {
+        let dir = tmp();
+        let k = RecordKey::new("ns", "coll", "a");
+        let store = FailsTheReupload::new(fs(&dir), ReuploadFault::WrongHash);
+        let idx = RecordVectorIndex::open(store, index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        let err = idx
+            .upsert(k.clone(), vec![1.0, 0.0, 0.0])
+            .await
+            .expect_err("a shard the manifest names but no one can reproduce is unrecoverable");
+
+        let msg = err.to_string();
+        assert!(msg.contains("unrecoverable"), "{msg}");
+        assert!(
+            msg.contains(&format!("shard {}", shard_of(&k, DEFAULT_SHARDS))),
+            "the message names the shard that cannot be restored: {msg}"
+        );
+    }
+
+    /// A re-upload that fails outright propagates rather than being swallowed.
+    /// The shard really is missing, so reporting the commit as a success would
+    /// leave the caller believing an index that cannot open.
+    #[tokio::test]
+    async fn a_failed_reupload_propagates() {
+        let dir = tmp();
+        let k = RecordKey::new("ns", "coll", "a");
+        let store = FailsTheReupload::new(fs(&dir), ReuploadFault::Error);
+        let idx = RecordVectorIndex::open(store, index_key(), "space-a", 3)
+            .await
+            .unwrap();
+
+        let err = idx
+            .upsert(k, vec![1.0, 0.0, 0.0])
+            .await
+            .expect_err("a failed shard re-upload is not a successful commit");
+        assert!(err.to_string().contains("unreachable"), "{err}");
     }
 
     #[tokio::test]
