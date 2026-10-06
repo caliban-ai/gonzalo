@@ -131,13 +131,20 @@ refuses a live record and tells them to `delete` it instead.
   a revision. This is a behaviour change, and it is the point of the guard.
 - **Negative:** the refusal message is a `&'static str` and cannot name the
   key. The caller already knows which key it wrote.
-- **Negative:** **a `RecordVectorIndex` opened over a tombstone still opens
-  successfully and fails only at its first commit.** `open` reads through
-  `store.get`, which hides tombstones, so it cannot tell. Nothing is lost and
-  the failure is loud, but the error surfaces from inside a commit rather than
-  from the call that was wrong. Tracked in gonzalo#340.
-- **Negative:** **a refused upsert still costs one orphaned shard blob until the
-  next sweep.** `RecordVectorIndex` stages the shard blob before the manifest
+- **Negative, resolved in gonzalo#340:** **a `RecordVectorIndex` opened over a
+  tombstone used to open successfully and fail only at its first commit.** `open`
+  read through `store.get`, which hides tombstones, so it could not tell. Nothing
+  was lost and the failure was loud, but the error surfaced from inside a commit
+  rather than from the call that was wrong. `open` now reads raw and refuses on
+  this ADR's own condition — the stored tombstone's `deleted_kind` naming a
+  manifest kind — so the two surfaces agree by construction, and the refusal can
+  name the key, which the static message below cannot. No force flag was added:
+  a caller starting over runs `gonzalo purge` first, keeping the discard of a
+  restore window one explicit operator action.
+- **Negative, narrowed in gonzalo#340:** **a refused upsert costs one orphaned
+  shard blob until the next sweep.** Refusing at `open` means a reopen stages
+  nothing at all, so this now only applies to a commit refused on a handle that
+  was already open — a delete that lands between `open` and the commit. `RecordVectorIndex` stages the shard blob before the manifest
   write that is then rejected. It is the same class of orphan a lost OCC race
   already produces (`crates/gonzalo-vector/src/record_index.rs:368`), reclaimed
   by `gc`, but it is a new way to reach it.
@@ -183,6 +190,7 @@ covers it.
 - Operators find purge-then-create too sharp a way to discard a deleted index.
 - `PutPlan::Rejected` gains a dynamic message, which would let the refusal name
   the key.
-- `RecordVectorIndex::open` learns to see tombstones (gonzalo#340). The
-  daemon's purge route gained its tombstone check in
-  [ADR 0031](0031-daemon-removal-surface-requires-admin.md).
+- The daemon's purge route gained its tombstone check in
+  [ADR 0031](0031-daemon-removal-surface-requires-admin.md), and
+  `RecordVectorIndex::open` learned to see tombstones in gonzalo#340. Both of
+  this record's daemon-side and library-side limitations are now closed.

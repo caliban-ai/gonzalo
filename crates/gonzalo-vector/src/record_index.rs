@@ -12,8 +12,8 @@ use crate::shard::{DEFAULT_SHARDS, decode_shard, encode_shard, shard_of};
 use crate::{Match, MemoryVectorIndex, VectorIndex};
 use async_trait::async_trait;
 use gonzalo_core::{
-    BlobStore, ContentHash, CoreError, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey,
-    RecordKind, Result, Store, VectorManifest,
+    BlobStore, ContentHash, CoreError, Identity, KeyPrefix, MANIFEST_TOMBSTONE_RECREATE_REJECTED,
+    Meta, PutResult, Record, RecordKey, RecordKind, Result, Store, VectorManifest,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
@@ -148,6 +148,13 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
     /// declared one, naming both values, so a swapped embedder surfaces once at
     /// startup rather than as quietly wrong rankings on every later query. A
     /// missing manifest starts an empty index created on the first commit.
+    ///
+    /// **Errors if the index was deleted** and its tombstone still holds a
+    /// restore window (gonzalo#340). The error names the key and the two ways
+    /// out — `gonzalo undelete` to restore it, `gonzalo purge` to discard the
+    /// window — and there is deliberately no flag here that skips them: a
+    /// caller starting over purges first, which keeps discarding a restore
+    /// window a single explicit operator action (ADR 0029/0030).
     pub async fn open(store: S, key: RecordKey, space: &str, dim: usize) -> Result<Self> {
         Self::open_with_shards(store, key, space, dim, DEFAULT_SHARDS).await
     }
@@ -162,7 +169,33 @@ impl<S: Store + BlobStore + Send + Sync + 'static> RecordVectorIndex<S> {
         shards: NonZeroU16,
     ) -> Result<Self> {
         let store = Arc::new(store);
-        let existing = store.get(&key).await?;
+        // Read raw. `get` hides tombstones, so `open` used to succeed over a
+        // deleted index, hand back a handle onto an empty in-memory index, and
+        // fail only at the first commit — reporting the problem from a call that
+        // was not the wrong one (gonzalo#340). The trigger below matches
+        // `plan_put`'s exactly, so `open` refuses precisely when the first
+        // commit would have.
+        let existing = match store.get_raw(&key).await? {
+            Some(t) if t.is_tombstone() => {
+                if matches!(
+                    t.deleted_kind,
+                    Some(RecordKind::GraphManifest | RecordKind::VectorManifest)
+                ) {
+                    return Err(CoreError::Invalid(format!(
+                        "vector index {key}: {MANIFEST_TOMBSTONE_RECREATE_REJECTED}"
+                    )));
+                }
+                // A tombstone carrying no manifest kind has no restore window —
+                // one written before gonzalo#327, or by a non-manifest delete —
+                // and `plan_put` lets a create through at such a key. Behave
+                // exactly as before: start fresh, and leave `last_seen` as
+                // `None` so the first commit goes out as a create. Naming the
+                // tombstone's revision instead would make `plan_put` answer
+                // `NotFound`.
+                None
+            }
+            other => other,
+        };
         let (shards, manifest) = match &existing {
             None => (shards, None),
             Some(record) => {

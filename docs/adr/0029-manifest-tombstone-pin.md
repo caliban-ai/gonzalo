@@ -140,14 +140,15 @@ mean different things depending on whether `collect` had run. Only an explicit
 - **Positive:** the fix adds no wire surface, trait method or planner arm. Old
   records read unchanged, and a tombstone written before this one marks nothing,
   as it did not before.
-- **Negative:** **a `RecordVectorIndex` opened over a manifest tombstone still
-  opens successfully.** `RecordVectorIndex::open`
-  (`crates/gonzalo-vector/src/record_index.rs`) reads with `store.get`, which
-  hides tombstones, so it builds a fresh empty manifest and fails only at its
-  first commit. A `put` that creates over a manifest tombstone is refused
-  ([ADR 0030](0030-manifest-tombstone-recreate-guard.md)), so the restore
-  window survives the attempt, and `gonzalo undelete` still works afterwards.
-  The late failure is tracked in gonzalo#340.
+- **Negative, resolved by [ADR 0030](0030-manifest-tombstone-recreate-guard.md)
+  and gonzalo#340:** **a `RecordVectorIndex` opened over a manifest tombstone
+  used to open successfully.** `RecordVectorIndex::open`
+  (`crates/gonzalo-vector/src/record_index.rs`) read with `store.get`, which
+  hides tombstones, so it built a fresh empty manifest and failed only at its
+  first commit. ADR 0030 made that commit refuse, so the restore window always
+  survived the attempt; gonzalo#340 then moved the refusal to `open` itself, so
+  the failing call is the one that was wrong. `open` now reads raw and refuses on
+  the same condition `plan_put` does.
 - **Negative:** **a divergent delete can drop a pin early.** When two peers
   delete *different revisions* of the same manifest key, sync's
   diverged-tombstone merge calls `tombstone_winner`
