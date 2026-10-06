@@ -709,6 +709,11 @@ fn purge_removes_a_tombstone_and_lets_the_key_be_recreated() {
         "got {:?}",
         stdout(&out)
     );
+    assert!(
+        stdout(&out).contains("revision:"),
+        "purge prints the revision it removed, got {:?}",
+        stdout(&out)
+    );
 
     // The tombstone is physically gone, so the record reads as absent raw too.
     assert!(

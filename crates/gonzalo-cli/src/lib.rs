@@ -1177,6 +1177,11 @@ pub async fn undelete(
 /// leaving no tombstone, which a peer that had not synced since would
 /// resurrect (ADR 0021). Core keeps its contract because `collect` depends on
 /// it; the check belongs here, at the operator surface.
+///
+/// Benign race: a concurrent `collect` that purges the same key first makes
+/// the plan a no-op, which `Store::purge` reports as success, so this can
+/// print `purged:` for a tombstone it did not itself remove. That is
+/// `Store::purge`'s documented idempotency.
 pub async fn purge(
     root: &Path,
     ancestor_cap: usize,
@@ -1191,12 +1196,17 @@ pub async fn purge(
     };
     if !record.is_tombstone() {
         anyhow::bail!(
-            "{key} is live at revision {}; purge removes tombstones only. \
-             Delete it first if that is what you meant.",
+            "{key} is live at revision {}; purge only discards an existing tombstone. \
+             To remove the record use `gonzalo delete`: it keeps a restore window \
+             for manifest kinds, and purging that tombstone would discard it.",
             record.revision.counter
         );
     }
     let revision = record.revision.clone();
+    // Exits 1, not `EXIT_CONFLICT`: purge takes no `--expected`, so there is no
+    // stale input for a caller to refresh. The revision moved between our read
+    // and the purge (a concurrent `undelete`, or a create over a non-manifest
+    // tombstone), and re-running re-reads it.
     if let gonzalo_core::DeleteResult::Conflict(_) = store.purge(&key, revision.clone()).await? {
         anyhow::bail!("{key} changed while purging; nothing was removed, retry");
     }
@@ -1805,7 +1815,8 @@ mod tests {
             "the refusal must tell the operator both ways out, got {msg}"
         );
 
-        // Nothing was written: the window is intact.
+        // The manifest record is untouched, so the window is intact (orphan slice
+        // blobs are gc'd).
         let after = store
             .get_raw(&key)
             .await
@@ -1813,6 +1824,24 @@ mod tests {
             .expect("tombstone survives");
         assert!(after.is_tombstone());
         assert_eq!(after.body, retained, "the retained body was not touched");
+
+        // Follow the refusal's own advice: purge the tombstone, then the
+        // indexer is unblocked. Nothing else asserts this for a key reached
+        // through `index`.
+        purge(
+            root.path(),
+            gonzalo_core::DEFAULT_ANCESTOR_CAP,
+            &key.namespace,
+            &key.collection,
+            &key.id,
+        )
+        .await
+        .unwrap();
+        index(root.path(), src.path(), "r", "main")
+            .await
+            .expect("indexing succeeds once the tombstone is purged");
+        let live = store.get_raw(&key).await.unwrap().expect("manifest");
+        assert!(!live.is_tombstone(), "the view is live again");
     }
 
     #[tokio::test]
