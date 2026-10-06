@@ -2,8 +2,8 @@
 //! reopened, and queried — with the reopen cost reported rather than assumed.
 
 use gonzalo_core::{
-    DeleteResult, KeyPrefix, RecordKey, Store as _, SweepPolicy, VectorManifest, gc_blobs_with,
-    now_ms, undelete,
+    BlobStore as _, CoreError, DeleteResult, KeyPrefix, RecordKey, Store as _, SweepPolicy,
+    VectorManifest, collect, gc_blobs_with, now_ms, undelete,
 };
 use gonzalo_store_fs::FsStore;
 use gonzalo_vector::{RecordVectorIndex, VectorIndex as _};
@@ -105,4 +105,123 @@ async fn a_deleted_index_can_be_undeleted_and_queried() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1, "the restored index answers queries");
+}
+
+/// The hazard #333 exists for: reopening a deleted index and writing to it used
+/// to overwrite the tombstone and orphan the shards. Now the commit refuses and
+/// the shards stay pinned (ADR 0030).
+#[tokio::test]
+async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
+    let dir = TempDir::new().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = VectorManifest::key("ns", "guarded");
+
+    let mut probe = vec![0.0; DIM];
+    probe[1] = 1.0;
+
+    let idx = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "guarded-space", DIM)
+        .await
+        .unwrap();
+    idx.upsert_many(vec![(RecordKey::new("ns", "coll", "a"), probe.clone())])
+        .await
+        .unwrap();
+    drop(idx);
+
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    // The shards the delete pinned. The refused commit below stages a blob of its
+    // own that nothing will ever reference, so the sweep may legitimately free
+    // that one; what must survive is exactly this set.
+    let pinned: Vec<_> = store
+        .list_blobs()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.hash)
+        .collect();
+    assert!(!pinned.is_empty(), "the index wrote shard blobs");
+
+    // Reopen: this still succeeds, because `open` reads through `store.get`,
+    // which hides tombstones. The refusal lands on the first commit instead.
+    let reopened =
+        RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "guarded-space", DIM)
+            .await
+            .unwrap();
+    let err = reopened
+        .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe.clone())])
+        .await
+        .expect_err("the commit must be refused while a tombstone holds the key");
+    assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+
+    // The window survived, so the shards are still pinned.
+    let swept = gc_blobs_with(
+        &store,
+        SweepPolicy {
+            min_age: Duration::ZERO,
+            now: SystemTime::now(),
+        },
+    )
+    .await
+    .unwrap();
+    for hash in &pinned {
+        assert!(
+            !swept.freed.contains(hash),
+            "the sweep freed a pinned shard"
+        );
+        assert!(
+            store.has_blob(hash).await.unwrap(),
+            "a pinned shard is gone"
+        );
+    }
+
+    // And the record is still restorable.
+    undelete(&store, &key, now_ms(), None).await.unwrap();
+    let restored = RecordVectorIndex::open(FsStore::new(dir.path()), key, "guarded-space", DIM)
+        .await
+        .unwrap();
+    assert_eq!(restored.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+}
+
+/// Review Focus 2: the guard must not brick the key. Once `collect` has removed
+/// the tombstone there is no window left to protect, so a create must work
+/// again — otherwise a deleted index's key becomes permanently unwritable.
+#[tokio::test]
+async fn after_collect_removes_the_tombstone_a_fresh_index_can_be_created() {
+    let dir = TempDir::new().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = VectorManifest::key("ns", "recycled");
+
+    let mut probe = vec![0.0; DIM];
+    probe[2] = 1.0;
+
+    let idx = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "recycled-space", DIM)
+        .await
+        .unwrap();
+    idx.upsert_many(vec![(RecordKey::new("ns", "coll", "a"), probe.clone())])
+        .await
+        .unwrap();
+    drop(idx);
+    assert_eq!(
+        store.delete(&key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+
+    // Past the horizon: collect removes the tombstone, and with it the window.
+    let collected = collect(&store, &KeyPrefix::default(), Duration::ZERO, now_ms() + 1)
+        .await
+        .unwrap();
+    assert_eq!(collected.purged.len(), 1);
+
+    // A fresh index at the same key now commits normally.
+    let fresh = RecordVectorIndex::open(FsStore::new(dir.path()), key, "recycled-space", DIM)
+        .await
+        .unwrap();
+    fresh
+        .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe)])
+        .await
+        .expect("with no tombstone there is no window to protect");
+    assert_eq!(fresh.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
 }
