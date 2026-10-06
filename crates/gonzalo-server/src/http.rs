@@ -184,8 +184,9 @@ fn put_outcome_response(result: gonzalo_core::Result<PutResult>) -> Response {
     }
 }
 
-/// `200` + `Deleted`, `409` + `Conflict`, or an opaque `500`. Shared by
-/// `DELETE /v1/records/...` and `POST /v1/purge/...`.
+/// `200` + `Deleted`, `409` + `Conflict`, `400` for a call the store will never
+/// accept, or an opaque `500`. Shared by `DELETE /v1/records/...` and
+/// `POST /v1/purge/...`.
 fn delete_outcome_response(result: gonzalo_core::Result<DeleteResult>) -> Response {
     match result {
         Ok(DeleteResult::Deleted) => (StatusCode::OK, Json(DeleteOutcome::Deleted)).into_response(),
@@ -194,6 +195,10 @@ fn delete_outcome_response(result: gonzalo_core::Result<DeleteResult>) -> Respon
             Json(DeleteOutcome::Conflict { conflict }),
         )
             .into_response(),
+        // A call the store will never accept, such as a purge of a live record
+        // (gonzalo#341). Retrying is pointless, so say so with a 400 instead of
+        // hiding it behind an opaque 500 (gonzalo#299).
+        Err(CoreError::Invalid(reason)) => (StatusCode::BAD_REQUEST, reason).into_response(),
         Err(e) => server_error(e),
     }
 }
@@ -361,30 +366,39 @@ async fn get_raw_record(
 
 /// `PUT /v1/raw/records/{ns}/{col}/{id}` with a [`PutBody`] — replication write
 /// (gonzalo#203). The store writes the record verbatim (revision and
-/// tombstones included). Authorization is `Write` on the namespace, with the
-/// same path/body agreement check as `put` (#158).
+/// tombstones included), with the same path/body agreement check as `put`
+/// (#158).
 ///
-/// **Authorship stays unforgeable (ADR 0015).** An admin token is the
-/// replication credential: daemon-to-daemon and operator replication run with
-/// one, so an admin's raw write keeps the replicated record's original
-/// `meta.author`. Any other principal is restamped exactly as `put` restamps,
-/// so a namespace writer cannot forge authorship through the raw route. Open
-/// mode's implicit principal is an admin, so it keeps the author too.
+/// **Admin only (gonzalo#342), matching `POST /v1/purge/...`.** This route
+/// reaches `plan_put_raw`, so it bypasses the guard that stops a consumer
+/// creating over a manifest tombstone (ADR 0030) — by design, because that
+/// same verbatim arm is what `undelete` rides. A principal holding plain
+/// `Write` could therefore discard a deleted manifest's retained body, the
+/// only record of which blob was which index shard (ADR 0029), by aiming a
+/// fresh manifest at the tombstone's revision — which is predictable, since
+/// `tombstone_hash()` is a constant. Refusing a kind-changing write here
+/// instead would break convergence: a peer that legitimately purged and
+/// recreated a manifest could no longer replicate that state. So the route
+/// requires the credential replication already uses.
+///
+/// **Authorship stays unforgeable (ADR 0015)** and is now so by construction:
+/// an admin token is the replication credential, so the replicated record
+/// keeps its original `meta.author`, and no other principal reaches this
+/// route. Open mode's implicit principal is an admin, so it keeps the author
+/// too.
 async fn put_raw_record(
     State(svc): State<Arc<Service>>,
     Extension(principal): Extension<Principal>,
     Path(path): Path<(String, String, String)>,
-    Json(mut body): Json<PutBody>,
+    Json(body): Json<PutBody>,
 ) -> Response {
+    // Authorize before inspecting the body, so an unauthorized caller cannot
+    // learn whether its record agreed with the path.
+    if !principal.is_admin() {
+        return forbidden_admin(&principal, "a raw record write");
+    }
     if let Some(bad) = path_key_mismatch(&path, &body.record.key) {
         return bad;
-    }
-    let ns = &body.record.key.namespace;
-    if !principal.allows(Access::Write, ns) {
-        return forbidden(&principal, Access::Write, &ns.clone());
-    }
-    if !principal.is_admin() {
-        body.record.meta.author = Identity::new(principal.name());
     }
     put_outcome_response(svc.put_raw(body.record, body.expected).await)
 }
@@ -1845,24 +1859,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_raw_needs_write_scope_and_matching_path() {
+    async fn put_raw_needs_admin_and_matching_path() {
         let (svc, _d) = fs_service();
         let auth = tomb_auth();
         let replica = record_at("origin", Revision::initial(b"{}"));
 
-        // A reader may not write.
+        // Neither a reader nor a namespace writer may replicate (gonzalo#342):
+        // the raw route bypasses `plan_put`'s guards, so it is admin-only.
+        for token in ["rtok", "wtok"] {
+            let (s, _) = call(
+                svc.clone(),
+                auth.clone(),
+                "PUT",
+                RAW,
+                Some(token),
+                Some(put_body_with(replica.clone(), None)),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{token}");
+        }
+
+        // Path and body key must agree (#158) — checked for an admin, since a
+        // non-admin is now refused before the body is inspected at all.
         let (s, _) = call(
-            svc.clone(),
-            auth.clone(),
+            svc,
+            auth,
             "PUT",
-            RAW,
-            Some("rtok"),
-            Some(put_body_with(replica.clone(), None)),
+            "/v1/raw/records/memory/col/y",
+            Some("atok"),
+            Some(put_body_with(replica, None)),
         )
         .await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
 
-        // Path and body key must agree (#158).
+    /// The authorization check precedes the path/body agreement check, so an
+    /// unauthorized caller cannot learn whether its body matched the path
+    /// (gonzalo#342).
+    #[tokio::test]
+    async fn put_raw_authorizes_before_checking_the_path() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let replica = record_at("origin", Revision::initial(b"{}"));
         let (s, _) = call(
             svc,
             auth,
@@ -1872,18 +1910,7 @@ mod tests {
             Some(put_body_with(replica, None)),
         )
         .await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_raw_by_scoped_writer_is_stamped_with_the_writer() {
-        // A non-admin cannot forge authorship through the raw route (ADR 0015).
-        let (svc, _d) = fs_service();
-        let auth = tomb_auth();
-        assert_eq!(
-            put_raw_author(&svc, &auth, Some("wtok")).await,
-            gonzalo_core::Identity::new("writer")
-        );
+        assert_eq!(s, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1918,14 +1945,15 @@ mod tests {
         let tomb = tomb.expect("tombstone");
 
         // expected = None over a tombstone is a conflict for put_raw, and the
-        // conflict may carry the tombstone.
+        // conflict may carry the tombstone. Replication is admin-only
+        // (gonzalo#342), so these run with the admin token.
         let peer = record_at("peer", Revision::initial(b"peer"));
         let (s, body) = call(
             svc.clone(),
             auth.clone(),
             "PUT",
             RAW,
-            Some("wtok"),
+            Some("atok"),
             Some(put_body_with(peer.clone(), None)),
         )
         .await;
@@ -1941,7 +1969,7 @@ mod tests {
             auth.clone(),
             "PUT",
             RAW,
-            Some("wtok"),
+            Some("atok"),
             Some(put_body_with(peer.clone(), Some(tomb.revision.clone()))),
         )
         .await;
@@ -1958,13 +1986,14 @@ mod tests {
         let auth = tomb_auth();
         let never = Revision::initial(b"never current");
 
-        // put_raw with Some over an absent key → NotFound → 412.
+        // put_raw with Some over an absent key → NotFound → 412. Replication is
+        // admin-only (gonzalo#342).
         let (s, _) = call(
             svc.clone(),
             auth.clone(),
             "PUT",
             RAW,
-            Some("wtok"),
+            Some("atok"),
             Some(put_body_with(
                 record_at("w", Revision::initial(b"{}")),
                 Some(never.clone()),
@@ -2028,6 +2057,183 @@ mod tests {
         let (s, rec) = raw_get(&svc, &auth, RAW, Some("atok")).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(rec, None);
+    }
+
+    /// gonzalo#342: a namespace writer cannot destroy a deleted manifest's
+    /// restore window through the raw route. Before the admin gate, `Write` on
+    /// the namespace plus the tombstone's revision — which is predictable,
+    /// because `tombstone_hash()` is a constant — was enough to overwrite the
+    /// retained body that names the index's shard blobs (ADR 0029).
+    #[tokio::test]
+    async fn a_namespace_writer_cannot_destroy_a_manifest_restore_window() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+
+        // Seed a live manifest, then delete it: the tombstone keeps the body
+        // and records `deleted_kind` (ADR 0029).
+        let mut manifest = record_at("client", Revision::initial(b"{}"));
+        manifest.kind = gonzalo_core::RecordKind::VectorManifest;
+        manifest.body = gonzalo_core::Body::Inline(br#"{"shards":["blob-a"]}"#.to_vec());
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            Some("wtok"),
+            Some(put_body_with(manifest, None)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "DELETE",
+            LIVE,
+            Some("wtok"),
+            Some(delete_body()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let tomb = tomb.expect("tombstone");
+        assert!(tomb.is_tombstone());
+        assert_eq!(
+            tomb.deleted_kind,
+            Some(gonzalo_core::RecordKind::VectorManifest)
+        );
+
+        // The writer knows the tombstone's revision and aims a fresh, empty
+        // manifest at it. The raw route refuses it.
+        let mut replacement = record_at("writer", Revision::initial(b"empty"));
+        replacement.kind = gonzalo_core::RecordKind::VectorManifest;
+        replacement.body = gonzalo_core::Body::Inline(br#"{"shards":[]}"#.to_vec());
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            RAW,
+            Some("wtok"),
+            Some(put_body_with(replacement, Some(tomb.revision.clone()))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+
+        // The restore window is intact: same revision, same retained body.
+        let (_, after) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let after = after.expect("tombstone survives");
+        assert_eq!(after.revision, tomb.revision);
+        assert_eq!(after.body, tomb.body);
+        assert_eq!(after.deleted_kind, tomb.deleted_kind);
+    }
+
+    /// gonzalo#341: the daemon refuses to purge a live record, as
+    /// `gonzalo purge` does. Purging a live record leaves no tombstone, so a
+    /// peer that has not synced since would resurrect it (ADR 0021).
+    #[tokio::test]
+    async fn purge_of_a_live_record_is_refused() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            Some("wtok"),
+            Some(put_body("memory", "client")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, live) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let live = live.expect("live record");
+
+        let (s, body) = call(
+            svc.clone(),
+            auth.clone(),
+            "POST",
+            PURGE,
+            Some("atok"),
+            Some(purge_body(&live.revision)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let msg = String::from_utf8_lossy(&body);
+        assert!(msg.contains("gonzalo delete"), "{msg}");
+
+        // Still there, unchanged.
+        let (_, after) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let after = after.expect("live record survives");
+        assert_eq!(after.revision, live.revision);
+        assert!(!after.is_tombstone());
+    }
+
+    /// The live-record guard is narrow by design: a *mismatched* revision over a
+    /// live record is collection losing an OCC race to a recreate, and must stay
+    /// a `409 Conflict` — `collect` records that and carries on, where an error
+    /// would fail the whole run (gonzalo#341,
+    /// `conformance::purge_conflicts_after_recreation`).
+    #[tokio::test]
+    async fn purge_of_a_recreated_record_still_conflicts() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        seed_tombstone(&svc, &auth, Some("wtok"), Some("wtok")).await;
+        let (_, tomb) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let tomb_rev = tomb.expect("tombstone").revision;
+
+        // The key comes back while collection is still holding the tombstone's
+        // revision.
+        let (s, _) = call(
+            svc.clone(),
+            auth.clone(),
+            "PUT",
+            LIVE,
+            Some("wtok"),
+            Some(put_body("memory", "client")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        let (s, body) = call(
+            svc.clone(),
+            auth.clone(),
+            "POST",
+            PURGE,
+            Some("atok"),
+            Some(purge_body(&tomb_rev)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert!(matches!(
+            serde_json::from_slice::<DeleteOutcome>(&body).unwrap(),
+            DeleteOutcome::Conflict { .. }
+        ));
+
+        // The recreated record survives.
+        let (_, after) = raw_get(&svc, &auth, RAW, Some("atok")).await;
+        let after = after.expect("recreated record survives");
+        assert!(!after.is_tombstone());
+    }
+
+    /// The live-record guard must not break collection's re-run safety: a purge
+    /// of a key that is already gone still reports `Deleted` (gonzalo#341).
+    #[tokio::test]
+    async fn purge_of_an_absent_record_is_still_deleted() {
+        let (svc, _d) = fs_service();
+        let auth = tomb_auth();
+        let (s, body) = call(
+            svc,
+            auth,
+            "POST",
+            PURGE,
+            Some("atok"),
+            Some(purge_body(&Revision::initial(b"anything"))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(matches!(
+            serde_json::from_slice::<DeleteOutcome>(&body).unwrap(),
+            DeleteOutcome::Deleted
+        ));
     }
 
     #[tokio::test]

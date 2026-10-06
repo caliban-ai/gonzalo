@@ -3,6 +3,9 @@
 - **Status:** accepted
 - **Date:** 2026-07-05
 - **Source:** [`docs/superpowers/specs/2026-07-05-namespace-scoped-daemon-auth-design.md`](../superpowers/specs/2026-07-05-namespace-scoped-daemon-auth-design.md)
+- **Amended by** [ADR 0031](0031-daemon-removal-surface-requires-admin.md),
+  which raises the raw replication write from `write` on the namespace to admin.
+  The scoping model itself is unchanged; one route moved between its tiers.
 
 ## Context
 

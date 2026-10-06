@@ -195,3 +195,120 @@ async fn sync_replicates_a_tombstone_to_a_daemon_peer() {
 
     assert_eq!(sync(&a, &b).await.unwrap(), SyncReport::default());
 }
+
+/// gonzalo#341: the daemon's live-record purge guard must not break tombstone
+/// collection, which is the one legitimate caller of `purge` at scale. Over a
+/// daemon, `collect` routes every purge through the guarded `Service::purge`,
+/// so this is the regression the guard most plausibly causes.
+#[tokio::test(flavor = "multi_thread")]
+async fn collect_over_a_daemon_still_purges_tombstones_and_spares_live_records() {
+    use gonzalo_core::{
+        Body, DeleteResult, Identity, KeyPrefix, Meta, PutResult, Record, RecordKey, RecordKind,
+        Revision, Store, collect,
+    };
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    fn record_at(key: &RecordKey, payload: &[u8]) -> Record {
+        let body = Body::Inline(payload.to_vec());
+        Record {
+            revision: Revision::initial(body.bytes()),
+            parent: None,
+            body,
+            kind: RecordKind::Topic,
+            meta: Meta {
+                author: Identity::new("tester"),
+                origin_system: "test".into(),
+                created: 0,
+                updated: 0,
+                labels: BTreeMap::new(),
+            },
+            links: Vec::new(),
+            key: key.clone(),
+            ancestors: Vec::new(),
+            deleted_at: None,
+            deleted_blob: None,
+            deleted_kind: None,
+        }
+    }
+
+    let store = fresh_http_store(DEFAULT_ANCESTOR_CAP).await;
+    let doomed = RecordKey::new("testns", "testcol", "doomed");
+    let kept = RecordKey::new("testns", "testcol", "kept");
+
+    for key in [&doomed, &kept] {
+        assert!(matches!(
+            store.put(record_at(key, b"v0\n"), None).await.unwrap(),
+            PutResult::Committed(_)
+        ));
+    }
+    assert!(matches!(
+        store.delete(&doomed, None).await.unwrap(),
+        DeleteResult::Deleted
+    ));
+
+    // A zero horizon and a far-future clock make every stamped tombstone
+    // eligible, so the only thing standing between `collect` and both records
+    // is the guard.
+    let report = collect(&store, &KeyPrefix::default(), Duration::ZERO, i64::MAX)
+        .await
+        .expect("collect succeeds over a daemon");
+
+    assert_eq!(report.purged, vec![doomed.clone()]);
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+    assert_eq!(store.get_raw(&doomed).await.unwrap(), None);
+
+    // The live record was never a purge candidate, and is untouched.
+    let survivor = store.get_raw(&kept).await.unwrap().expect("kept survives");
+    assert!(!survivor.is_tombstone());
+}
+
+/// gonzalo#342: a namespace writer's raw replication write is refused by a real
+/// daemon with a 403, not mistaken for an older daemon lacking the route.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_raw_write_by_non_admin_is_forbidden_end_to_end() {
+    use gonzalo_core::{Body, Identity, Meta, Record, RecordKey, RecordKind, Revision, Store};
+    use gonzalo_store_server::DAEMON_PREDATES_REPLICATION;
+    use std::collections::BTreeMap;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = Arc::new(Auth::Enabled(std::collections::HashMap::from([(
+        "wtok".to_string(),
+        Principal::new("writer", vec!["memory".into()], vec!["memory".into()]),
+    )])));
+    tokio::spawn(serve_http(
+        listener,
+        service_with_cap(DEFAULT_ANCESTOR_CAP),
+        auth,
+    ));
+    let writer = ServerStore::http_with_token(&format!("http://{addr}"), "wtok").unwrap();
+
+    let key = RecordKey::new("memory", "col", "x");
+    let body = Body::Inline(b"{}".to_vec());
+    let record = Record {
+        revision: Revision::initial(body.bytes()),
+        parent: None,
+        body,
+        kind: RecordKind::MemoryTier,
+        meta: Meta {
+            author: Identity::new("origin"),
+            origin_system: "test".into(),
+            created: 0,
+            updated: 0,
+            labels: BTreeMap::new(),
+        },
+        links: Vec::new(),
+        key: key.clone(),
+        ancestors: Vec::new(),
+        deleted_at: None,
+        deleted_blob: None,
+        deleted_kind: None,
+    };
+    let msg = writer.put_raw(record, None).await.unwrap_err().to_string();
+    assert!(msg.contains("403"), "{msg}");
+    assert!(!msg.contains(DAEMON_PREDATES_REPLICATION), "{msg}");
+
+    // Nothing was written.
+    assert_eq!(writer.get_raw(&key).await.unwrap(), None);
+}

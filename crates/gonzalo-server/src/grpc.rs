@@ -257,15 +257,19 @@ impl Gonzalo for GrpcAdapter {
 
     async fn put_raw(&self, req: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let (metadata, _ext, r) = req.into_parts();
-        // Replication write (gonzalo#203). Authorship stays unforgeable (ADR
-        // 0015): an admin token is the replication credential, so an admin's
-        // PutRaw keeps the replicated record's original author. Any other
-        // principal is restamped exactly as `Put` restamps. Open mode's
-        // implicit principal is an admin, so it keeps the author too.
-        let (principal, mut record, expected) = self.authorize_put(&metadata, &r)?;
-        if !principal.is_admin() {
-            record.meta.author = Identity::new(principal.name());
-        }
+        // Replication write (gonzalo#203), admin only (gonzalo#342) to match
+        // `Purge` and the HTTP route: this path reaches `plan_put_raw`, so a
+        // plain `Write` principal could otherwise discard a deleted manifest's
+        // restore window (ADR 0029/0030). The admin check runs before
+        // deserializing the caller's JSON (#146). Authorship stays unforgeable
+        // (ADR 0015) by construction: the replication credential is an admin
+        // token, so the record keeps its original author, and no other
+        // principal reaches this RPC.
+        self.authorize_admin(&metadata, "a raw record write")?;
+        let record: Record = serde_json::from_slice(&r.record_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let expected: Option<Revision> = serde_json::from_slice(&r.expected_json)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let outcome = self
             .service
             .put_raw(record, expected)
@@ -282,7 +286,11 @@ impl Gonzalo for GrpcAdapter {
         let expected: Revision = serde_json::from_slice(&r.expected_json)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let key = RecordKey::new(r.namespace, r.collection, r.id);
-        let outcome = self.service.purge(&key, expected).await.map_err(internal)?;
+        let outcome = self
+            .service
+            .purge(&key, expected)
+            .await
+            .map_err(purge_error)?;
         let (outcome, payload_json) = delete_outcome_parts(outcome)?;
         Ok(Response::new(PurgeResponse {
             outcome,
@@ -484,6 +492,17 @@ fn put_error(e: CoreError) -> Status {
         CoreError::NotFound(key) => Status::failed_precondition(format!("record not found: {key}")),
         // A call the store will never accept (a consumer put of a tombstone):
         // the caller's fault, not an outage, so not `Internal` (gonzalo#299).
+        CoreError::Invalid(reason) => Status::invalid_argument(reason),
+        other => internal(other),
+    }
+}
+
+/// `Status` for a purge error. A call the store will never accept — a purge of a
+/// live record (gonzalo#341) — is the caller's fault, not an outage, so it is
+/// `invalid_argument` rather than `internal` (same rule as `put_error`,
+/// gonzalo#299).
+fn purge_error(e: CoreError) -> Status {
+    match e {
         CoreError::Invalid(reason) => Status::invalid_argument(reason),
         other => internal(other),
     }
@@ -1270,29 +1289,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_put_raw_is_write_scoped() {
+    async fn grpc_put_raw_requires_admin() {
+        // Replication is admin-only (gonzalo#342): PutRaw reaches
+        // `plan_put_raw`, so a namespace writer could otherwise discard a
+        // deleted manifest's restore window. Nothing is written.
+        let adapter = fs_adapter(tomb_auth());
+        for token in ["rtok", "wtok"] {
+            let err = adapter
+                .put_raw(with_token(put_req_with("origin", b"{}", None), token))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{token}");
+        }
+        assert_eq!(raw_record(&adapter).await, None);
+    }
+
+    /// The admin check runs before the caller's JSON is deserialized (#146), so
+    /// a non-admin sending garbage gets `PermissionDenied`, not
+    /// `InvalidArgument` (gonzalo#342).
+    #[tokio::test]
+    async fn grpc_put_raw_authorizes_before_deserializing() {
         let adapter = fs_adapter(tomb_auth());
         let err = adapter
-            .put_raw(with_token(put_req_with("origin", b"{}", None), "rtok"))
+            .put_raw(with_token(malformed_put_req(), "wtok"))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn grpc_put_raw_by_scoped_writer_is_stamped_with_the_writer() {
-        // A non-admin cannot forge authorship through PutRaw (ADR 0015).
-        let adapter = fs_adapter(tomb_auth());
-        let resp = adapter
-            .put_raw(with_token(put_req_with("origin", b"{}", None), "wtok"))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(resp.outcome, "committed");
-        assert_eq!(
-            raw_record(&adapter).await.expect("stored").meta.author,
-            Identity::new("writer")
-        );
     }
 
     #[tokio::test]
@@ -1336,8 +1358,9 @@ mod tests {
         let adapter = fs_adapter(tomb_auth());
         let tomb = seed_tombstone(&adapter, "wtok").await;
 
+        // Replication is admin-only (gonzalo#342).
         let conflict = adapter
-            .put_raw(with_token(put_req_with("peer", b"peer", None), "wtok"))
+            .put_raw(with_token(put_req_with("peer", b"peer", None), "atok"))
             .await
             .unwrap()
             .into_inner();
@@ -1346,7 +1369,7 @@ mod tests {
         let ok = adapter
             .put_raw(with_token(
                 put_req_with("peer", b"peer", Some(tomb.revision.clone())),
-                "wtok",
+                "atok",
             ))
             .await
             .unwrap()
@@ -1361,7 +1384,7 @@ mod tests {
         let adapter = fs_adapter(tomb_auth());
         let never = Some(Revision::initial(b"never current"));
         let err = adapter
-            .put_raw(with_token(put_req_with("w", b"{}", never.clone()), "wtok"))
+            .put_raw(with_token(put_req_with("w", b"{}", never.clone()), "atok"))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -1399,6 +1422,34 @@ mod tests {
             .into_inner();
         assert_eq!(ok.outcome, "deleted");
         assert_eq!(raw_record(&adapter).await, None);
+    }
+
+    /// gonzalo#341: the daemon refuses to purge a live record over gRPC too,
+    /// and classifies it as the caller's error rather than an outage.
+    #[tokio::test]
+    async fn grpc_purge_of_a_live_record_is_invalid_argument() {
+        let adapter = fs_adapter(tomb_auth());
+        adapter
+            .put(with_token(put_req("memory", "client"), "wtok"))
+            .await
+            .unwrap();
+        let live = raw_record(&adapter).await.expect("live record");
+        assert!(!live.is_tombstone());
+
+        let err = adapter
+            .purge(with_token(purge_req("memory", &live.revision), "atok"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("gonzalo delete"),
+            "{}",
+            err.message()
+        );
+
+        // Still there, unchanged.
+        let after = raw_record(&adapter).await.expect("live record survives");
+        assert_eq!(after.revision, live.revision);
     }
 
     #[tokio::test]

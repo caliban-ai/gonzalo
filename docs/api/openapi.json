@@ -141,7 +141,7 @@
       "put": {
         "tags": ["replication"],
         "summary": "Replication write",
-        "description": "Requires `write` on the namespace. Stores the record verbatim and never re-stamps its revision. A non-admin caller's write is attributed to that caller, so nobody can plant a record in another's name through this route.",
+        "description": "**Admin only.** Stores the record verbatim and never re-stamps its revision, so it reaches past the guard that protects a deleted manifest's restore window — which is why it needs the same credential as purge rather than `write` on the namespace. A replicated record therefore always keeps the author it arrived with.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PutBody" } } }
@@ -190,7 +190,7 @@
       "post": {
         "tags": ["replication"],
         "summary": "Physically remove a tombstone",
-        "description": "**Admin only.** The one operation that can make a delete undoable across peers: removing a tombstone lets a peer that never saw the delete resurrect the record on its next sync. `expected` is required — purge is always conditional on the current revision, so a recreation landing mid-purge survives.",
+        "description": "**Admin only.** The one operation that can make a delete undoable across peers: removing a tombstone lets a peer that never saw the delete resurrect the record on its next sync. `expected` is required — purge is always conditional on the current revision, so a recreation landing mid-purge survives. Only a tombstone can be removed: naming the revision of a *live* record is a 400.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PurgeBody" } } }
@@ -200,6 +200,7 @@
             "description": "purged, or a conflict",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteOutcome" } } }
           },
+          "400": { "description": "the key is live at that revision; purge only discards a tombstone" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "description": "the caller is not an admin" }
         }

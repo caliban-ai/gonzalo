@@ -357,8 +357,14 @@ This discards the restore window, so there is no prompt and no `--yes`; run
 is **live** (exit `1`), because removing a live record would leave no tombstone
 for a peer to respect and the record could come back on the next sync. Use
 `gonzalo delete` for that. A key that does not exist is also an error (exit `1`),
-unlike `delete`, which is idempotent. Over a daemon, the purge route needs an
-admin token and does not make the live-record check (gonzalo#341).
+unlike `delete`, which is idempotent. Over a daemon the purge route needs an
+admin token and makes the same live-record check, answering `400` (gRPC
+`InvalidArgument`); the two surfaces agree
+([ADR 0031](./adr/0031-daemon-removal-surface-requires-admin.md)). The daemon's
+check is narrower in one way that matters only to collection: a purge naming a
+revision that *no longer* matches a live record — the key was recreated while
+collection held the old tombstone revision — still answers `409 Conflict` and
+removes nothing, so `collect` records the conflict and carries on.
 
 ## Ancestor cap
 
@@ -389,7 +395,7 @@ meaning, with tombstones hidden:
 |---|---|---|
 | Delete (writes a tombstone; deleter as above) | `DELETE /v1/records/{ns}/{col}/{id}` | `write` on the namespace |
 | Raw read of one record | `GET /v1/raw/records/{ns}/{col}/{id}` | `read` on the namespace |
-| Raw write (replication; revision stored verbatim, never re-stamped) | `PUT /v1/raw/records/{ns}/{col}/{id}` | `write` on the namespace |
+| Raw write (replication; revision stored verbatim, never re-stamped) | `PUT /v1/raw/records/{ns}/{col}/{id}` | admin |
 | Raw key listing | `GET /v1/raw/keys?namespace=&collection=` | `read` on the namespace; `read` on `*` without `namespace` |
 | Purge (physical removal) | `POST /v1/purge/{ns}/{col}/{id}` with body `{"expected": <revision>}` | admin |
 
@@ -399,12 +405,13 @@ permissions.
 `collect` and `purge` through a daemon need an admin token; a non-admin token
 fails on the first eligible tombstone, before anything is purged.
 
-**Who a replicated record is attributed to.** A raw write never changes a record's
-revision, but its author follows the same rule as a normal write. If the caller is
-not an admin, the daemon sets the record's author to the caller, so nobody can plant
-a record in someone else's name through the raw route. If the caller is an admin, or
-the daemon runs without auth, the record keeps the author it arrived with. Use an
-admin token for replication when authorship must carry across stores.
+**Who a replicated record is attributed to.** A raw write never changes a
+record's revision, and it always keeps the author the record arrived with,
+because the route is admin-only
+([ADR 0031](./adr/0031-daemon-removal-surface-requires-admin.md)) and an admin
+token is the replication credential. So authorship carries across stores
+without any special handling. A non-admin token cannot reach the route at all:
+it gets `403` (gRPC `PermissionDenied`) and nothing is written.
 
 **Writes to a deleted key.** A conditional write (normal or raw) whose expected
 revision the daemon rejects as not found returns **HTTP 412**
@@ -413,8 +420,12 @@ conditional normal write over a deleted key is the common case. This used to be 
 opaque HTTP 500. It is not a 404, because on the raw routes a 404 means the daemon
 is too old to have them.
 
-Purge requires admin because it is the one operation that can make a
-delete undoable across peers.
+Purge requires admin because it is the one operation that can make a delete
+undoable across peers. The raw write requires admin for the same reason: it
+writes verbatim, so it reaches past the guard that protects a deleted manifest's
+restore window, and a namespace writer could otherwise discard that window by
+aiming a fresh record at the tombstone's — entirely predictable — revision
+(gonzalo#342).
 
 **Blob GC is not a daemon route.** `gonzalo gc` sweeps a filesystem store
 directly. A library caller can run `gc_blobs` against any store that is both a
