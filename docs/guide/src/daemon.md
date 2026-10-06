@@ -97,9 +97,10 @@ What each operation needs:
 | put or delete a record | `write` on its namespace |
 | list keys in a namespace | `read` on that namespace |
 | list keys with no namespace filter | `read` on `"*"` |
-| raw get / raw put a record | `read` / `write` on its namespace |
+| raw get a record | `read` on its namespace |
+| raw put a record | admin (`"*"` in both lists) |
 | raw key listing | as list keys |
-| purge a record | admin (`"*"` in both lists) |
+| purge a record | admin (`"*"` in both lists), and only a tombstone |
 | code-graph queries | `read` on the view's `repo` |
 | blobs | `read` / `write` on the reserved `_blobs` namespace |
 | ticket sync | `write` on `tickets` |
@@ -107,8 +108,9 @@ What each operation needs:
 
 When auth is on, a write's `meta.author` is overwritten with the authenticated
 principal's name, so authorship cannot be forged — except `put_raw` and `delete`
-from an admin, which keep the replicated author or the named deleter. With auth
-off, the author the client sent is kept. See
+from an admin, which keep the replicated author or the named deleter. `put_raw`
+is admin-only, so a replicated record always keeps its original author. With
+auth off, the author the client sent is kept. See
 [Deletion, reset & collection § Over the daemon](./deletion.md#over-the-daemon)
 for the full authorship rules.
 
@@ -123,9 +125,9 @@ for the full authorship rules.
 | `DELETE /v1/records/{ns}/{col}/{id}` | optional body `{"expected": <revision>, "author": <identity>}`, both fields optional |
 | `GET /v1/keys?namespace=&collection=` | list keys, both filters optional |
 | `GET /v1/raw/records/{ns}/{col}/{id}` | the record as JSON including tombstones; always `200`, absence is `{"record": null}` |
-| `PUT /v1/raw/records/{ns}/{col}/{id}` | replication write; body `{"record": …, "expected": <revision or null>}`, stored verbatim |
+| `PUT /v1/raw/records/{ns}/{col}/{id}` | replication write, **admin only**; body `{"record": …, "expected": <revision or null>}`, stored verbatim |
 | `GET /v1/raw/keys?namespace=&collection=` | list keys including tombstoned ones, both filters optional |
-| `POST /v1/purge/{ns}/{col}/{id}` | body `{"expected": <revision>}`; physically removes the record |
+| `POST /v1/purge/{ns}/{col}/{id}` | body `{"expected": <revision>}`; physically removes the tombstone. `400` if the key is live at that revision |
 | `GET`, `PUT`, `DELETE /v1/blobs/{hash}` | content-addressed blob bytes |
 | `HEAD /v1/blobs/{hash}` | whether the blob exists: `200` or `404`, no body. Answered from a presence check, so `content-length` is `0` rather than the blob's size |
 | `GET /v1/blobs` | list blobs, as objects carrying each blob's hash and modified time |

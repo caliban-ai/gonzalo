@@ -149,6 +149,33 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: the raw replication write requires an admin token.**
+  `PUT /v1/raw/records/{ns}/{col}/{id}` and the `PutRaw` RPC authorized `write`
+  on the namespace; they now require admin, matching `POST /v1/purge/...` and
+  `Purge`. A replication peer configured with a non-admin token begins getting
+  `403` / `PermissionDenied` and must be re-credentialed — [ADR
+  0015](docs/adr/0015-namespace-scoped-daemon-auth.md) already described an admin
+  token as the replication credential, so a correctly configured peer is
+  unaffected. The route writes verbatim and so reaches past the `plan_put` guard
+  added above, which let a principal with plain `Write` discard a deleted
+  manifest's restore window by aiming a fresh record at the tombstone's
+  revision — predictable, because `tombstone_hash()` is a constant. Authorship
+  now carries across stores unconditionally, since the non-admin restamping that
+  hardened the old path is no longer reachable.
+  ([ADR 0031](docs/adr/0031-daemon-removal-surface-requires-admin.md), #342)
+- **BREAKING: the daemon refuses to purge a live record.** `POST /v1/purge/...`
+  and the `Purge` RPC now answer `400` / `InvalidArgument` when the named
+  revision matches a **live** record, as `gonzalo purge` has since #333;
+  purging a live record leaves no tombstone, so a peer that has not synced since
+  would resurrect it ([ADR
+  0021](docs/adr/0021-replicated-deletion-with-tombstones.md)). An admin purge of
+  a live record therefore starts failing where it previously succeeded; use
+  `gonzalo delete` and then purge the tombstone. Tombstone collection is
+  unaffected: the refusal is narrow enough that a purge naming a revision that no
+  longer matches — the key was recreated while collection held the old tombstone
+  revision — still answers `409 Conflict` and removes nothing, which `collect`
+  records and carries on from.
+  ([ADR 0031](docs/adr/0031-daemon-removal-surface-requires-admin.md), #341)
 - **A `put` that creates over a manifest tombstone is now refused.** A consumer
   create (`expected: None`) at a key holding a `GraphManifest` or
   `VectorManifest` tombstone used to succeed, overwriting the tombstone and

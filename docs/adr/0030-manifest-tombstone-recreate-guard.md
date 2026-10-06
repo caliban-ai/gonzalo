@@ -7,6 +7,10 @@
   consequence named this hazard and left it documented rather than closed. A
   consumer create over a manifest tombstone is now refused.
 
+- **Amended by** [ADR 0031](0031-daemon-removal-surface-requires-admin.md),
+  which closes two of the three known limitations below: the daemon's unguarded
+  purge route (gonzalo#341) and the namespace writer's raw write (gonzalo#342).
+
 ADR 0029 is not superseded and stays `accepted`; its retention, marking and
 `undelete` decisions stand unchanged.
 
@@ -137,17 +141,20 @@ refuses a live record and tells them to `delete` it instead.
   write that is then rejected. It is the same class of orphan a lost OCC race
   already produces (`crates/gonzalo-vector/src/record_index.rs:368`), reclaimed
   by `gc`, but it is a new way to reach it.
-- **Negative (known limitation):** **the daemon exposes `Store::purge` to an
+- **Negative, resolved by [ADR 0031](0031-daemon-removal-surface-requires-admin.md):**
+  **the daemon exposed `Store::purge` to an
   admin principal with no tombstone check**
   (`crates/gonzalo-server/src/service.rs:162`,
   `crates/gonzalo-server/src/http.rs:430`,
   `crates/gonzalo-server/src/grpc.rs:285`). An admin can therefore physically
   remove a live record over either transport, which is the same ADR 0021
   resurrection hazard that the CLI check closes. The route arrived with the
-  replication surface and predates this decision; closing it is out of scope
-  here and is tracked in gonzalo#341.
-- **Negative (known limitation):** **a principal with plain `Write` on a
-  namespace can destroy the restore window through the raw route.**
+  replication surface and predates this decision; closing it was out of scope
+  here and was tracked in gonzalo#341. `Service::purge` now refuses to remove a
+  live record, narrowly enough to leave collection's OCC-race `Conflict` intact.
+- **Negative, resolved by [ADR 0031](0031-daemon-removal-surface-requires-admin.md):**
+  **a principal with plain `Write` on a
+  namespace could destroy the restore window through the raw route.**
   `PUT /v1/raw/records/{ns}/{col}/{id}` authorizes `Access::Write`, not admin
   (`crates/gonzalo-server/src/http.rs:382-385`; compare `purge_record` at
   `:420`, which requires admin), and `GET /v1/raw/...` needs only
@@ -158,7 +165,8 @@ refuses a live record and tells them to `delete` it instead.
   empty manifest naming that revision, and the retained body, the pin and
   `undelete` all go: no race and no admin token. The fix belongs at the route,
   not in `plan_put_raw`, whose matching-revision arm is what `undelete` rides.
-  Tracked in gonzalo#342, a sibling of #341 that needs lower privilege.
+  Tracked in gonzalo#342, a sibling of #341 that needs lower privilege. The
+  route now requires admin, matching `POST /v1/purge/...`.
 
 ### Open questions from the ticket
 
@@ -175,5 +183,6 @@ covers it.
 - Operators find purge-then-create too sharp a way to discard a deleted index.
 - `PutPlan::Rejected` gains a dynamic message, which would let the refusal name
   the key.
-- The daemon's purge route gains a tombstone check (gonzalo#341), or
-  `RecordVectorIndex::open` learns to see tombstones (gonzalo#340).
+- `RecordVectorIndex::open` learns to see tombstones (gonzalo#340). The
+  daemon's purge route gained its tombstone check in
+  [ADR 0031](0031-daemon-removal-surface-requires-admin.md).

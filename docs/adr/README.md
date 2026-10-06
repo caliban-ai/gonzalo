@@ -39,7 +39,7 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0012](0012-code-graph-two-level-keying.md) | Two-level keying for the code graph | accepted (blob GC marking amended by [0024](0024-blob-garbage-collection.md)) |
 | [0013](0013-local-candle-embedder.md) | Local Candle embedder for real semantic embeddings | accepted |
 | [0014](0014-approximate-vector-index-backend.md) | Approximate vector index backend (hnsw_rs) | accepted (on-disk scale answered by [0027](0027-durable-vector-index.md)) |
-| [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted |
+| [0015](0015-namespace-scoped-daemon-auth.md) | Namespace-scoped daemon auth | accepted (raw replication write raised to admin by [0031](0031-daemon-removal-surface-requires-admin.md)) |
 | [0016](0016-threeway-merge-stored-ancestry.md) | 3-way merge with content-addressed stored ancestry | accepted |
 | [0017](0017-nonff-pull-content-merge.md) | Non-fast-forward git pull via content-aware merge | accepted |
 | [0018](0018-record-deletion-and-sync.md) | Record deletion and its sync semantics | accepted (local-only deletion superseded by [0021](0021-replicated-deletion-with-tombstones.md)) |
@@ -54,7 +54,8 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0027](0027-durable-vector-index.md) | A durable vector index | accepted (GC-during-commit window narrowed for live writers by [0028](0028-blob-gc-grace-period.md)) |
 | [0028](0028-blob-gc-grace-period.md) | A grace period for blob garbage collection | accepted |
 | [0029](0029-manifest-tombstone-pin.md) | Manifest tombstones retain their body, and `undelete` restores it | accepted (recreate hazard closed by [0030](0030-manifest-tombstone-recreate-guard.md)) |
-| [0030](0030-manifest-tombstone-recreate-guard.md) | A create over a manifest tombstone is refused, and `gonzalo purge` discards one deliberately | accepted |
+| [0030](0030-manifest-tombstone-recreate-guard.md) | A create over a manifest tombstone is refused, and `gonzalo purge` discards one deliberately | accepted (daemon-side gaps closed by [0031](0031-daemon-removal-surface-requires-admin.md)) |
+| [0031](0031-daemon-removal-surface-requires-admin.md) | The daemon's physical-removal surfaces require admin, and refuse to remove a live record | accepted |
 
 ## Adding a new ADR
 
