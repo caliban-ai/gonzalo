@@ -119,9 +119,10 @@ both, and a first, broader attempt at this guard broke the second:
   one — it already reads each key to classify it. That is proportional, not
   asymptotic, and collection is background maintenance, but it is a real cost on
   a large store.
-- **Negative (known limitation):** `RecordVectorIndex::open` still reads through
-  `store.get`, so opening a deleted index succeeds and fails later at the first
-  commit. Unchanged by this decision and still tracked in gonzalo#340.
+- **Negative (known limitation), since closed:** `RecordVectorIndex::open` read
+  through `store.get`, so opening a deleted index succeeded and failed later at
+  the first commit. Unchanged by this decision, and closed separately in
+  gonzalo#340.
 
 ## Revisit if
 

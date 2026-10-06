@@ -2,9 +2,9 @@
 //! reopened, and queried — with the reopen cost reported rather than assumed.
 
 use gonzalo_core::{
-    BlobStore as _, CoreError, DeleteResult, KeyPrefix, MANIFEST_TOMBSTONE_RECREATE_REJECTED,
-    RecordKey, RecordKind, Store as _, SweepPolicy, VectorManifest, collect, gc_blobs_with, now_ms,
-    undelete,
+    BlobStore as _, Body, CoreError, DeleteResult, KeyPrefix, MANIFEST_TOMBSTONE_RECREATE_REJECTED,
+    PutResult, RecordKey, RecordKind, Store as _, SweepPolicy, VectorManifest, collect,
+    gc_blobs_with, now_ms, undelete,
 };
 use gonzalo_store_fs::FsStore;
 use gonzalo_vector::{RecordVectorIndex, VectorIndex as _};
@@ -109,10 +109,11 @@ async fn a_deleted_index_can_be_undeleted_and_queried() {
 }
 
 /// The hazard #333 exists for: reopening a deleted index and writing to it used
-/// to overwrite the tombstone and orphan the shards. Now the commit refuses and
-/// the shards stay pinned (ADR 0030).
+/// to overwrite the tombstone and orphan the shards. #333 made the commit refuse;
+/// gonzalo#340 moves the refusal forward to `open`, so the call that was actually
+/// wrong is the one that fails. Either way the shards stay pinned (ADR 0030).
 #[tokio::test]
-async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
+async fn reopening_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
     let dir = TempDir::new().unwrap();
     let store = FsStore::new(dir.path());
     let key = VectorManifest::key("ns", "guarded");
@@ -143,22 +144,21 @@ async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
         .collect();
     assert!(!pinned.is_empty(), "the tombstone retains shard hashes");
 
-    // Reopen: this still succeeds, because `open` reads through `store.get`,
-    // which hides tombstones. The refusal lands on the first commit instead.
-    let reopened =
-        RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "guarded-space", DIM)
-            .await
-            .unwrap();
-    let err = reopened
-        .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe.clone())])
+    // Reopen: `open` itself refuses now (gonzalo#340), naming the key and the
+    // remedy, instead of handing back a handle that fails at the first commit.
+    let err = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "guarded-space", DIM)
         .await
-        .expect_err("the commit must be refused while a tombstone holds the key");
+        .expect_err("open must refuse while a tombstone holds the key");
     assert!(
-        matches!(&err, CoreError::Invalid(m) if m == MANIFEST_TOMBSTONE_RECREATE_REJECTED),
-        "got {err:?}"
+        matches!(&err, CoreError::Invalid(m)
+            if m.contains(MANIFEST_TOMBSTONE_RECREATE_REJECTED) && m.contains(&key.to_string())),
+        "the refusal must name the key and the remedy; got {err:?}"
     );
 
-    // The window survived, so the shards are still pinned.
+    // The window survived, so the shards are still pinned. Refusing at `open`
+    // also means no doomed commit staged a shard blob, so there is nothing for
+    // the sweep to reclaim at all — where the commit-time refusal left exactly
+    // one orphan behind.
     let swept = gc_blobs_with(
         &store,
         SweepPolicy {
@@ -168,10 +168,10 @@ async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        swept.freed.len(),
-        1,
-        "exactly the refused commit's orphan shard"
+    assert!(
+        swept.freed.is_empty(),
+        "a refusal at open stages no orphan shard; freed {:?}",
+        swept.freed
     );
     for hash in &pinned {
         assert!(
@@ -216,20 +216,15 @@ async fn after_collect_removes_the_tombstone_a_fresh_index_can_be_created() {
     let tomb = store.get_raw(&key).await.unwrap().unwrap();
     assert_eq!(tomb.deleted_kind, Some(RecordKind::VectorManifest));
 
-    // Before the collect the window is still open, so a create is refused.
-    let blocked =
-        RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "recycled-space", DIM)
-            .await
-            .unwrap();
-    let err = blocked
-        .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe.clone())])
+    // Before the collect the window is still open, so `open` is refused
+    // (gonzalo#340 — previously this succeeded and the upsert was refused).
+    let err = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "recycled-space", DIM)
         .await
-        .expect_err("the tombstone's window must still refuse a create");
+        .expect_err("the tombstone's window must still refuse an open");
     assert!(
-        matches!(&err, CoreError::Invalid(m) if m == MANIFEST_TOMBSTONE_RECREATE_REJECTED),
+        matches!(&err, CoreError::Invalid(m) if m.contains(MANIFEST_TOMBSTONE_RECREATE_REJECTED)),
         "got {err:?}"
     );
-    drop(blocked);
 
     // Past the horizon: collect removes the tombstone, and with it the window.
     let collected = collect(&store, &KeyPrefix::default(), Duration::ZERO, now_ms() + 1)
@@ -245,5 +240,69 @@ async fn after_collect_removes_the_tombstone_a_fresh_index_can_be_created() {
         .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe)])
         .await
         .expect("with no tombstone there is no window to protect");
+    assert_eq!(fresh.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
+}
+
+/// gonzalo#340's trigger must match `plan_put`'s, which keys on the tombstone's
+/// `deleted_kind`. A tombstone written before gonzalo#327 carries `None` there
+/// and retains no body, so there is no restore window to protect and
+/// `plan_put` lets a create through. `open` must therefore let it through too —
+/// refusing on *any* tombstone would strand such a key, unwritable, with
+/// nothing to restore.
+#[tokio::test]
+async fn open_over_a_tombstone_with_no_restore_window_starts_fresh() {
+    let dir = TempDir::new().unwrap();
+    let store = FsStore::new(dir.path());
+    let key = VectorManifest::key("ns", "legacy");
+
+    let mut probe = vec![0.0; DIM];
+    probe[3] = 1.0;
+
+    let idx = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "legacy-space", DIM)
+        .await
+        .unwrap();
+    idx.upsert_many(vec![(RecordKey::new("ns", "coll", "a"), probe.clone())])
+        .await
+        .unwrap();
+    drop(idx);
+    let _ = store.delete(&key, None).await.unwrap();
+
+    // Rewrite the tombstone into the shape gonzalo#327 predates: no retained
+    // body, no `deleted_kind`. `put_raw` stores it verbatim, which is the same
+    // path replication uses.
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(tomb.deleted_kind, Some(RecordKind::VectorManifest));
+    let legacy = gonzalo_core::Record {
+        body: Body::Inline(Vec::new()),
+        deleted_kind: None,
+        ..tomb.clone()
+    };
+    assert!(matches!(
+        store
+            .put_raw(legacy, Some(tomb.revision.clone()))
+            .await
+            .unwrap(),
+        PutResult::Committed(_)
+    ));
+    let rewritten = store.get_raw(&key).await.unwrap().unwrap();
+    assert!(rewritten.is_tombstone(), "still a tombstone");
+    assert_eq!(rewritten.deleted_kind, None, "no restore window");
+
+    // `open` starts fresh rather than refusing...
+    let fresh = RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "legacy-space", DIM)
+        .await
+        .expect("a tombstone with no restore window must not refuse open");
+    assert!(
+        fresh.keys(&KeyPrefix::default()).await.unwrap().is_empty(),
+        "a fresh index starts empty"
+    );
+
+    // ...and the first commit goes out as a create, which `plan_put` accepts.
+    // This is what pins `last_seen` staying `None`: naming the tombstone's
+    // revision instead would make `plan_put` answer `NotFound`.
+    fresh
+        .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe)])
+        .await
+        .expect("the first commit must land as a create");
     assert_eq!(fresh.keys(&KeyPrefix::default()).await.unwrap().len(), 1);
 }

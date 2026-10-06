@@ -146,10 +146,9 @@ walks through the order.
 Deleting a vector index (or a code-graph view) is recoverable within the
 collection horizon: the manifest's tombstone keeps the manifest body, so its
 shards stay marked and `gonzalo undelete` restores it
-([ADR 0029](./adr/0029-manifest-tombstone-pin.md)). Reopening a deleted index
-succeeds, but its first commit is refused, so the restore window survives; the two
-ways out (`undelete` or `purge`) are in
-[Deletion](./deletion.md#deleting-an-index-and-getting-it-back).
+([ADR 0029](./adr/0029-manifest-tombstone-pin.md)). Reopening a deleted index is
+refused, so the restore window survives; the two ways out (`undelete` or `purge`)
+are in [Deletion](./deletion.md#deleting-an-index-and-getting-it-back).
 
 ## Vector search and embeddings
 

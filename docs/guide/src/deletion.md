@@ -319,10 +319,11 @@ fails until you do one of those for each manifest key. `gonzalo index --watch`
 logs the refusal as a failed re-index on every debounce tick and reconcile, and
 keeps retrying until the key is purged or undeleted.
 
-> **Note.** `RecordVectorIndex::open` still succeeds over a deleted index, because
-> it reads without seeing tombstones. The refusal arrives at the first commit
-> instead (gonzalo#340). A refused upsert can leave one orphaned shard blob,
-> which the next `gonzalo gc` reclaims.
+> **Note.** `RecordVectorIndex::open` refuses a deleted index outright, naming
+> the key and the same two ways out (gonzalo#340) — so the call that was wrong is
+> the one that fails, rather than a later commit. A commit refused on a handle
+> that was already open when the delete landed can still leave one orphaned shard
+> blob, which the next `gonzalo gc` reclaims.
 
 > **Warning.** Upgrade every binary that runs `gonzalo gc` against a store
 > before you rely on this pin. An older binary reads a tombstone that carries

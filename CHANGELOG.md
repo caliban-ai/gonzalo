@@ -149,6 +149,22 @@ the patch version for fixes.
 
 ### Changed
 
+- **BREAKING: `RecordVectorIndex::open` refuses a deleted index.** Opening an
+  index whose manifest is tombstoned used to succeed, hand back a handle onto an
+  empty in-memory index, and fail only at the first commit — so an operator who
+  deleted an index and restarted saw `open` succeed, queries return nothing, and
+  the real explanation arrive on the next upsert. `open` now reads raw and errors
+  with `CoreError::Invalid`, naming the key and the two ways out (`gonzalo
+  undelete`, `gonzalo purge`). The trigger is the same condition `plan_put` uses
+  — the stored tombstone's `deleted_kind` naming a manifest kind — so `open`
+  refuses exactly when the first commit would have, and a tombstone with no
+  restore window (written before #327) still opens fresh rather than stranding
+  the key. There is deliberately no flag to skip the refusal: a caller starting
+  over purges first, which keeps discarding a restore window one explicit
+  operator action. One side benefit: a refused reopen now stages no shard blob,
+  where the commit-time refusal left one orphan for `gc`.
+  ([ADR 0029](docs/adr/0029-manifest-tombstone-pin.md),
+  [ADR 0030](docs/adr/0030-manifest-tombstone-recreate-guard.md), #340)
 - **BREAKING: the raw replication write requires an admin token.**
   `PUT /v1/raw/records/{ns}/{col}/{id}` and the `PutRaw` RPC authorized `write`
   on the namespace; they now require admin, matching `POST /v1/purge/...` and
