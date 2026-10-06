@@ -165,13 +165,11 @@ async fn undelete_refuses_when_a_named_blob_is_missing() {
     );
 }
 
-// Someone recreated the key while the operator was deciding. The live-record
-// guard is what fires here: `undelete` reads the key and finds a non-tombstone.
-// (`put_raw` returning Conflict is the narrower race where a recreate lands
-// between that read and the write; a single-threaded test cannot reach it, so
-// nothing below asserts on it.)
+// The key was brought back to life while the operator was deciding (by replication,
+// since a consumer put can no longer recreate over a manifest tombstone, #333).
+// `undelete` must refuse rather than clobber the live record.
 #[tokio::test]
-async fn undelete_refuses_when_the_key_was_recreated() {
+async fn undelete_refuses_a_live_record_and_leaves_it_alone() {
     let (store, _shard) = store_with_index().await;
     let _ = store.delete(&manifest_key(), None).await.unwrap();
 
@@ -196,7 +194,14 @@ async fn undelete_refuses_when_the_key_was_recreated() {
     let err = undelete(&store, &manifest_key(), 9_000, None)
         .await
         .unwrap_err();
-    assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+    // This is `undelete`'s "record is live" refusal, nothing recreation-specific:
+    // an undelete of a never-deleted key gets the same one. The narrower `put_raw`
+    // Conflict (a recreate between the read and the write) is not reachable
+    // single-threaded.
+    assert!(
+        matches!(&err, CoreError::Invalid(m) if m.contains("is live at revision") && m.contains("nothing to restore")),
+        "got {err:?}"
+    );
     let live = store.get(&manifest_key()).await.unwrap().unwrap();
     assert_eq!(
         live.kind,
