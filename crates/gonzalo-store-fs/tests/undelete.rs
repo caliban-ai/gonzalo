@@ -115,10 +115,16 @@ async fn undelete_refuses_when_there_is_no_tombstone() {
 #[tokio::test]
 async fn undelete_refuses_when_the_record_is_live() {
     let (store, _shard) = store_with_index().await;
+    let before = store.get(&manifest_key()).await.unwrap().unwrap();
     let err = undelete(&store, &manifest_key(), 9_000, None)
         .await
         .unwrap_err();
-    assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+    assert!(
+        matches!(&err, CoreError::Invalid(m) if m.contains("is live at revision") && m.contains("nothing to restore")),
+        "got {err:?}"
+    );
+    // A refused undelete must not damage the live record.
+    assert_eq!(store.get(&manifest_key()).await.unwrap().unwrap(), before);
 }
 
 // A kind whose body was never retained cannot be restored. This is the stated
@@ -162,50 +168,5 @@ async fn undelete_refuses_when_a_named_blob_is_missing() {
     assert!(
         store.get(&manifest_key()).await.unwrap().is_none(),
         "nothing was written"
-    );
-}
-
-// The key was brought back to life while the operator was deciding (by replication,
-// since a consumer put can no longer recreate over a manifest tombstone, #333).
-// `undelete` must refuse rather than clobber the live record.
-#[tokio::test]
-async fn undelete_refuses_a_live_record_and_leaves_it_alone() {
-    let (store, _shard) = store_with_index().await;
-    let _ = store.delete(&manifest_key(), None).await.unwrap();
-
-    // A consumer `put` can no longer create over a manifest tombstone (#333), so
-    // the recreation arrives the way a replicated write does: naming the
-    // tombstone's revision.
-    let tomb = store.get_raw(&manifest_key()).await.unwrap().unwrap();
-    let mut replacement = Record::create(
-        manifest_key(),
-        RecordKind::Topic,
-        Body::Inline(b"{}".to_vec()),
-        meta(),
-    );
-    replacement.revision = tomb.revision.next(replacement.body.bytes());
-    replacement.parent = Some(tomb.revision.clone());
-    replacement.ancestors = vec![tomb.revision.clone()];
-    let _ = store
-        .put_raw(replacement, Some(tomb.revision.clone()))
-        .await
-        .unwrap();
-
-    let err = undelete(&store, &manifest_key(), 9_000, None)
-        .await
-        .unwrap_err();
-    // This is `undelete`'s "record is live" refusal, nothing recreation-specific:
-    // an undelete of a never-deleted key gets the same one. The narrower `put_raw`
-    // Conflict (a recreate between the read and the write) is not reachable
-    // single-threaded.
-    assert!(
-        matches!(&err, CoreError::Invalid(m) if m.contains("is live at revision") && m.contains("nothing to restore")),
-        "got {err:?}"
-    );
-    let live = store.get(&manifest_key()).await.unwrap().unwrap();
-    assert_eq!(
-        live.kind,
-        RecordKind::Topic,
-        "the live record was not clobbered"
     );
 }
