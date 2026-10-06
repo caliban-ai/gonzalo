@@ -159,7 +159,41 @@ impl Service {
 
     /// Physically remove the record at `key` iff its current revision is
     /// `expected`. The only physical removal in the system.
+    ///
+    /// **Refuses to remove a live record (gonzalo#341)**, as `gonzalo purge`
+    /// does, so the daemon and the CLI — the system's two operator surfaces —
+    /// agree. `plan_purge` is kind-blind and removes whatever matches the
+    /// revision, and purging a *live* record leaves no tombstone behind, so a
+    /// peer that has not synced since would resurrect it: the exact failure
+    /// tombstones exist to prevent (ADR 0021).
+    ///
+    /// The refusal is deliberately narrow — only a revision that *matches* a
+    /// live record, which is the only call that would actually remove one. Two
+    /// neighbouring cases must keep their existing answers, because tombstone
+    /// collection depends on both:
+    ///
+    /// - A **mismatched** revision over a live record is `collect` losing an OCC
+    ///   race to a recreate between listing and purging. `plan_purge` answers
+    ///   `Conflict` and removes nothing, which `collect` records in
+    ///   `CollectReport::conflicts`; refusing here instead would fail the whole
+    ///   run (`conformance::purge_conflicts_after_recreation`).
+    /// - A key that is **already gone** still reports `Deleted`, so re-running
+    ///   collection after a partial run stays safe.
     pub async fn purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult> {
+        let Some(current) = self.store.get_raw(key).await? else {
+            // Nothing stored: `plan_purge` answers `Deleted`, which is what
+            // keeps a re-run of collection safe. Let it.
+            return self.store.purge(key, expected).await;
+        };
+        if !current.is_tombstone() && current.revision == expected {
+            return Err(CoreError::Invalid(format!(
+                "{key} is live at revision {}; purge only discards an existing \
+                 tombstone. To remove the record use `gonzalo delete`: it keeps \
+                 a restore window for manifest kinds, and purging that tombstone \
+                 would discard it.",
+                current.revision.counter
+            )));
+        }
         self.store.purge(key, expected).await
     }
 
