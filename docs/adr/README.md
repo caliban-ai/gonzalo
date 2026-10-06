@@ -53,7 +53,8 @@ changes gets a *new* ADR that supersedes the old one, and the old one is marked
 | [0026](0026-grouped-facade-surface.md) | A grouped facade surface | accepted |
 | [0027](0027-durable-vector-index.md) | A durable vector index | accepted (GC-during-commit window narrowed for live writers by [0028](0028-blob-gc-grace-period.md)) |
 | [0028](0028-blob-gc-grace-period.md) | A grace period for blob garbage collection | accepted |
-| [0029](0029-manifest-tombstone-pin.md) | Manifest tombstones retain their body, and `undelete` restores it | accepted |
+| [0029](0029-manifest-tombstone-pin.md) | Manifest tombstones retain their body, and `undelete` restores it | accepted (recreate hazard closed by [0030](0030-manifest-tombstone-recreate-guard.md)) |
+| [0030](0030-manifest-tombstone-recreate-guard.md) | A create over a manifest tombstone is refused, and `gonzalo purge` discards one deliberately | accepted |
 
 ## Adding a new ADR
 

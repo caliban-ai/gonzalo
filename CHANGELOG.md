@@ -11,6 +11,10 @@ the patch version for fixes.
 
 ### Added
 
+- **`gonzalo purge`** removes one tombstone, discarding its restore window. It
+  refuses a live record and an absent key (exit 1), takes no prompt, and prints
+  the key and revision. ([ADR 0030](docs/adr/0030-manifest-tombstone-recreate-guard.md),
+  #333)
 - **Deleting a manifest is now recoverable.** `Record` gains an additive
   `deleted_kind` field (tombstones only; absent on every existing record). A
   `GraphManifest` or `VectorManifest` tombstone now retains the deleted body
@@ -18,8 +22,8 @@ the patch version for fixes.
   deleted index's slices or shards survive until `collect` removes the
   tombstone. `gonzalo_core::undelete`, the `gonzalo undelete` subcommand and the
   facade re-export restore a manifest from its tombstone, preserving
-  `meta.created`. Reopening a deleted vector index before undeleting it
-  discards the tombstone, and so does any other `put` that creates at the key.
+  `meta.created`. A `put` that creates over a manifest tombstone is
+  refused (see below).
   An older binary's `gc` does not read `deleted_kind` and frees the shards the
   tombstone pins, so upgrade every binary that runs `gc` against a store first.
   ([ADR 0029](docs/adr/0029-manifest-tombstone-pin.md),
@@ -145,6 +149,18 @@ the patch version for fixes.
 
 ### Changed
 
+- **A `put` that creates over a manifest tombstone is now refused.** A consumer
+  create (`expected: None`) at a key holding a `GraphManifest` or
+  `VectorManifest` tombstone used to succeed, overwriting the tombstone and
+  discarding the retained body and the shard pin. It now fails with
+  `CoreError::Invalid` (HTTP 400 / gRPC `InvalidArgument`), naming
+  `gonzalo undelete` and `gonzalo purge`. This affects `RecordVectorIndex`
+  commits and `gonzalo index` over a deleted manifest, so `gonzalo reset`
+  followed by `gonzalo index` now needs a purge or undelete first. Replication
+  writes and `undelete` are unchanged. `RecordVectorIndex::open` still succeeds
+  and fails at its first commit (gonzalo#340), and the daemon's admin purge
+  route does not check for a live record (gonzalo#341).
+  ([ADR 0030](docs/adr/0030-manifest-tombstone-recreate-guard.md), #333)
 - **BREAKING: `gonzalo_core::unreferenced_slices` and
   `gonzalo_core::live_slice_hashes` are removed.** After #325 rewrote the
   sweep, neither had a caller outside its own unit tests — `live_blob_hashes`

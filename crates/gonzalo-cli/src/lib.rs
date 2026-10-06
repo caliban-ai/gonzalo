@@ -1176,7 +1176,7 @@ pub async fn undelete(
 /// without this check an operator could physically delete a live record
 /// leaving no tombstone, which a peer that had not synced since would
 /// resurrect (ADR 0021). Core keeps its contract because `collect` depends on
-/// it; the check belongs here, at the operator surface.
+/// it; the check belongs here, at the operator surface (ADR 0030).
 ///
 /// Benign race: a concurrent `collect` that purges the same key first makes
 /// the plan a no-op, which `Store::purge` reports as success, so this can

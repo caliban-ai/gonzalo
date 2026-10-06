@@ -12,6 +12,10 @@
 
 Neither ADR is superseded; both stay `accepted`.
 
+**Amended by** [ADR 0030](0030-manifest-tombstone-recreate-guard.md), which refuses a
+consumer create over a manifest tombstone and so closes the recreate hazard
+below.
+
 ## Context
 
 ADR 0024 gives deletion three steps: `delete` writes a tombstone that **pins**
@@ -136,31 +140,14 @@ mean different things depending on whether `collect` had run. Only an explicit
 - **Positive:** the fix adds no wire surface, trait method or planner arm. Old
   records read unchanged, and a tombstone written before this one marks nothing,
   as it did not before.
-- **Negative:** **any `put` that creates over a manifest tombstone destroys its
-  recoverability, and the most natural recovery attempt does exactly that.**
-  A consumer `put` with `expected: None` over a tombstone takes `plan_put`'s
-  recreation arm (`crates/gonzalo-core/src/tombstone.rs`), which overwrites the
-  tombstone, re-stamps `meta.created` and clears the retained body, whichever
-  caller issued it. The severe case is `RecordVectorIndex::open`
-  (`crates/gonzalo-vector/src/record_index.rs`), which reads
-  with `store.get`, which hides tombstones, so opening the key of a deleted
-  index does not fail: it silently builds a fresh, empty manifest. That
-  manifest's first commit goes through `store.put(record, None)` into
-  `plan_put`'s recreation arm, which overwrites the tombstone, re-stamps
-  `meta.created` and clears the retained body. The shard pin and the restore
-  window go with it. The most likely operator action after an accidental delete
-  is to restart the application and reopen the index, and that is the action
-  that makes `undelete` impossible. Run `gonzalo undelete` **before** anything
-  opens the key. A second live path is the indexer: `gonzalo index`
-  (`crates/gonzalo-cli/src/lib.rs`) derives `expected` from a consumer `get`,
-  which sees no record under a tombstone, so indexing a `GraphManifest` key
-  after `gonzalo delete` takes the same arm. The stakes are lower there, since
-  graph slices regenerate from source, but the restore window is gone all the
-  same. The vector case is the severe one because shards cannot be regenerated.
-  #333 tracks it. The deliberate decision here was to document the hazard
-  rather than change `open`, because the consumer read path (exposing a
-  tombstone to `open`, or letting `put` name one) is out of this change's
-  scope.
+- **Negative:** **a `RecordVectorIndex` opened over a manifest tombstone still
+  opens successfully.** `RecordVectorIndex::open`
+  (`crates/gonzalo-vector/src/record_index.rs`) reads with `store.get`, which
+  hides tombstones, so it builds a fresh empty manifest and fails only at its
+  first commit. A `put` that creates over a manifest tombstone is refused
+  ([ADR 0030](0030-manifest-tombstone-recreate-guard.md)), so the restore
+  window survives the attempt, and `gonzalo undelete` still works afterwards.
+  The late failure is tracked in gonzalo#340.
 - **Negative:** **a divergent delete can drop a pin early.** When two peers
   delete *different revisions* of the same manifest key, sync's
   diverged-tombstone merge calls `tombstone_winner`

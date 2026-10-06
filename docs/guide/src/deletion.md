@@ -306,13 +306,41 @@ nothing and exits non-zero when:
   and collected index also used. The message names the hashes;
 - the key was re-created since the delete.
 
-> **Warning.** Do not reopen a deleted index before you undelete it.
-> `RecordVectorIndex::open` does not see tombstones, so opening a deleted
-> key quietly starts a new empty index, and its first commit overwrites the
-> tombstone, taking the retained body and the chance to restore with it.
-> Run `gonzalo undelete` first. The same is true of anything else that creates
-> a record at that key: `gonzalo index` run against a deleted graph manifest
-> overwrites its tombstone in the same way.
+A write that would **create** a record over a manifest tombstone is refused, so
+the restore window cannot be destroyed by accident
+([ADR 0030](./adr/0030-manifest-tombstone-recreate-guard.md)). That covers
+reopening a deleted vector index and running `gonzalo index` against a deleted
+graph manifest. The write fails with an invalid-argument error (HTTP 400 over the
+daemon) naming the two ways out: `gonzalo undelete` to restore the manifest, or
+`gonzalo purge` to discard it. After `gonzalo reset`, indexing again therefore
+fails until you do one of those for each manifest key.
+
+> **Note.** `RecordVectorIndex::open` still succeeds over a deleted index, because
+> it reads without seeing tombstones. The refusal arrives at the first commit
+> instead (gonzalo#340). A refused upsert can leave one orphaned shard blob,
+> which the next `gonzalo gc` reclaims.
+
+### Discarding a tombstone: `gonzalo purge`
+
+To give up on a deleted manifest, and let a new index be created at its key,
+remove the tombstone for that one key:
+
+```sh
+gonzalo purge --root ~/.gonzalo --namespace vectors --collection indexes --id docs
+```
+
+```text
+purged: vectors/indexes/docs
+revision: {"counter":4,"hash":"…"}
+```
+
+This discards the restore window, so there is no prompt and no `--yes`; run
+`undelete` first if you might want the index back. `purge` refuses a record that
+is **live** (exit `1`), because removing a live record would leave no tombstone
+for a peer to respect and the record could come back on the next sync. Use
+`gonzalo delete` for that. A key that does not exist is also an error (exit `1`),
+unlike `delete`, which is idempotent. Over a daemon, the purge route needs an
+admin token and does not make the live-record check (gonzalo#341).
 
 > **Warning.** Upgrade every binary that runs `gonzalo gc` against a store
 > before you rely on this pin. An older binary reads a tombstone that carries

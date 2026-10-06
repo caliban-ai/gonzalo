@@ -31,6 +31,7 @@ alongside them. `gonzalo-mcp` reads the same root through `GONZALO_ROOT`.
 | `gonzalo sync <root-a> <root-b>` | two-way sync of two filesystem stores |
 | `gonzalo delete --root R --namespace N --collection C --id I [--expected REV]` | write a tombstone for one record (replicates on sync); `--expected` is the `revision` object from `gonzalo get`'s JSON output (e.g. `{"counter":3,"hash":"…"}`) |
 | `gonzalo undelete --root R --namespace N --collection C --id I` | restore a deleted manifest (graph or vector index) from its tombstone, before `collect` purges it; see [Deleting an index, and getting it back](./deletion.md#deleting-an-index-and-getting-it-back) |
+| `gonzalo purge --root R --namespace N --collection C --id I` | physically remove one tombstone, discarding its restore window; refuses a live record and an absent key (exit 1); see [Discarding a tombstone](./deletion.md#discarding-a-tombstone-gonzalo-purge) |
 | `gonzalo reset --root R --namespace N [--collection C]` | tombstone every live record in a namespace or collection; idempotent, re-run to finish |
 | `gonzalo collect --root R --older-than 30d [--namespace N [--collection C]]` | physically purge tombstones at least that old; choose a horizon longer than any peer's longest gap between syncs |
 
