@@ -119,7 +119,9 @@ over the old delete everywhere it syncs. Gonzalo sets the new record's revision 
 that it comes after the delete. Programs writing through the API should use the
 revision the write returns, not the one they built themselves. A conditional write
 that names a revision to a deleted key fails with "not found", because to an
-application the key doesn't exist. Write it unconditionally to recreate it.
+application the key doesn't exist. Write it unconditionally to recreate it. The one exception is a deleted graph or
+vector manifest, where the create is refused; see
+[Deleting an index, and getting it back](#deleting-an-index-and-getting-it-back).
 
 ## Resetting a namespace
 
@@ -320,6 +322,20 @@ fails until you do one of those for each manifest key.
 > instead (gonzalo#340). A refused upsert can leave one orphaned shard blob,
 > which the next `gonzalo gc` reclaims.
 
+> **Warning.** Upgrade every binary that runs `gonzalo gc` against a store
+> before you rely on this pin. An older binary reads a tombstone that carries
+> `deleted_kind` without complaint, but it does not mark through the retained
+> body, so its `gc` frees the very shards the tombstone protects, and a vector
+> index's shards cannot be regenerated. Sync copies records, not blobs, so
+> peers with separate blob stores are not exposed; the risk is one store root
+> run by two binary versions.
+
+If two peers delete different revisions of the same manifest, sync keeps the
+newer tombstone and drops the other, so shards that only the older revision named
+lose their pin early. The surviving tombstone is still a complete manifest.
+If the two tombstones sit at the same counter, each peer keeps its own and they
+do not converge on one body; see [ADR 0029](./adr/0029-manifest-tombstone-pin.md).
+
 ### Discarding a tombstone: `gonzalo purge`
 
 To give up on a deleted manifest, and let a new index be created at its key,
@@ -341,20 +357,6 @@ for a peer to respect and the record could come back on the next sync. Use
 `gonzalo delete` for that. A key that does not exist is also an error (exit `1`),
 unlike `delete`, which is idempotent. Over a daemon, the purge route needs an
 admin token and does not make the live-record check (gonzalo#341).
-
-> **Warning.** Upgrade every binary that runs `gonzalo gc` against a store
-> before you rely on this pin. An older binary reads a tombstone that carries
-> `deleted_kind` without complaint, but it does not mark through the retained
-> body, so its `gc` frees the very shards the tombstone protects, and a vector
-> index's shards cannot be regenerated. Sync copies records, not blobs, so
-> peers with separate blob stores are not exposed; the risk is one store root
-> run by two binary versions.
-
-If two peers delete different revisions of the same manifest, sync keeps the
-newer tombstone and drops the other, so shards that only the older revision named
-lose their pin early. The surviving tombstone is still a complete manifest.
-If the two tombstones sit at the same counter, each peer keeps its own and they
-do not converge on one body; see [ADR 0029](./adr/0029-manifest-tombstone-pin.md).
 
 ## Ancestor cap
 

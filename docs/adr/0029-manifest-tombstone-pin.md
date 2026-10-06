@@ -14,7 +14,7 @@ Neither ADR is superseded; both stay `accepted`.
 
 **Amended by** [ADR 0030](0030-manifest-tombstone-recreate-guard.md), which refuses a
 consumer create over a manifest tombstone and so closes the recreate hazard
-below.
+this ADR originally documented.
 
 ## Context
 
@@ -207,7 +207,8 @@ mean different things depending on whether `collect` had run. Only an explicit
 - Manifest tombstones grow costly: a very large shard count, or very many
   deleted indexes inside one horizon.
 - `put` ever needs to express succession explicitly, which reopens the
-  consumer-path question, and would be the principled alternative to the
+  question of how a consumer write may name a tombstone (decided in ADR 0030 by
+  refusing the create), and would be the principled alternative to the
   refusal in [ADR 0030](0030-manifest-tombstone-recreate-guard.md).
 - A divergent delete dropping a pin early, or an older binary's `gc` freeing
   pinned shards, is observed in practice.
