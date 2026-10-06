@@ -207,6 +207,7 @@ mean different things depending on whether `collect` had run. Only an explicit
 - Manifest tombstones grow costly: a very large shard count, or very many
   deleted indexes inside one horizon.
 - `put` ever needs to express succession explicitly, which reopens the
-  consumer-path question and is also the natural fix for the reopen hazard
-  above.
-- Either operator hazard above is observed in practice.
+  consumer-path question, and would be the principled alternative to the
+  refusal in [ADR 0030](0030-manifest-tombstone-recreate-guard.md).
+- A divergent delete dropping a pin early, or an older binary's `gc` freeing
+  pinned shards, is observed in practice.
