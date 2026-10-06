@@ -175,13 +175,23 @@ async fn undelete_refuses_when_the_key_was_recreated() {
     let (store, _shard) = store_with_index().await;
     let _ = store.delete(&manifest_key(), None).await.unwrap();
 
-    let replacement = Record::create(
+    // A consumer `put` can no longer create over a manifest tombstone (#333), so
+    // the recreation arrives the way a replicated write does: naming the
+    // tombstone's revision.
+    let tomb = store.get_raw(&manifest_key()).await.unwrap().unwrap();
+    let mut replacement = Record::create(
         manifest_key(),
         RecordKind::Topic,
         Body::Inline(b"{}".to_vec()),
         meta(),
     );
-    let _ = store.put(replacement, None).await.unwrap();
+    replacement.revision = tomb.revision.next(replacement.body.bytes());
+    replacement.parent = Some(tomb.revision.clone());
+    replacement.ancestors = vec![tomb.revision.clone()];
+    let _ = store
+        .put_raw(replacement, Some(tomb.revision.clone()))
+        .await
+        .unwrap();
 
     let err = undelete(&store, &manifest_key(), 9_000, None)
         .await
