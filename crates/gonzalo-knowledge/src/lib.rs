@@ -97,6 +97,23 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
     /// indexing) if the record is absent or its kind is definitionally not
     /// knowledge-bearing; returns `Err` if a knowledge-bearing body fails to
     /// parse — a corrupt record is a real failure, not "not indexable" (#139).
+    ///
+    /// **One batch per record, not one call per chunk** (gonzalo#326). On a
+    /// durable index every `upsert` is a full OCC commit — re-serialise the
+    /// shard, upload it as a blob, write a new manifest revision — so a
+    /// three-chunk record used to advance the manifest three times and leave two
+    /// superseded shard blobs for `gc`. Every chunk is now embedded first, then
+    /// written with one [`VectorIndex::upsert_many`]. A consequence of embedding
+    /// first: if an embedding fails part way, nothing is written at all, where
+    /// before the earlier chunks were already committed.
+    ///
+    /// The orphan removals below are **not** batched yet. Both candidate shapes
+    /// — a `remove_many` on the trait, or folding removals into the upsert
+    /// commit — add a `VectorIndex` method, and `cargo publish --workspace
+    /// --dry-run` verifies each packaged crate against the *published*
+    /// `gonzalo-vector`, so a new trait method cannot be called from this crate
+    /// until the workspace version is bumped. Orphans only occur when a record
+    /// shrinks, so the common path commits once either way. Tracked separately.
     pub async fn ingest(&self, key: &gonzalo_core::RecordKey) -> Result<bool> {
         let Some(record) = self.store.get(key).await? else {
             return Ok(false);
@@ -115,9 +132,12 @@ impl<S: Store, V: VectorIndex, E: Embedder> KnowledgeStore<S, V, E> {
             self.index.remove(&chunk_key(key, ordinal)).await?;
         }
 
+        let mut items = Vec::with_capacity(chunks.len());
         for (ordinal, text) in chunks.iter().enumerate() {
-            let vector = self.embedder.embed(text).await?;
-            self.index.upsert(chunk_key(key, ordinal), vector).await?;
+            items.push((chunk_key(key, ordinal), self.embedder.embed(text).await?));
+        }
+        if !items.is_empty() {
+            self.index.upsert_many(items).await?;
         }
 
         self.chunk_counts
@@ -543,6 +563,172 @@ mod tests {
             store.put(rec, None).await.unwrap(),
             PutResult::Committed(_)
         ));
+    }
+
+    // --- gonzalo#326: ingest batches its index writes ---
+
+    /// Counts how `KnowledgeStore` actually drives the index, so a regression to
+    /// per-chunk upserts fails here rather than only showing up as extra
+    /// manifest revisions on a durable backend.
+    #[derive(Default)]
+    struct CountingIndex {
+        inner: MemoryVectorIndex,
+        upsert: std::sync::atomic::AtomicUsize,
+        upsert_many: std::sync::atomic::AtomicUsize,
+        remove: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingIndex {
+        /// `(upsert, upsert_many, remove)` call counts.
+        fn counts(&self) -> (usize, usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.upsert.load(SeqCst),
+                self.upsert_many.load(SeqCst),
+                self.remove.load(SeqCst),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl gonzalo_vector::VectorIndex for CountingIndex {
+        async fn upsert(&self, key: RecordKey, vector: Vec<f32>) -> Result<()> {
+            self.upsert
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.upsert(key, vector).await
+        }
+        async fn remove(&self, key: &RecordKey) -> Result<()> {
+            self.remove
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.remove(key).await
+        }
+        async fn query(
+            &self,
+            query: &[f32],
+            k: usize,
+            filter: &KeyPrefix,
+        ) -> Result<Vec<gonzalo_vector::Match>> {
+            self.inner.query(query, k, filter).await
+        }
+        async fn keys(&self, filter: &KeyPrefix) -> Result<Vec<RecordKey>> {
+            self.inner.keys(filter).await
+        }
+        async fn upsert_many(&self, items: Vec<(RecordKey, Vec<f32>)>) -> Result<()> {
+            self.upsert_many
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.upsert_many(items).await
+        }
+    }
+
+    fn topic_record(key: &RecordKey, bullets: &[&str]) -> Record {
+        record(
+            key,
+            RecordKind::Topic,
+            Topic {
+                slug: key.id.clone(),
+                bullets: bullets.iter().map(|b| (*b).to_string()).collect(),
+            }
+            .to_body()
+            .unwrap(),
+        )
+    }
+
+    /// A three-chunk record is one batched upsert, not three.
+    #[tokio::test]
+    async fn ingest_batches_a_records_chunks_into_one_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+        let key = RecordKey::new("caliban", "topics", "rust");
+        put(
+            &store,
+            topic_record(&key, &["alpha one", "beta two", "gamma three"]),
+        )
+        .await;
+
+        let index = std::sync::Arc::new(CountingIndex::default());
+        let ks = KnowledgeStore::new(store, std::sync::Arc::clone(&index), Bow);
+        assert!(ks.ingest(&key).await.unwrap());
+
+        assert_eq!(
+            index.counts(),
+            (0, 1, 0),
+            "one batch for the whole record, no per-chunk upsert"
+        );
+        assert_eq!(index.keys(&KeyPrefix::default()).await.unwrap().len(), 3);
+    }
+
+    /// A re-ingest after a shrink is still one batched upsert. The orphan
+    /// removals remain one call each — see `ingest`'s note on why batching them
+    /// waits on a workspace version bump — so this pins the current shape rather
+    /// than claiming they are batched.
+    #[tokio::test]
+    async fn re_ingest_after_a_shrink_batches_the_upserts_and_drops_the_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+        let key = RecordKey::new("caliban", "topics", "rust");
+        put(
+            &store,
+            topic_record(&key, &["alpha one", "beta two", "gamma three"]),
+        )
+        .await;
+
+        let index = std::sync::Arc::new(CountingIndex::default());
+        let ks = KnowledgeStore::new(FsStore::new(dir.path()), std::sync::Arc::clone(&index), Bow);
+        assert!(ks.ingest(&key).await.unwrap());
+
+        // Shrink 3 chunks -> 1, orphaning ordinals 1 and 2.
+        let current = store.get(&key).await.unwrap().unwrap();
+        assert!(matches!(
+            store
+                .put(topic_record(&key, &["alpha one"]), Some(current.revision))
+                .await
+                .unwrap(),
+            PutResult::Committed(_)
+        ));
+        assert!(ks.ingest(&key).await.unwrap());
+
+        let (upsert, upsert_many, remove) = index.counts();
+        assert_eq!(upsert_many, 2, "one batch per ingest");
+        assert_eq!(upsert, 0, "no per-chunk upsert");
+        assert_eq!(remove, 2, "the two orphaned ordinals");
+        assert_eq!(
+            index.keys(&KeyPrefix::default()).await.unwrap().len(),
+            1,
+            "only the surviving chunk is indexed"
+        );
+    }
+
+    /// The claim #326 actually makes, measured on the durable backend: ingesting
+    /// one three-chunk record advances the vector manifest once, not three times.
+    #[tokio::test]
+    async fn ingest_commits_a_durable_manifest_once_per_record() {
+        use gonzalo_vector::RecordVectorIndex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(dir.path());
+        let key = RecordKey::new("caliban", "topics", "rust");
+        put(
+            &store,
+            topic_record(&key, &["alpha one", "beta two", "gamma three"]),
+        )
+        .await;
+
+        let manifest_key = gonzalo_core::VectorManifest::key("caliban", "topics");
+        let index =
+            RecordVectorIndex::open(FsStore::new(dir.path()), manifest_key.clone(), "bow-32", 32)
+                .await
+                .unwrap();
+        let ks = KnowledgeStore::new(FsStore::new(dir.path()), index, Bow);
+
+        assert!(ks.ingest(&key).await.unwrap());
+
+        let manifest = store.get(&manifest_key).await.unwrap().expect("manifest");
+        assert_eq!(
+            manifest.revision.counter, 0,
+            "one commit for a three-chunk record: the first commit on a fresh \
+             manifest lands at counter 0 (`Revision::initial`), so a per-chunk \
+             loop would show 2 here"
+        );
     }
 
     #[tokio::test]

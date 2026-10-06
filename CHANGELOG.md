@@ -311,6 +311,21 @@ the patch version for fixes.
 
 ### Fixed
 
+- **`KnowledgeStore::ingest` committed once per chunk on a durable index.**
+  `ingest` looped `upsert` per chunk. On `MemoryVectorIndex` that is cheap; on
+  the `RecordVectorIndex` added in #323 every call is a full OCC commit —
+  re-serialise the shard, upload it as a blob, write a new manifest revision —
+  so ingesting one three-chunk record advanced the manifest three times and left
+  two superseded shard blobs for `gc`. At the default 256 shards and ~100k
+  vectors a shard is ~600 KB, so that was ~1.8 MB of blob writes for one record.
+  It is now one `upsert_many` per record. One behaviour change falls out: every
+  chunk is embedded before anything is written, so a failing embedding now
+  writes nothing, where before the earlier chunks were already committed.
+  Orphaned chunks (from a record that shrank) are still removed one at a time;
+  batching them needs a new `VectorIndex` method, which cannot be called from
+  `gonzalo-knowledge` until the workspace version is bumped, because
+  `cargo publish --dry-run` verifies each packaged crate against the published
+  `gonzalo-vector`. (#326)
 - **A sweep could delete a blob between a writer's upload and the manifest
   commit naming it.** Both manifest writers upload blobs before committing, so
   a `gonzalo gc` (or `gonzalo index --gc` under `--watch`, which needs no
