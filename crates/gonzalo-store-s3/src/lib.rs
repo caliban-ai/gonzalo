@@ -4,6 +4,8 @@
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::primitives::DateTime;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
@@ -1039,18 +1041,7 @@ impl BlobStore for S3Store {
                 if let Some(k) = obj.key()
                     && let Some(hash) = blob_hash_from_key(k)
                 {
-                    // ListObjectsV2 always carries LastModified; a response
-                    // without one is a malformed listing, not a blob we can
-                    // reason about the age of.
-                    let dt = obj.last_modified().ok_or_else(|| {
-                        CoreError::Backend(format!("blob {k} listed without a LastModified"))
-                    })?;
-                    let modified = SystemTime::try_from(*dt).map_err(|e| {
-                        CoreError::Backend(format!(
-                            "blob {k} has an unrepresentable LastModified: {e}"
-                        ))
-                    })?;
-                    out.push(BlobEntry::from_system_time(hash, modified));
+                    out.push(blob_entry_from_listing(k, hash, obj.last_modified())?);
                 }
             }
             match next_continuation(resp.is_truncated(), resp.next_continuation_token()) {
@@ -1085,11 +1076,18 @@ impl BlobStore for S3Store {
         {
             Ok(_) => Ok(true),
             Err(e) => {
+                // Read the HTTP status before `into_service_error` drops the raw
+                // response; it is the most diagnosable part of a 403 (#330).
+                let status = e.raw_response().map(|r| r.status().as_u16());
                 let svc = e.into_service_error();
-                if svc.is_not_found() || head_means_absent(svc.code().unwrap_or_default()) {
+                if head_error_is_absent(&svc) {
                     Ok(false)
                 } else {
-                    Err(CoreError::Backend(svc.to_string()))
+                    Err(CoreError::Backend(format!(
+                        "head blob {}: {}",
+                        hash.0,
+                        describe_head_error(&svc, status)
+                    )))
                 }
             }
         }
@@ -1101,6 +1099,78 @@ impl BlobStore for S3Store {
 /// is a real error and must not be reported as absence.
 fn head_means_absent(code: &str) -> bool {
     matches!(code, "NotFound" | "NoSuchKey")
+}
+
+/// Whether a `HeadObject` service error means "no such blob".
+///
+/// Split out of [`S3Store::has_blob`] so the *combination* of the two checks is
+/// testable, not just the string half (gonzalo#330). The earlier unit test only
+/// covered [`head_means_absent`], so an edit that mapped `AccessDenied` or a 500
+/// to absence would have passed the suite untouched.
+///
+/// Getting this wrong is asymmetric. Reporting a present blob as absent only
+/// makes a writer re-upload it, never delete it. Reporting a *fault* as absence
+/// is worse: it hides an outage behind a plausible answer, and a GC run that
+/// believes a blob is gone will not re-pin it.
+fn head_error_is_absent(e: &HeadObjectError) -> bool {
+    e.is_not_found() || head_means_absent(e.code().unwrap_or_default())
+}
+
+/// A `HeadObject` failure, described for whoever reads the log.
+///
+/// `HeadObjectError`'s own `Display` renders the `Unhandled` variant as
+/// "unhandled error", which tells an operator nothing about a 403 (gonzalo#330).
+/// Lead with the service's error code and the HTTP status, so the common
+/// misconfigurations — wrong credentials, wrong bucket policy — are readable
+/// from the message alone.
+fn describe_head_error(e: &HeadObjectError, status: Option<u16>) -> String {
+    let code = e.code().unwrap_or("unknown code");
+    let mut out = match status {
+        Some(status) => format!("{code} (HTTP {status})"),
+        None => code.to_string(),
+    };
+    match e.message() {
+        Some(message) => {
+            out.push_str(": ");
+            out.push_str(message);
+        }
+        // No service message: fall back to the SDK's own rendering rather than
+        // stopping at a bare code.
+        None => out.push_str(&format!(": {e}")),
+    }
+    out
+}
+
+/// Map one listed blob object to a [`BlobEntry`].
+///
+/// Split out of `list_blobs` so its two failure branches are reachable from a
+/// unit test (gonzalo#330): the crate has no fake S3 client and its integration
+/// tests need a live endpoint, so otherwise only CI's HA soak exercises this code
+/// at all. Both branches fail the whole listing loudly, which is right — a
+/// listing we cannot date is not one GC should sweep from. Only the
+/// missing-timestamp branch is testable; see the note on the conversion below.
+fn blob_entry_from_listing(
+    key: &str,
+    hash: ContentHash,
+    last_modified: Option<&DateTime>,
+) -> Result<BlobEntry> {
+    // ListObjectsV2 always carries LastModified; a response without one is a
+    // malformed listing, not a blob we can reason about the age of.
+    let dt = last_modified
+        .ok_or_else(|| CoreError::Backend(format!("blob {key} listed without a LastModified")))?;
+    // Unreachable on a 64-bit target, and deliberately kept anyway.
+    // `SystemTime::try_from(DateTime)` fails only if the offset from the epoch
+    // overflows `SystemTime`, and on a 64-bit `timespec` platform both extremes
+    // of the `i64` seconds a `DateTime` can hold convert cleanly -- measured on
+    // the Linux builder: `i64::MAX` yields an entry dated `i64::MAX` ms and
+    // `i64::MIN` one dated `-i64::MAX` ms, neither an error. So no unit test
+    // covers this arm; a 32-bit target is where it earns its keep (gonzalo#330).
+    let modified = SystemTime::try_from(*dt).map_err(|e| {
+        CoreError::Backend(format!(
+            "blob {key} has an unrepresentable LastModified: {e}"
+        ))
+    })?;
+    Ok(BlobEntry::from_system_time(hash, modified))
 }
 
 /// Parse a blob object key `blobs/<hash>` back into a [`ContentHash`]. Returns
@@ -1178,6 +1248,74 @@ mod tests {
         assert!(!head_means_absent("AccessDenied"));
         assert!(!head_means_absent("InternalError"));
         assert!(head_means_absent("NotFound"));
+    }
+
+    /// A `HeadObjectError` carrying `code`, as the SDK builds an unmodelled
+    /// service error. `generic` is the sanctioned constructor; matching the
+    /// `Unhandled` variant directly is deprecated.
+    fn head_error(code: &str) -> HeadObjectError {
+        HeadObjectError::generic(
+            aws_sdk_s3::error::ErrorMetadata::builder()
+                .code(code)
+                .message("from the service")
+                .build(),
+        )
+    }
+
+    // gonzalo#330: the test above only covers the string half of `has_blob`'s
+    // decision. This one covers the predicate `has_blob` actually calls, so an
+    // edit that mapped a fault to `Ok(false)` fails here.
+    #[test]
+    fn only_a_not_found_head_error_is_absence() {
+        // The modelled 404, which `is_not_found()` answers.
+        assert!(head_error_is_absent(&HeadObjectError::NotFound(
+            aws_sdk_s3::types::error::NotFound::builder().build()
+        )));
+        // An unmodelled error whose code still means absence, which only the
+        // `head_means_absent` arm catches.
+        assert!(head_error_is_absent(&head_error("NoSuchKey")));
+
+        // Faults. None of these may be reported as absence.
+        for code in ["AccessDenied", "InternalError", "SlowDown", ""] {
+            assert!(
+                !head_error_is_absent(&head_error(code)),
+                "code {code:?} must not read as absence"
+            );
+        }
+    }
+
+    // gonzalo#330: `HeadObjectError`'s own Display renders an unmodelled error
+    // as "unhandled error", which does not tell an operator a 403 happened.
+    #[test]
+    fn a_head_fault_is_described_with_its_code_and_status() {
+        let msg = describe_head_error(&head_error("AccessDenied"), Some(403));
+        assert!(msg.contains("AccessDenied"), "{msg}");
+        assert!(msg.contains("403"), "{msg}");
+        assert!(msg.contains("from the service"), "{msg}");
+
+        // No status available (a response error, not a service error).
+        let msg = describe_head_error(&head_error("InternalError"), None);
+        assert!(msg.contains("InternalError"), "{msg}");
+        assert!(!msg.contains("HTTP"), "no status should be invented: {msg}");
+    }
+
+    // gonzalo#330: `list_blobs`'s two failure branches. Neither was reachable in
+    // a unit test before, and only CI's HA soak touches `list_blobs` at all.
+    #[test]
+    fn a_listed_blob_without_a_last_modified_fails_the_listing() {
+        let err = blob_entry_from_listing("blobs/abc", ContentHash("abc".into()), None)
+            .expect_err("a listing we cannot date must not be silently dropped");
+        let msg = err.to_string();
+        assert!(msg.contains("blobs/abc"), "{msg}");
+        assert!(msg.contains("without a LastModified"), "{msg}");
+    }
+
+    #[test]
+    fn a_well_formed_listed_blob_maps_to_an_entry() {
+        let dt = DateTime::from_secs(1_700_000_000);
+        let entry = blob_entry_from_listing("blobs/ok", ContentHash("ok".into()), Some(&dt))
+            .expect("a dated blob maps cleanly");
+        assert_eq!(entry.hash, ContentHash("ok".into()));
     }
 
     #[test]

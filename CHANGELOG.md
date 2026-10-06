@@ -327,6 +327,13 @@ the patch version for fixes.
 
 ### Fixed
 
+- **An S3 `HeadObject` fault was described as "unhandled error".** A failed blob
+  presence check surfaced `HeadObjectError`'s own `Display`, which renders the
+  unmodelled variant with no code and no status — so the most common
+  misconfigurations, a 403 from a bucket policy or wrong credentials, were
+  indistinguishable from each other and from anything else. The error now leads
+  with the service's error code and the HTTP status, read off the response before
+  the SDK discards it, and names the blob. (#330)
 - **`KnowledgeStore::ingest` committed once per chunk on a durable index.**
   `ingest` looped `upsert` per chunk. On `MemoryVectorIndex` that is cheap; on
   the `RecordVectorIndex` added in #323 every call is a full OCC commit —
