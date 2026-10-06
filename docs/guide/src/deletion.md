@@ -315,7 +315,9 @@ reopening a deleted vector index and running `gonzalo index` against a deleted
 graph manifest. The write fails with an invalid-argument error (HTTP 400 over the
 daemon) naming the two ways out: `gonzalo undelete` to restore the manifest, or
 `gonzalo purge` to discard it. After `gonzalo reset`, indexing again therefore
-fails until you do one of those for each manifest key.
+fails until you do one of those for each manifest key. `gonzalo index --watch`
+logs the refusal as a failed re-index on every debounce tick and reconcile, and
+keeps retrying until the key is purged or undeleted.
 
 > **Note.** `RecordVectorIndex::open` still succeeds over a deleted index, because
 > it reads without seeing tombstones. The refusal arrives at the first commit

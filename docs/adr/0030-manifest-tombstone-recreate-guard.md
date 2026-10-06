@@ -73,7 +73,8 @@ application and reopen the index, and that is exactly the action that made
 - **Replication and `undelete` are untouched.** `plan_put_raw` is unchanged, so
   a replicated create over a tombstone still `Conflict`s and `undelete` still
   writes through it. A conformance case holds all five substrates to the
-  refusal and asserts the tombstone's revision, retained body and `deleted_kind`
+  refusal (the S3 arm runs only in CI's HA soak job, since it skips without
+  `GONZALO_S3_TEST_ENDPOINT`/`BUCKET`; the ordinary gate covers four substrates) and asserts the tombstone's revision, retained body and `deleted_kind`
   all survive it.
 - **`gonzalo purge --namespace --collection --id`.** It removes one tombstone
   and discards its restore window. It reads raw and refuses anything that is not
@@ -89,7 +90,7 @@ The hazard is a property of the consumer write path, not of one function.
 Guarding `RecordVectorIndex::open` alone would fix the likeliest trigger and
 leave the graph indexer, and every future writer that derives `expected` from a
 consumer `get`, exposed. Putting the check in `plan_put` makes it hold once, for
-every substrate and every caller, and it is the only place that sees the stored
+every substrate and every *consumer* caller (`plan_put_raw` is deliberately untouched, which is what keeps `undelete` and replication working), and it is the only place that sees the stored
 tombstone and the incoming write together.
 
 ### Why both manifest kinds
@@ -145,6 +146,19 @@ refuses a live record and tells them to `delete` it instead.
   resurrection hazard that the CLI check closes. The route arrived with the
   replication surface and predates this decision; closing it is out of scope
   here and is tracked in gonzalo#341.
+- **Negative (known limitation):** **a principal with plain `Write` on a
+  namespace can destroy the restore window through the raw route.**
+  `PUT /v1/raw/records/{ns}/{col}/{id}` authorizes `Access::Write`, not admin
+  (`crates/gonzalo-server/src/http.rs:382-385`; compare `purge_record` at
+  `:420`, which requires admin), and `GET /v1/raw/...` needs only
+  `Access::Read`. A tombstone's revision is `{live_counter + 1,
+  tombstone_hash()}`, and `tombstone_hash()`
+  (`crates/gonzalo-core/src/tombstone.rs:21`) is a constant, so the revision is
+  predictable even without reading it. Such a principal can `put_raw` a fresh
+  empty manifest naming that revision, and the retained body, the pin and
+  `undelete` all go: no race and no admin token. The fix belongs at the route,
+  not in `plan_put_raw`, whose matching-revision arm is what `undelete` rides.
+  Tracked in gonzalo#342, a sibling of #341 that needs lower privilege.
 
 ### Open questions from the ticket
 

@@ -88,6 +88,12 @@ can unpin them at any moment.
 
 ## The guard
 
+> **Note (as shipped).** This design sketches the trigger as
+> `deleted_kind.is_some()`. The shipped guard is narrower: an explicit match on
+> `GraphManifest | VectorManifest`. Do not implement `is_some()`; see
+> [ADR 0030](../../adr/0030-manifest-tombstone-recreate-guard.md) for the
+> narrowing and why.
+
 A new arm in `plan_put`, ahead of the existing recreation arm:
 
 ```rust
