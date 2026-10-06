@@ -142,9 +142,11 @@ pub enum PutPlan {
     /// Persist nothing; return `Err(CoreError::NotFound(key))`.
     NotFound,
     /// The record may not be written through this path; return
-    /// `Err(CoreError::Backend(reason.to_string()))`. Only consumer `plan_put`
-    /// produces this, for a `RecordKind::Tombstone` record: deletes go through
-    /// `Store::delete_as`, and replication writes tombstones through `put_raw`.
+    /// `Err(CoreError::Invalid(reason.to_string()))` (the daemon answers 400,
+    /// not 500; gonzalo#299). Only consumer `plan_put` produces this: for a
+    /// `RecordKind::Tombstone` record (deletes go through `Store::delete_as`,
+    /// and replication writes tombstones through `put_raw`), and for a create
+    /// over a manifest tombstone, which would discard its restore window.
     Rejected(&'static str),
 }
 
@@ -157,14 +159,21 @@ pub const CONSUMER_TOMBSTONE_REJECTED: &str =
 /// rejected (see [`PutPlan::Rejected`]). A manifest tombstone retains the
 /// deleted body, which is the restore window ADR 0029 promises; overwriting it
 /// would unpin blobs that may be unregenerable (ADR 0030).
-pub const MANIFEST_TOMBSTONE_RECREATE_REJECTED: &str = "a deleted manifest is at this key; restore it with `gonzalo undelete`, \
+// `rustfmt` reflows a multi-line string literal back onto the `=` line (past
+// `max_width`); skip it so this reads like `CONSUMER_TOMBSTONE_REJECTED`.
+#[rustfmt::skip]
+pub const MANIFEST_TOMBSTONE_RECREATE_REJECTED: &str =
+    "a deleted manifest is at this key; restore it with `gonzalo undelete`, \
      or discard the tombstone with `gonzalo purge`";
 
 /// Decide a consumer `put` (spec §3.2). A `RecordKind::Tombstone` record is
 /// always `Rejected`: deletes go through `Store::delete_as`, and replication
 /// writes tombstones through `put_raw`. Otherwise, a tombstone counts as
 /// absent: a create (`expected == None`) recreates the key past the
-/// tombstone, and any `Some(_)` is `NotFound`. Replication writes use
+/// tombstone, and any `Some(_)` is `NotFound`. The one exception is a
+/// *manifest* tombstone (`deleted_kind` of `GraphManifest` or `VectorManifest`),
+/// whose retained body is a restore window: a create over it is `Rejected`
+/// with [`MANIFEST_TOMBSTONE_RECREATE_REJECTED`]. Replication writes use
 /// [`plan_put_raw`].
 ///
 /// The store stamps `meta.created` and `meta.updated` on every consumer write,
@@ -205,7 +214,11 @@ pub fn plan_put(
             // restoring and discarding (ADR 0030). Keyed on the STORED
             // tombstone, never the incoming record: an incoming `deleted_kind`
             // is a client smuggling a field, handled by the recreation arm.
-            None if t.deleted_kind.is_some() => {
+            None if matches!(
+                t.deleted_kind,
+                Some(RecordKind::GraphManifest | RecordKind::VectorManifest)
+            ) =>
+            {
                 PutPlan::Rejected(MANIFEST_TOMBSTONE_RECREATE_REJECTED)
             }
             None => {
@@ -925,6 +938,20 @@ mod tests {
         assert_eq!(stored.revision.counter, t.revision.counter + 1);
     }
 
+    // A tombstone can carry a non-manifest `deleted_kind` (hand-written or
+    // replicated verbatim by `put_raw`); `tombstone_of` never produces one. GC
+    // pins nothing for it, so there is no restore window and no reason to refuse.
+    #[test]
+    fn create_over_a_tombstone_with_a_non_manifest_deleted_kind_still_recreates() {
+        let mut t = tomb(3);
+        t.deleted_kind = Some(RecordKind::Topic);
+        let PutPlan::Write(stored) = plan_put(Some(&t), live(0, b"again", vec![]), None, 32) else {
+            panic!("a non-manifest deleted_kind has no restore window to protect");
+        };
+        assert!(!stored.is_tombstone());
+        assert_eq!(stored.deleted_kind, None);
+    }
+
     // The new arm must not swallow the stale-revision case.
     #[test]
     fn put_with_expected_over_a_manifest_tombstone_is_still_not_found() {
@@ -948,6 +975,8 @@ mod tests {
         );
     }
 
+    // ---- plan_put_raw ----
+
     // Review Focus 1: `undelete` is the recovery path this ticket protects, and
     // it rides `plan_put_raw`. A guard in the wrong planner would break it while
     // every other test here still passed.
@@ -969,8 +998,6 @@ mod tests {
         assert!(!stored.is_tombstone());
         assert_eq!(stored.ancestors.first(), Some(&t.revision));
     }
-
-    // ---- plan_put_raw ----
 
     #[test]
     fn put_raw_create_on_absent_writes_verbatim_including_tombstones() {
