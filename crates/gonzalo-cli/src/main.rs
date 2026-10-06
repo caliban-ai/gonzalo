@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gonzalo_cli::{
     DeleteOutcome, EXIT_CONFLICT, Horizon, IndexFilter, IndexOptions, WatchConfig, collect, delete,
     gc, get, index_with_options, list, migrate, parse_duration, parse_horizon, parse_revision,
-    reset, reset_exit_code, resolve_parse_worker, status, sync_exit_code, sync_stores_with_cap,
-    ticket_move, ticket_sync, undelete, watch,
+    purge, reset, reset_exit_code, resolve_parse_worker, status, sync_exit_code,
+    sync_stores_with_cap, ticket_move, ticket_sync, undelete, watch,
 };
 use gonzalo_core::{DEFAULT_ANCESTOR_CAP, RecordKey, RecordKind, Revision};
 use gonzalo_store_fs::expand_tilde;
@@ -179,6 +179,25 @@ enum Commands {
         /// Most recent revisions a record remembers in `ancestors` (at least 1).
         #[arg(long, default_value_t = DEFAULT_ANCESTOR_CAP)]
         ancestor_cap: usize,
+    },
+    /// Physically remove a tombstone, discarding the restore window it holds.
+    /// Refuses anything that is not a tombstone. This is the deliberate way
+    /// past the guard that stops a write from recreating over a deleted
+    /// manifest; to get the record back instead, use `gonzalo undelete`.
+    #[command(after_help = "Exit codes: 0 purged, 1 error or refused, 2 usage error")]
+    Purge {
+        /// Root directory of the fs store.
+        #[arg(long, default_value = ".", value_parser = store_root)]
+        root: PathBuf,
+        /// Namespace of the record.
+        #[arg(long)]
+        namespace: String,
+        /// Collection of the record.
+        #[arg(long)]
+        collection: String,
+        /// ID of the record.
+        #[arg(long)]
+        id: String,
     },
     /// Restore a record from its tombstone, while the tombstone still exists.
     /// Only manifest kinds retain a body, so only they can be restored. Fails
@@ -523,6 +542,20 @@ async fn main() -> Result<ExitCode> {
                     return Ok(ExitCode::from(EXIT_CONFLICT));
                 }
             }
+        }
+
+        Commands::Purge {
+            root,
+            namespace,
+            collection,
+            id,
+        } => {
+            let key = RecordKey::new(&namespace, &collection, &id);
+            // No `--ancestor-cap`: purge never folds ancestors, so a flag
+            // would be a knob with no effect.
+            let revision = purge(&root, DEFAULT_ANCESTOR_CAP, &namespace, &collection, &id).await?;
+            println!("purged: {key}");
+            println!("revision: {}", serde_json::to_string(&revision)?);
         }
 
         Commands::Undelete {

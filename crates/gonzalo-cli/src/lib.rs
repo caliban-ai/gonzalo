@@ -1168,6 +1168,41 @@ pub async fn undelete(
     Ok(gonzalo_core::undelete(&store, &key, gonzalo_core::now_ms(), Some(&author)).await?)
 }
 
+/// Physically remove the tombstone at `namespace/collection/id`, discarding the
+/// restore window it holds.
+///
+/// Refuses anything that is not a tombstone. [`gonzalo_core::plan_purge`] does
+/// not check the record's kind: it removes whatever matches the revision, so
+/// without this check an operator could physically delete a live record
+/// leaving no tombstone, which a peer that had not synced since would
+/// resurrect (ADR 0021). Core keeps its contract because `collect` depends on
+/// it; the check belongs here, at the operator surface.
+pub async fn purge(
+    root: &Path,
+    ancestor_cap: usize,
+    namespace: &str,
+    collection: &str,
+    id: &str,
+) -> Result<Revision> {
+    let store = open_store(root, ancestor_cap)?;
+    let key = RecordKey::new(namespace, collection, id);
+    let Some(record) = store.get_raw(&key).await? else {
+        anyhow::bail!("record not found: {key}");
+    };
+    if !record.is_tombstone() {
+        anyhow::bail!(
+            "{key} is live at revision {}; purge removes tombstones only. \
+             Delete it first if that is what you meant.",
+            record.revision.counter
+        );
+    }
+    let revision = record.revision.clone();
+    if let gonzalo_core::DeleteResult::Conflict(_) = store.purge(&key, revision.clone()).await? {
+        anyhow::bail!("{key} changed while purging; nothing was removed, retry");
+    }
+    Ok(revision)
+}
+
 /// Tombstone every live record in `namespace` (optionally one `collection`)
 /// via [`gonzalo_core::reset_as`], attributing each tombstone to
 /// [`CLI_AUTHOR`].
@@ -1736,6 +1771,49 @@ mod tests {
     }
 
     // ── index: build a queryable view from a source tree ─────────────────────
+
+    // Review Focus 3: the ergonomic regression this design accepts must be a
+    // clean refusal with guidance, not a panic and not a half-written
+    // manifest. This is the graph-indexer half of #333's hazard: `index`
+    // derives `expected` from a consumer `get`, which hides the tombstone.
+    #[tokio::test]
+    async fn index_over_a_deleted_manifest_is_refused_with_guidance() {
+        let root = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        write_file(src.path(), "a.rs", "fn a() {}");
+
+        index(root.path(), src.path(), "r", "main").await.unwrap();
+
+        // Delete the view's manifest, as `gonzalo delete` or `reset` would.
+        let store = open_store(root.path(), gonzalo_core::DEFAULT_ANCESTOR_CAP).unwrap();
+        let key = Manifest::key("r", "main");
+        assert_eq!(
+            store.delete(&key, None).await.unwrap(),
+            gonzalo_core::DeleteResult::Deleted
+        );
+        let tomb = store.get_raw(&key).await.unwrap().expect("tombstone");
+        let retained = tomb.body.clone();
+
+        // Re-indexing must refuse rather than overwrite the restore window.
+        let err = index(root.path(), src.path(), "r", "main")
+            .await
+            .err()
+            .expect("indexing over a deleted manifest must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("gonzalo undelete") && msg.contains("gonzalo purge"),
+            "the refusal must tell the operator both ways out, got {msg}"
+        );
+
+        // Nothing was written: the window is intact.
+        let after = store
+            .get_raw(&key)
+            .await
+            .unwrap()
+            .expect("tombstone survives");
+        assert!(after.is_tombstone());
+        assert_eq!(after.body, retained, "the retained body was not touched");
+    }
 
     #[tokio::test]
     async fn index_builds_a_queryable_view() {
