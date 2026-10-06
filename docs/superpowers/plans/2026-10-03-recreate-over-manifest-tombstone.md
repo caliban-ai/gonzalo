@@ -28,7 +28,7 @@ Five conditions the spec implies that no task's happy path reaches. Each one's t
 
 1. **`undelete` must still work.** It is the primary recovery path and rides `plan_put_raw`. A guard implemented in the wrong planner — or applied too broadly — would break the very capability this ticket protects, and every other test here would still pass. → Task 1.
 2. **`collect` past the horizon, then create, must succeed.** The guard must not make a manifest key permanently unwritable. Once the tombstone is gone there is no window to protect, so the key must accept a create again. → Task 3.
-3. **`reset` then `gonzalo index` must fail cleanly.** This is the ergonomic regression the design accepts; it has to be a clean refusal with guidance and nothing partially written, not a panic or a half-committed manifest. → Task 3.
+3. **`reset` then `gonzalo index` must fail cleanly.** This is the ergonomic regression the design accepts; it has to be a clean refusal with guidance and nothing partially written, not a panic or a half-committed manifest. → Task 4, which owns `cli/src/lib.rs`; see the note in its Files block.
 4. **Replication must be untouched.** A `put_raw` create over a manifest tombstone must still Conflict exactly as before, or sync starts resurrecting deleted manifests. → Task 2.
 5. **A manifest tombstone whose retained body does not parse must still refuse cleanly.** The guard reads `deleted_kind` and must never parse the body, so a corrupt window still produces the refusal rather than a serde error. → Task 1.
 
@@ -47,7 +47,10 @@ Five conditions the spec implies that no task's happy path reaches. Each one's t
 | `crates/gonzalo-cli/tests/cli.rs` | **Modify.** `purge` tests and the `index`-after-delete refusal. |
 | `docs/adr/0030-manifest-tombstone-recreate-guard.md` | **Create.** The decision record. |
 
-**Verified API shapes** — checked against the tree at this plan's HEAD. Use them verbatim.
+**Verified API shapes** — re-verified against `da91ba0` after rebasing past #329 and #331.
+Use them verbatim. The `crates/gonzalo-cli/src/lib.rs` line numbers moved when #331
+inserted `IndexOptions` earlier in that file; `tombstone.rs` and every substrate
+reference were unaffected.
 
 - `PutPlan::{Write(Record), Conflict(Box<Conflict>), NotFound, Rejected(&'static str)}` (`tombstone.rs:135-149`).
 - `pub const CONSUMER_TOMBSTONE_REJECTED: &str = "consumer put cannot write a tombstone; use delete_as";` (`tombstone.rs:153-154`) — the style to match.
@@ -56,8 +59,8 @@ Five conditions the spec implies that no task's happy path reaches. Each one's t
 - `plan_purge(current: Option<&Record>, expected: &Revision) -> PurgePlan` (`tombstone.rs:328-338`) — **does not check the record's kind.**
 - `Store::purge(&self, key: &RecordKey, expected: Revision) -> Result<DeleteResult>`.
 - `tomb(counter)` test helper = `tombstone_of(&live(counter - 1, ..), 42, 32, None)` (`tombstone.rs:740-743`), so its `deleted_kind` is `None`.
-- `open_store(root: &Path, ancestor_cap: usize) -> anyhow::Result<FsStore>` (`cli/src/lib.rs:1096-1100`).
-- CLI wrapper shape: `pub async fn undelete(root: &Path, ancestor_cap: usize, namespace: &str, collection: &str, id: &str) -> Result<Revision>` (`cli/src/lib.rs:1143-1154`), using `open_store` and `CLI_AUTHOR`.
+- `open_store(root: &Path, ancestor_cap: usize) -> anyhow::Result<FsStore>` (`cli/src/lib.rs:1111-1115`).
+- CLI wrapper shape: `pub async fn undelete(root: &Path, ancestor_cap: usize, namespace: &str, collection: &str, id: &str) -> Result<Revision>` (`cli/src/lib.rs:1158-1169`), using `open_store` and `CLI_AUTHOR`.
 - `Commands::Delete`'s `root` arg: `#[arg(long, default_value = ".", value_parser = store_root)] root: PathBuf` (`main.rs:163-164`).
 - `conformance.rs` registration list is in `run_tombstone_conformance` (`conformance.rs:255-268`); `recreate_continues_chain` is registered at `:264` and defined at `:545`. `consumer_put_of_a_tombstone_is_rejected` is the model for asserting a refusal.
 - `cli.rs` test helpers: `run(root, args)` appends `--root <root>` itself; also `stdout`, `stderr`, `seed(root, ns, col, ids)`, `record_file`, `edit_record_file`.
@@ -551,7 +554,7 @@ fn purge_of_an_absent_key_exits_one() {
 
 ```
 
-**Review Focus 3 goes in a different file, deliberately.** `crates/gonzalo-cli/tests/cli.rs` has **no** `index` tests at all, so driving the full indexer through the binary would mean building a source tree, grammar availability and flag plumbing from scratch. But `crates/gonzalo-cli/src/lib.rs`'s own test module already has the harness: a local `async fn index(root, src, repo, view) -> Result<IndexSummary>` helper (`lib.rs:1416`) that a dozen tests already call as `index(root.path(), src.path(), "r", "main")` (`lib.rs:1715`, `:1751`, `:1757`, …). Add this there, beside those tests, and follow whatever they use to build `src`:
+**Review Focus 3 goes in a different file, deliberately.** `crates/gonzalo-cli/tests/cli.rs` has **no** `index` tests at all, so driving the full indexer through the binary would mean building a source tree, grammar availability and flag plumbing from scratch. But `crates/gonzalo-cli/src/lib.rs`'s own test module already has the harness: a local `async fn index(root, src, repo, view) -> Result<IndexSummary>` helper (`lib.rs:1448`) that a dozen tests already call as `index(root.path(), src.path(), "r", "main")` (`lib.rs:1748`, `:1818`, `:1846`, …). Add this there, beside those tests, and follow whatever they use to build `src`:
 
 ```rust
     // Review Focus 3: the ergonomic regression this design accepts must be a
