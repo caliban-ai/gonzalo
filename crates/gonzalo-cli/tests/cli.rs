@@ -661,3 +661,131 @@ fn undelete_of_a_key_that_was_never_written_exits_nonzero() {
     );
     assert!(stderr(&out).contains("not found"), "got {:?}", stderr(&out));
 }
+
+#[test]
+fn purge_removes_a_tombstone_and_lets_the_key_be_recreated() {
+    let root = TempDir::new().unwrap();
+    seed(root.path(), "ns", "col", &["note.md"]);
+
+    // Make it a retaining kind, so the guard would otherwise block recreation.
+    let body = serde_json::to_value(gonzalo_core::Manifest::new().to_body()).unwrap();
+    edit_record_file(
+        &record_file(root.path(), "ns", "col", "note.md"),
+        |record| {
+            record.insert("kind".into(), serde_json::json!("GraphManifest"));
+            record.insert("body".into(), body);
+        },
+    );
+
+    let del = run(
+        root.path(),
+        &[
+            "delete",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+            "--id",
+            "note.md",
+        ],
+    );
+    assert_eq!(del.status.code(), Some(0), "{del:?}");
+
+    let out = run(
+        root.path(),
+        &[
+            "purge",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+            "--id",
+            "note.md",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        stdout(&out).starts_with("purged: ns/col/note.md"),
+        "got {:?}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("revision:"),
+        "purge prints the revision it removed, got {:?}",
+        stdout(&out)
+    );
+
+    // The tombstone is physically gone, so the record reads as absent raw too.
+    assert!(
+        !record_file(root.path(), "ns", "col", "note.md").is_file(),
+        "purge removes the record file"
+    );
+
+    // And the key accepts a create again: purge is not a dead end, which is
+    // the whole reason it exists as the guard's escape hatch.
+    seed(root.path(), "ns", "col", &["note.md"]);
+    assert!(
+        run(root.path(), &["get", "ns", "col", "note.md"])
+            .status
+            .success(),
+        "the key is writable again after purge"
+    );
+}
+
+// The trap in plan_purge must not reach operators: purging a LIVE record would
+// leave no tombstone, and a peer that had not synced would resurrect it.
+#[test]
+fn purge_refuses_a_live_record_and_leaves_it_alone() {
+    let root = TempDir::new().unwrap();
+    seed(root.path(), "ns", "col", &["note.md"]);
+
+    let out = run(
+        root.path(),
+        &[
+            "purge",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+            "--id",
+            "note.md",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        stderr(&out).contains("live"),
+        "the refusal must say the record is live, got {:?}",
+        stderr(&out)
+    );
+    assert!(
+        run(root.path(), &["get", "ns", "col", "note.md"])
+            .status
+            .success(),
+        "the live record survives a refused purge"
+    );
+}
+
+// Deliberately unlike `delete`, which exits 0 for an absent key: purge is a
+// targeted destructive act, so a typo must be visible.
+#[test]
+fn purge_of_an_absent_key_exits_one() {
+    let root = TempDir::new().unwrap();
+    let out = run(
+        root.path(),
+        &[
+            "purge",
+            "--namespace",
+            "ns",
+            "--collection",
+            "col",
+            "--id",
+            "nope",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout when nothing was purged"
+    );
+    assert!(stderr(&out).contains("not found"), "got {:?}", stderr(&out));
+}

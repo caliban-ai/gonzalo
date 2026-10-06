@@ -115,10 +115,16 @@ async fn undelete_refuses_when_there_is_no_tombstone() {
 #[tokio::test]
 async fn undelete_refuses_when_the_record_is_live() {
     let (store, _shard) = store_with_index().await;
+    let before = store.get(&manifest_key()).await.unwrap().unwrap();
     let err = undelete(&store, &manifest_key(), 9_000, None)
         .await
         .unwrap_err();
-    assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+    assert!(
+        matches!(&err, CoreError::Invalid(m) if m.contains("is live at revision") && m.contains("nothing to restore")),
+        "got {err:?}"
+    );
+    // A refused undelete must not damage the live record.
+    assert_eq!(store.get(&manifest_key()).await.unwrap().unwrap(), before);
 }
 
 // A kind whose body was never retained cannot be restored. This is the stated
@@ -162,35 +168,5 @@ async fn undelete_refuses_when_a_named_blob_is_missing() {
     assert!(
         store.get(&manifest_key()).await.unwrap().is_none(),
         "nothing was written"
-    );
-}
-
-// Someone recreated the key while the operator was deciding. The live-record
-// guard is what fires here: `undelete` reads the key and finds a non-tombstone.
-// (`put_raw` returning Conflict is the narrower race where a recreate lands
-// between that read and the write; a single-threaded test cannot reach it, so
-// nothing below asserts on it.)
-#[tokio::test]
-async fn undelete_refuses_when_the_key_was_recreated() {
-    let (store, _shard) = store_with_index().await;
-    let _ = store.delete(&manifest_key(), None).await.unwrap();
-
-    let replacement = Record::create(
-        manifest_key(),
-        RecordKind::Topic,
-        Body::Inline(b"{}".to_vec()),
-        meta(),
-    );
-    let _ = store.put(replacement, None).await.unwrap();
-
-    let err = undelete(&store, &manifest_key(), 9_000, None)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
-    let live = store.get(&manifest_key()).await.unwrap().unwrap();
-    assert_eq!(
-        live.kind,
-        RecordKind::Topic,
-        "the live record was not clobbered"
     );
 }

@@ -51,12 +51,21 @@ pub trait Store: Send + Sync {
     /// store's current revision differs, returns `PutResult::Conflict`.
     ///
     /// A tombstoned key counts as absent (ADR 0021, spec §8.5):
-    /// - `expected == None` **recreates** the key. The store re-stamps
-    ///   `record.revision` to continue the chain past the tombstone, so the
-    ///   caller must read the real revision back from
+    /// - `expected == None` **recreates** the key, with one exception: a
+    ///   *manifest* tombstone (`deleted_kind` of `GraphManifest` or
+    ///   `VectorManifest`) holds a restore window, so a create over it is
+    ///   refused with `Err(CoreError::Invalid)` (ADR 0030). Restore it with
+    ///   `gonzalo undelete`, or discard it with `gonzalo purge`; once `collect`
+    ///   removes the tombstone the key is free again. Otherwise the store
+    ///   re-stamps `record.revision` to continue the chain past the tombstone,
+    ///   so the caller must read the real revision back from
     ///   `PutResult::Committed` rather than reuse the one it built.
     /// - Any `Some(_)` — including the tombstone's own revision, which
     ///   consumers never learn — is `Err(CoreError::NotFound)`.
+    ///
+    /// A create over a manifest tombstone is therefore a second error case
+    /// (`Err(CoreError::Invalid)`, which the daemon answers 400 /
+    /// `InvalidArgument`), alongside the following one.
     ///
     /// A `record` whose `kind` is `RecordKind::Tombstone` is always rejected
     /// with an error, on every `current` state: deletes go through

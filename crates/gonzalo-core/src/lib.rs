@@ -14,10 +14,10 @@ pub use record::{Body, MergeClass, Meta, Record, RecordKind};
 
 pub mod tombstone;
 pub use tombstone::{
-    CONSUMER_TOMBSTONE_REJECTED, DEFAULT_ANCESTOR_CAP, DeletePlan, PurgePlan, PutPlan,
-    TOMBSTONE_DOMAIN, fold_ancestors, now_ms, plan_delete, plan_purge, plan_put, plan_put_raw,
-    reconciled_ancestors, reconciled_record, tombstone_hash, tombstone_of, tombstone_winner,
-    validate_ancestor_cap,
+    CONSUMER_TOMBSTONE_REJECTED, DEFAULT_ANCESTOR_CAP, DeletePlan,
+    MANIFEST_TOMBSTONE_RECREATE_REJECTED, PurgePlan, PutPlan, TOMBSTONE_DOMAIN, fold_ancestors,
+    now_ms, plan_delete, plan_purge, plan_put, plan_put_raw, reconciled_ancestors,
+    reconciled_record, tombstone_hash, tombstone_of, tombstone_winner, validate_ancestor_cap,
 };
 
 pub mod manifest;

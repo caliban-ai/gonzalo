@@ -53,3 +53,4 @@
   - [ADR 0027 · A durable vector index](./adr/0027-durable-vector-index.md)
   - [ADR 0028 · A grace period for blob garbage collection](./adr/0028-blob-gc-grace-period.md)
   - [ADR 0029 · Manifest tombstones retain their body, and `undelete` restores it](./adr/0029-manifest-tombstone-pin.md)
+  - [ADR 0030 · A create over a manifest tombstone is refused, and `gonzalo purge` discards one deliberately](./adr/0030-manifest-tombstone-recreate-guard.md)

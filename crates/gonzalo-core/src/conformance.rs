@@ -262,6 +262,8 @@ where
     independent_deletes_are_identical(&factory().await, &factory().await).await;
     tombstone_never_collides_with_empty_body(&factory().await).await;
     recreate_continues_chain(&factory().await).await;
+    create_over_a_manifest_tombstone_is_refused(&factory().await).await;
+    put_raw_create_over_a_manifest_tombstone_still_conflicts(&factory().await).await;
     put_some_over_tombstone_is_not_found(&factory().await).await;
     consumer_put_of_a_tombstone_is_rejected(&factory().await).await;
     replication_overwrite_of_tombstone(&factory().await).await;
@@ -370,6 +372,30 @@ async fn committed<S: Store>(store: &S, rec: Record, expected: Option<Revision>)
     }
 }
 
+/// Commit a vector manifest at `key`, delete it, and return its body with the
+/// tombstone read back raw.
+async fn put_then_delete_manifest<S: Store>(store: &S, key: &RecordKey) -> (Body, Record) {
+    let mut m = crate::VectorManifest::new("space-a", 3, 256);
+    m.entries.insert(0, ContentHash::of(b"shard-zero"));
+    let body = m.to_body();
+
+    let mut record = sample(key.clone(), b"unused");
+    record.kind = RecordKind::VectorManifest;
+    record.revision = Revision::initial(body.bytes());
+    record.body = body.clone();
+    committed(store, record, None).await;
+    assert_eq!(
+        store.delete(key, None).await.unwrap(),
+        DeleteResult::Deleted
+    );
+    let tomb = store
+        .get_raw(key)
+        .await
+        .unwrap()
+        .expect("tombstone visible to get_raw");
+    (body, tomb)
+}
+
 async fn put_then_delete<S: Store>(
     store: &S,
     key: &RecordKey,
@@ -459,22 +485,7 @@ async fn tombstone_pins_the_deleted_records_blob<S: Store>(store: &S) {
 /// index back (ADR 0029).
 async fn tombstone_retains_a_manifest_body<S: Store>(store: &S) {
     let key = tomb_key("manifest");
-    let mut m = crate::VectorManifest::new("space-a", 3, 256);
-    m.entries.insert(0, ContentHash::of(b"shard-zero"));
-    let body = m.to_body();
-
-    let mut record = sample(key.clone(), b"unused");
-    record.kind = RecordKind::VectorManifest;
-    record.revision = Revision::initial(body.bytes());
-    record.body = body.clone();
-    committed(store, record, None).await;
-
-    assert_eq!(
-        store.delete(&key, None).await.unwrap(),
-        DeleteResult::Deleted
-    );
-
-    let t = store.get_raw(&key).await.unwrap().expect("tombstone");
+    let (body, t) = put_then_delete_manifest(store, &key).await;
     assert!(t.is_tombstone());
     assert_eq!(t.body, body, "the manifest body survives the round trip");
     assert_eq!(
@@ -557,6 +568,73 @@ async fn recreate_continues_chain<S: Store>(store: &S) {
     assert_eq!(live.parent, Some(t.revision.clone()));
     assert_eq!(live.deleted_at, None);
     assert_eq!(live.ancestors.first(), Some(&t.revision));
+}
+
+/// A consumer `put` that would create over a manifest tombstone is refused, and
+/// nothing is written. The tombstone retains the deleted manifest's body, which
+/// is the restore window GC marks through (ADR 0029); a substrate that wrote
+/// anyway, or mapped the refusal to a different error, would silently unpin
+/// blobs that may be unregenerable (ADR 0030).
+async fn create_over_a_manifest_tombstone_is_refused<S: Store>(store: &S) {
+    let key = tomb_key("manifest-recreate");
+    let (body, tomb) = put_then_delete_manifest(store, &key).await;
+
+    // A create at the key, as any ordinary writer would issue it.
+    let err = store
+        .put(sample(key.clone(), b"replacement"), None)
+        .await
+        .expect_err("a create over a manifest tombstone must be refused");
+    assert!(
+        matches!(err, CoreError::Invalid(_)),
+        "every substrate maps Rejected to Invalid, got {err:?}"
+    );
+
+    // The window survives, untouched: a substrate that refuses but rewrites the
+    // tombstone on the way out (bumped counter, re-stamped times) still loses it.
+    let t = store
+        .get_raw(&key)
+        .await
+        .unwrap()
+        .expect("tombstone survives");
+    assert!(t.is_tombstone());
+    assert_eq!(
+        t.revision, tomb.revision,
+        "the refusal must not rewrite the tombstone"
+    );
+    assert_eq!(t.body, body, "the retained body was not discarded");
+    assert_eq!(t.deleted_kind, Some(RecordKind::VectorManifest));
+    assert_eq!(
+        store.get(&key).await.unwrap(),
+        None,
+        "the key stays hidden to `get`"
+    );
+}
+
+/// Replication is untouched by the manifest guard: a `put_raw` create over a
+/// manifest tombstone must still Conflict, or sync starts resurrecting deleted
+/// manifests.
+async fn put_raw_create_over_a_manifest_tombstone_still_conflicts<S: Store>(store: &S) {
+    let key = tomb_key("manifest-raw-create");
+    let (body, tomb) = put_then_delete_manifest(store, &key).await;
+
+    match store
+        .put_raw(sample(key.clone(), b"from-peer"), None)
+        .await
+        .unwrap()
+    {
+        PutResult::Conflict(c) => {
+            assert!(c.current.is_tombstone());
+            assert_eq!(c.current.revision, tomb.revision);
+            assert_eq!(
+                c.current.body, body,
+                "the retained manifest body survives the refusal"
+            );
+            assert_eq!(c.current.deleted_kind, Some(RecordKind::VectorManifest));
+        }
+        PutResult::Committed(rev) => {
+            panic!("put_raw must not create over a tombstone, committed {rev:?}")
+        }
+    }
 }
 
 /// A tombstone is absent to a conditional put naming any other revision.

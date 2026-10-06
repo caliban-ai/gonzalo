@@ -645,8 +645,9 @@ fn put_step(key: &RecordKey, plan: PutPlan) -> Result<Planned<PutResult>> {
         }
         PutPlan::Conflict(conflict) => Ok(Planned::Finish(PutResult::Conflict(conflict))),
         PutPlan::NotFound => Err(CoreError::NotFound(key.clone())),
-        // Only consumer `plan_put` produces this, for a `RecordKind::Tombstone`
-        // record: deletes go through `delete_as`, replication through `put_raw`.
+        // Only consumer `plan_put` produces this: for a `RecordKind::Tombstone`
+        // record (deletes go through `delete_as`, replication through `put_raw`)
+        // and for a create over a manifest tombstone.
         PutPlan::Rejected(reason) => Err(CoreError::Invalid(reason.to_string())),
     }
 }
