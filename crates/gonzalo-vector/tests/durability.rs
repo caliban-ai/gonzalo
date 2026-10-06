@@ -2,8 +2,9 @@
 //! reopened, and queried — with the reopen cost reported rather than assumed.
 
 use gonzalo_core::{
-    BlobStore as _, CoreError, DeleteResult, KeyPrefix, RecordKey, Store as _, SweepPolicy,
-    VectorManifest, collect, gc_blobs_with, now_ms, undelete,
+    BlobStore as _, CoreError, DeleteResult, KeyPrefix, MANIFEST_TOMBSTONE_RECREATE_REJECTED,
+    RecordKey, RecordKind, Store as _, SweepPolicy, VectorManifest, collect, gc_blobs_with, now_ms,
+    undelete,
 };
 use gonzalo_store_fs::FsStore;
 use gonzalo_vector::{RecordVectorIndex, VectorIndex as _};
@@ -127,22 +128,20 @@ async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
         .unwrap();
     drop(idx);
 
-    assert_eq!(
-        store.delete(&key, None).await.unwrap(),
-        DeleteResult::Deleted
-    );
+    let _ = store.delete(&key, None).await.unwrap();
+    // The guard keys on this field of the stored tombstone.
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(tomb.deleted_kind, Some(RecordKind::VectorManifest));
 
-    // The shards the delete pinned. The refused commit below stages a blob of its
-    // own that nothing will ever reference, so the sweep may legitimately free
-    // that one; what must survive is exactly this set.
-    let pinned: Vec<_> = store
-        .list_blobs()
-        .await
+    // The shards the tombstone pins, read from its retained manifest body. The
+    // refused commit below stages a blob of its own that nothing will ever
+    // reference, so the sweep frees exactly that one; these must survive.
+    let pinned: Vec<_> = VectorManifest::from_body(&tomb.body)
         .unwrap()
-        .into_iter()
-        .map(|b| b.hash)
+        .entries
+        .into_values()
         .collect();
-    assert!(!pinned.is_empty(), "the index wrote shard blobs");
+    assert!(!pinned.is_empty(), "the tombstone retains shard hashes");
 
     // Reopen: this still succeeds, because `open` reads through `store.get`,
     // which hides tombstones. The refusal lands on the first commit instead.
@@ -154,7 +153,10 @@ async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
         .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe.clone())])
         .await
         .expect_err("the commit must be refused while a tombstone holds the key");
-    assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+    assert!(
+        matches!(&err, CoreError::Invalid(m) if m == MANIFEST_TOMBSTONE_RECREATE_REJECTED),
+        "got {err:?}"
+    );
 
     // The window survived, so the shards are still pinned.
     let swept = gc_blobs_with(
@@ -166,6 +168,11 @@ async fn an_upsert_on_a_deleted_index_is_refused_and_the_shards_stay_pinned() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        swept.freed.len(),
+        1,
+        "exactly the refused commit's orphan shard"
+    );
     for hash in &pinned {
         assert!(
             !swept.freed.contains(hash),
@@ -204,10 +211,25 @@ async fn after_collect_removes_the_tombstone_a_fresh_index_can_be_created() {
         .await
         .unwrap();
     drop(idx);
-    assert_eq!(
-        store.delete(&key, None).await.unwrap(),
-        DeleteResult::Deleted
+    let _ = store.delete(&key, None).await.unwrap();
+    // The guard keys on this field of the stored tombstone.
+    let tomb = store.get_raw(&key).await.unwrap().unwrap();
+    assert_eq!(tomb.deleted_kind, Some(RecordKind::VectorManifest));
+
+    // Before the collect the window is still open, so a create is refused.
+    let blocked =
+        RecordVectorIndex::open(FsStore::new(dir.path()), key.clone(), "recycled-space", DIM)
+            .await
+            .unwrap();
+    let err = blocked
+        .upsert_many(vec![(RecordKey::new("ns", "coll", "b"), probe.clone())])
+        .await
+        .expect_err("the tombstone's window must still refuse a create");
+    assert!(
+        matches!(&err, CoreError::Invalid(m) if m == MANIFEST_TOMBSTONE_RECREATE_REJECTED),
+        "got {err:?}"
     );
+    drop(blocked);
 
     // Past the horizon: collect removes the tombstone, and with it the window.
     let collected = collect(&store, &KeyPrefix::default(), Duration::ZERO, now_ms() + 1)
