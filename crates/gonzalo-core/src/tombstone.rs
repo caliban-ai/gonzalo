@@ -159,12 +159,10 @@ pub const CONSUMER_TOMBSTONE_REJECTED: &str =
 /// rejected (see [`PutPlan::Rejected`]). A manifest tombstone retains the
 /// deleted body, which is the restore window ADR 0029 promises; overwriting it
 /// would unpin blobs that may be unregenerable (ADR 0030).
-// `rustfmt` reflows a multi-line string literal back onto the `=` line (past
-// `max_width`); skip it so this reads like `CONSUMER_TOMBSTONE_REJECTED`.
-#[rustfmt::skip]
-pub const MANIFEST_TOMBSTONE_RECREATE_REJECTED: &str =
-    "a deleted manifest is at this key; restore it with `gonzalo undelete`, \
-     or discard the tombstone with `gonzalo purge`";
+pub const MANIFEST_TOMBSTONE_RECREATE_REJECTED: &str = concat!(
+    "a deleted manifest is at this key; restore it with `gonzalo undelete`, ",
+    "or discard the tombstone with `gonzalo purge`",
+);
 
 /// Decide a consumer `put` (spec §3.2). A `RecordKind::Tombstone` record is
 /// always `Rejected`: deletes go through `Store::delete_as`, and replication
